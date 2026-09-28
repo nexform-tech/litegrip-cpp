@@ -1,0 +1,43 @@
+{
+  "kind": "safety_limits",
+  "baseline_version": "3.5",
+  "is_default_baseline": true,
+  "supersedes": "0.25",
+  "device": "LiteGrip",
+  "can_id": 8,
+  "mst_id": 24,
+
+  "mechanical_observed_min_rad": -1.272793,
+  "mechanical_observed_max_rad": 0.051308,
+  "red_open_limit_rad": -1.24,
+  "red_close_limit_rad": -0.01,
+  "red_line_enabled": true,
+
+  "hard_torque_limit_nm": 3.5,
+
+  "torque_basis": {
+    "value_nm": 3.5,
+    "meaning": "rated torque (continuous) of the DM-J4310-2EC module, output side",
+    "peak_note": "the 12.5 N.m peak is a short-time rating needing duty-cycle and temperature-rise data this project does not have, so the rated value is used",
+    "not_a_basis": "the 10 N.m MIT frame tau range is an encoding range, not a protection threshold"
+  },
+
+  "provenance": [
+    "The interval values are inherited from the vendor calibration snapshot; the upstream SDK has no concept of red lines.",
+    "Open-side margin to the observed boundary: 0.032793 rad (about 2.99 mm). Closed-side: 0.061308 rad (about 5.60 mm).",
+    "Sign convention: the closed end has the larger rad value, the open end the smaller (more negative)."
+  ],
+
+  "warnings": [
+    "★ NOT VERIFIED ON THIS UNIT. These numbers are the REFERENCE unit's zero-gravity hand-push measurement, not a measurement of the gripper this SDK is deployed on. Treat them as an UPPER BOUND only.",
+    "★ The caliper calibration for the deployment unit has not been done, and the zero point was once reset with the 0xFE command, so the red lines' physical meaning may have shifted relative to the vendor zero.",
+    "★ Before real-hardware motion: re-derive the red lines (caliper measurement plus a closed-end zero reset) and then recalibrate ControlLoopConfig::max_feedback_velocity_rad_s. Until that is done the control loop refuses to send any motion frame, which is deliberate fail-closed behaviour."
+  ],
+
+  "invariants": [
+    "mechanical_observed_min_rad <= red_open_limit_rad < red_close_limit_rad <= mechanical_observed_max_rad",
+    "The red lines must lie inside the mechanically observed range, otherwise the loader refuses the file (fail-closed).",
+    "hard_torque_limit_nm is an upper bound only: the effective value is min(requested, this value, the SDK hard ceiling).",
+    "A config file may only NARROW this baseline; any attempt to widen it is rejected."
+  ]
+}
