@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "litegrip/calibration.hpp"
@@ -40,9 +41,16 @@ void check_near(double got, double want, double tol, const char* what) {
 const std::string kFactoryPath =
     std::string(LITEGRIP_TEST_DATA_DIR) + "/factory_calibration.json";
 
+// The fixtures below are written with std::fopen, which creates the file but
+// not its directory. Create it here: on a clean machine nothing has yet, and
+// the checks must not depend on an earlier run having left it behind.
+const char* const kFixtureDir = "/tmp/litegrip_calib_test";
+
 }  // namespace
 
 int main() {
+  ::mkdir(kFixtureDir, 0755);
+
   // ── the shipped factory calibration ───────────────────────────────────
   {
     const auto factory = litegrip::read_calibration_file(kFactoryPath);
@@ -72,7 +80,7 @@ int main() {
   check(!litegrip::read_calibration_file(kFactoryPath + ".nope").has_value(),
         "missing file yields no value");
   {
-    const std::string path = "/tmp/litegrip_calib_test/broken.json";
+    const std::string path = std::string(kFixtureDir) + "/broken.json";
     const std::string text = "{\"can_id\": 8}";  // required keys absent
     FILE* file = std::fopen(path.c_str(), "w");
     check(file != nullptr, "write fixture");
@@ -83,7 +91,7 @@ int main() {
     check(!litegrip::read_calibration_file(path).has_value(),
           "file without required keys is rejected");
 
-    const std::string garbage = "/tmp/litegrip_calib_test/garbage.json";
+    const std::string garbage = std::string(kFixtureDir) + "/garbage.json";
     file = std::fopen(garbage.c_str(), "w");
     if (file != nullptr) {
       const std::string bad = "{not json";
@@ -105,7 +113,7 @@ int main() {
     config.kd = 2.0;
     config.grasp_torque_threshold = 0.5;
 
-    const std::string path = "/tmp/litegrip_calib_test/roundtrip.json";
+    const std::string path = std::string(kFixtureDir) + "/roundtrip.json";
     // The explicit can_id/mst_id/motor_type arguments are authoritative for
     // those three fields; the rest comes from the config.
     litegrip::write_calibration_file(path, config, 8, 18, "DM4310");
@@ -136,16 +144,18 @@ int main() {
 
   // ── path resolution / overrides ───────────────────────────────────────
   {
-    const std::string explicit_calib = "/tmp/litegrip_calib_test/env_calib.json";
+    const std::string explicit_calib =
+        std::string(kFixtureDir) + "/env_calib.json";
     ::setenv("LITEGRIP_CALIB", explicit_calib.c_str(), 1);
     check(litegrip::default_calibration_path() == explicit_calib,
           "LITEGRIP_CALIB overrides the default calib path");
     ::unsetenv("LITEGRIP_CALIB");
 
     // Without the override: $HOME/.litegrip/litegrip_calibration.json
-    ::setenv("HOME", "/tmp/litegrip_calib_test/home", 1);
+    const std::string fake_home = std::string(kFixtureDir) + "/home";
+    ::setenv("HOME", fake_home.c_str(), 1);
     check(litegrip::default_calibration_path() ==
-              "/tmp/litegrip_calib_test/home/.litegrip/litegrip_calibration.json",
+              fake_home + "/.litegrip/litegrip_calibration.json",
           "default calib path is under $HOME/.litegrip");
 
     ::setenv("LITEGRIP_FACTORY_CALIB", kFactoryPath.c_str(), 1);
