@@ -1,0 +1,788 @@
+// gripper.cpp — LiteGrip, the high-level API, ported from
+// litegrip_driver/litegrip/gripper.py and wired to the safety core.
+//
+// Scope is v1 (plan D6): lifecycle, hold-based init, calibration, position
+// motion, state and parameter access. Force control (grasp / set_force),
+// constant-speed moves and the public zero-gravity mode are deliberately absent.
+//
+// Safety wiring (D4): the MOTION path (goto_rad / move_to / open / close / home)
+// goes through SafetyGuard::guard_motion_frame, so a target outside the red
+// lines, a measured position already outside them, over-ceiling gains, an
+// over-budget feed-forward torque, or a velocity beyond the deceleration zone
+// are all refused with a diagnosable reason and nothing is sent.
+//
+// The expert paths that must keep working when the gripper is outside the red
+// lines do NOT go through that gate, and each says why at its definition:
+// stop() / zero-torque frames (an emergency stop has to work from anywhere) and
+// the calibration routines (they deliberately drive to the mechanical stops).
+
+#include "litegrip/gripper.hpp"
+
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <limits>
+#include <string>
+#include <thread>
+
+#include "litegrip/calibration.hpp"
+#include "litegrip/constants.hpp"
+#include "litegrip/exceptions.hpp"
+
+namespace litegrip {
+namespace {
+
+double monotonic_now() noexcept {
+  return std::chrono::duration<double>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+double wall_clock_now() noexcept {
+  return std::chrono::duration<double>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+void sleep_s(double seconds) {
+  if (seconds > 0.0) {
+    std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+  }
+}
+
+const char* motor_type_name(can::MotorType type) noexcept {
+  switch (type) {
+    case can::MotorType::kDM3507:
+      return "DM3507";
+    case can::MotorType::kDM4310:
+      return "DM4310";
+    case can::MotorType::kDM4310_48V:
+      return "DM4310_48V";
+    case can::MotorType::kDM4340:
+      return "DM4340";
+    case can::MotorType::kDM4340_48V:
+      return "DM4340_48V";
+    case can::MotorType::kDM6006:
+      return "DM6006";
+    case can::MotorType::kDM6248P:
+      return "DM6248P";
+    case can::MotorType::kDM8006:
+      return "DM8006";
+    case can::MotorType::kDM8009:
+      return "DM8009";
+    case can::MotorType::kDM10010L:
+      return "DM10010L";
+    case can::MotorType::kDM10010:
+      return "DM10010";
+    case can::MotorType::kDMH3510:
+      return "DMH3510";
+    case can::MotorType::kDMH6215:
+      return "DMH6215";
+    case can::MotorType::kDMS3519:
+      return "DMS3519";
+    case can::MotorType::kDMG6220:
+      return "DMG6220";
+  }
+  return "DM4310";
+}
+
+/// Measured feedback as the optional triple the safety gate wants. A motor that
+/// has never produced a status frame reports position 0.0, which is a fake
+/// value — hence nullopt rather than 0.0.
+struct Feedback {
+  std::optional<double> position;
+  std::optional<double> velocity;
+  std::optional<double> torque;
+};
+
+Feedback measured_feedback(can::MotorState* motor) {
+  if (motor == nullptr || !motor->has_data()) {
+    return Feedback{std::nullopt, std::nullopt, std::nullopt};
+  }
+  return Feedback{motor->position(), motor->velocity(), motor->torque()};
+}
+
+}  // namespace
+
+LiteGrip::LiteGrip(GripperConfig config)
+    : config_(std::move(config)),
+      bus_(std::make_unique<GripperBus>(config_)),
+      safety_(std::make_unique<SafetyGuard>(canonical_baseline())),
+      mst_id_(config_.mst_id) {}
+
+LiteGrip::~LiteGrip() { disconnect(); }
+
+LiteGrip::LiteGrip(LiteGrip&& other) noexcept
+    : config_(std::move(other.config_)),
+      bus_(std::move(other.bus_)),
+      safety_(std::move(other.safety_)),
+      mst_id_(other.mst_id_),
+      connected_(other.connected_),
+      enabled_(other.enabled_),
+      status_flags_(other.status_flags_) {
+  other.mst_id_.reset();
+  other.connected_ = false;
+  other.enabled_ = false;
+  other.status_flags_ = GripperStatus::kNone;
+}
+
+LiteGrip& LiteGrip::operator=(LiteGrip&& other) noexcept {
+  if (this != &other) {
+    disconnect();
+    config_ = std::move(other.config_);
+    bus_ = std::move(other.bus_);
+    safety_ = std::move(other.safety_);
+    mst_id_ = other.mst_id_;
+    connected_ = other.connected_;
+    enabled_ = other.enabled_;
+    status_flags_ = other.status_flags_;
+    other.mst_id_.reset();
+    other.connected_ = false;
+    other.enabled_ = false;
+    other.status_flags_ = GripperStatus::kNone;
+  }
+  return *this;
+}
+
+LiteGrip LiteGrip::connect_raii(GripperConfig config) {
+  LiteGrip instance(std::move(config));
+  instance.connect();
+  return instance;
+}
+
+// ── connection ────────────────────────────────────────────────────────────
+
+bool LiteGrip::connect() {
+  if (connected_) {
+    return true;
+  }
+
+  bus_->connect();  // throws ConnectError
+
+  // register_gripper() fills in mst_id when the config left it unset, so the
+  // detected value comes back through the bus config.
+  config_.mst_id = bus_->config().mst_id;
+  mst_id_ = config_.mst_id;
+  connected_ = true;
+  status_flags_ = GripperStatus::kNone;
+  return true;
+}
+
+void LiteGrip::disconnect() {
+  if (!connected_) {
+    return;
+  }
+  if (enabled_) {
+    disable();
+  }
+  if (bus_ != nullptr) {
+    bus_->disconnect();
+  }
+  connected_ = false;
+  enabled_ = false;
+  status_flags_ = GripperStatus::kNone;
+}
+
+// ── enable / init / fault ─────────────────────────────────────────────────
+
+bool LiteGrip::enable() {
+  check_connected();
+
+  // A latched fault has to be cleared before the motor will accept an enable;
+  // init() below is what actually proves the link.
+  const int error = get_error();
+  if (error != 0 && error != 1) {
+    clear_fault();
+  }
+  return init();
+}
+
+bool LiteGrip::init() {
+  check_connected();
+
+  try {
+    enabled_ = bus_->init(config_.kp, config_.kd);
+  } catch (const HardwareError&) {
+    enabled_ = false;
+    throw;
+  } catch (const LiteGripError& error) {
+    enabled_ = false;
+    throw HardwareError(std::string("enable failed: ") + error.what());
+  }
+
+  if (enabled_) {
+    status_flags_ |= GripperStatus::kEnabled;
+  }
+  return enabled_;
+}
+
+bool LiteGrip::disable() {
+  check_connected();
+  const bool result = bus_->disable();
+  enabled_ = false;
+  status_flags_ &= ~GripperStatus::kEnabled;
+  return result;
+}
+
+bool LiteGrip::clear_fault() {
+  check_connected();
+  const bool cleared = bus_->clear_fault(config_.kp, config_.kd);
+  if (!cleared) {
+    const int error = bus_->get_error();
+    throw HardwareError(
+        std::string("could not clear the fault: ") + describe_error(error),
+        error);
+  }
+  enabled_ = true;
+  status_flags_ |= GripperStatus::kEnabled;
+  return true;
+}
+
+void LiteGrip::stop() {
+  if (bus_ == nullptr || !enabled_) {
+    return;
+  }
+  // Deliberately NOT routed through guard_motion_frame: an emergency stop must
+  // work even when the gripper is outside the red lines. The zero-torque
+  // invariant is asserted instead, which is what makes the bypass legitimate.
+  safety_->guard_zero_torque_frame(0.0, 0.0, 0.0, 0.0, "stop");
+  bus_->control_mit(0.0, 0.0, 0.0, 0.0, 0.0);
+  bus_->update_state(0.02);
+}
+
+// ── low-level frame access ────────────────────────────────────────────────
+
+bool LiteGrip::send_mit_frame(double q, double kp, double kd, double dq,
+                              double tau) {
+  if (bus_ == nullptr || !enabled_) {
+    return false;
+  }
+  return bus_->control_mit(q, kp, kd, dq, tau);
+}
+
+bool LiteGrip::poll(double timeout_s) {
+  return bus_ != nullptr && bus_->poll(timeout_s);
+}
+
+// ── motion ────────────────────────────────────────────────────────────────
+
+bool LiteGrip::home() {
+  check_connected();
+  check_enabled();
+  return move_to(GripperParams::kPosClosedRad, std::nullopt, std::nullopt, 0.0,
+                 1.0);
+}
+
+bool LiteGrip::open(std::optional<double> kp, std::optional<double> kd,
+                    double duration) {
+  check_connected();
+  check_enabled();
+  return move_to(config_.pos_open_rad, kp, kd, 0.0, duration);
+}
+
+bool LiteGrip::close(std::optional<double> kp, std::optional<double> kd,
+                     std::optional<double> force_n, double duration) {
+  check_connected();
+  check_enabled();
+
+  if (force_n.has_value()) {
+    // Applying a grip force needs torque feed-forward, which needs force
+    // calibration — not verified in this SDK, and force control is out of v1
+    // scope. Silently ignoring it would be worse than saying so.
+    std::fprintf(stderr,
+                 "[litegrip] close(force_n=...) is not supported in this "
+                 "version: applying a grip force needs torque feed-forward and "
+                 "verified force calibration. The value is ignored.\n");
+  }
+  return move_to(config_.pos_closed_rad, kp, kd, 0.0, duration);
+}
+
+bool LiteGrip::goto_mm(double position_mm, std::optional<double> kp,
+                       std::optional<double> kd, double duration) {
+  check_connected();
+  check_enabled();
+  // The motor angle decreases as the gripper opens.
+  const double position_rad =
+      config_.pos_closed_rad - position_mm / config_.rad_to_mm;
+  return goto_rad(position_rad, kp, kd, 0.0, 0.0, duration);
+}
+
+bool LiteGrip::goto_rad(double position_rad, std::optional<double> kp,
+                        std::optional<double> kd, double dq_target,
+                        double tau_feedforward, double duration) {
+  check_connected();
+  check_enabled();
+
+  const double effective_kp = kp.has_value() ? *kp : config_.kp;
+  const double effective_kd = kd.has_value() ? *kd : config_.kd;
+
+  // Clamp into the commandable range first. The model layer's opening range can
+  // be wider than what the red lines allow, so without this clamp a "fully open"
+  // target would be refused wholesale instead of moving as far as it may.
+  const double lower = std::min(config_.pos_closed_rad, config_.pos_open_rad);
+  const double upper = std::max(config_.pos_closed_rad, config_.pos_open_rad);
+  const double clamped = std::max(lower, std::min(upper, position_rad));
+
+  // The gate may throw (LimitViolation / SafetyFault); those propagate, because
+  // the safety layer rejects rather than clamps, and swallowing them here would
+  // hide exactly the condition the caller needs to know about.
+  const Feedback feedback = measured_feedback(bus_->motor());
+  const double q_safe = safety_->guard_motion_frame(
+      clamped, effective_kp, effective_kd, dq_target, tau_feedforward,
+      feedback.position, feedback.velocity, feedback.torque, "goto_rad");
+
+  return bus_->control_mit_stream(q_safe, effective_kp, effective_kd, duration,
+                                  dq_target, tau_feedforward);
+}
+
+bool LiteGrip::move_to(double target_rad, std::optional<double> kp,
+                       std::optional<double> kd, double tau_feedforward,
+                       double duration) {
+  return goto_rad(target_rad, kp, kd, 0.0, tau_feedforward, duration);
+}
+
+// ── calibration ───────────────────────────────────────────────────────────
+//
+// All three routines deliberately drive the mechanism to its MECHANICAL stops,
+// which lie OUTSIDE the software red lines. They therefore cannot go through
+// guard_motion_frame, and they run inside the safety MODE that matches what they
+// do (variant B's structure): zero-gravity for the hand-pushed routine,
+// maintenance for the self-probing ones. The mode does not widen the red lines —
+// it documents intent and controls whether an out-of-range FEEDBACK reading
+// latches. See the plan's open item on calibration vs. the red lines.
+
+CalibrationData LiteGrip::calibrate(double kp, double kd, double step_rad,
+                                    double stall_delta, int stall_cycles,
+                                    int max_iter) {
+  check_connected();
+  check_enabled();
+
+  auto scope = safety_->maintenance_scope("calibrate");
+
+  bus_->update_state(0.1);
+  const double initial = bus_->get_position();
+  std::printf("[litegrip] calibrate: initial position %.4f rad\n", initial);
+
+  const auto find_limit = [&](bool closing) -> double {
+    const double sign = closing ? 1.0 : -1.0;
+    bus_->update_state(0.05);
+    double current = bus_->get_position();
+    double target = current;
+    int stall = 0;
+
+    for (int i = 0; i < max_iter; ++i) {
+      target += sign * step_rad;
+      bus_->control_mit_stream(target, kp, kd, 0.3, 0.0, 0.0, 0.005);
+      bus_->update_state(0.1);
+
+      const double measured = bus_->get_position();
+      const double delta = std::fabs(measured - current);
+      std::printf("[litegrip]   [%d] target=%+.3f pos=%.4f d=%.5f stall=%d\n", i,
+                  target, measured, delta, stall);
+
+      if (delta < stall_delta) {
+        if (++stall >= stall_cycles) {
+          std::printf("[litegrip]   reached %s limit: %.6f rad\n",
+                      closing ? "closed" : "open", measured);
+          return measured;
+        }
+      } else {
+        stall = 0;
+      }
+      current = measured;
+    }
+    std::printf("[litegrip]   safety stop at the iteration cap: %.4f rad\n",
+                current);
+    return current;
+  };
+
+  // Back off first, so probing does not start against a stop.
+  bus_->control_mit_stream(initial + 0.2, 80.0, kd, 0.5);
+  bus_->update_state(0.1);
+
+  const double closed = find_limit(true);
+  bus_->control_mit_stream(closed + 0.3, 80.0, kd, 0.5);
+  bus_->update_state(0.1);
+  const double opened = find_limit(false);
+
+  const double travel = closed - opened;  // closed is numerically larger
+  if (travel <= 0.0) {
+    throw CommError("calibration failed: the travel range is not positive");
+  }
+  const double rad_to_mm = config_.max_stroke_mm / travel;
+
+  CalibrationData result;
+  result.zero_position = closed;
+  result.max_position = opened;
+  result.travel_range = travel;
+  result.rad_to_mm = rad_to_mm;
+  result.motor_type = motor_type_name(GripperParams::kMotorType);
+  result.can_id = config_.can_id;
+  result.mst_id = mst_id_.value_or(0);
+
+  config_.pos_closed_rad = result.zero_position;
+  config_.pos_open_rad = result.max_position;
+  config_.rad_to_mm = result.rad_to_mm;
+
+  std::printf(
+      "[litegrip] calibrate: closed(0mm)=%.6f rad open=%.6f rad travel=%.6f "
+      "rad (%.1f mm) scale=%.1f mm/rad\n",
+      result.zero_position, result.max_position, result.travel_range,
+      result.travel_mm(), result.rad_to_mm);
+  return result;
+}
+
+CalibrationData LiteGrip::calibrate_guided(double kp, double kd,
+                                           double step_rad,
+                                           double stall_delta, int stall_cycles,
+                                           int max_iter) {
+  check_connected();
+  check_enabled();
+
+  auto scope = safety_->maintenance_scope("calibrate_guided");
+
+  const auto step_to_limit = [&](bool closing, const char* label) -> double {
+    std::printf("[litegrip] probing the %s limit; press Enter to confirm\n",
+                label);
+    bus_->update_state(0.05);
+    double current = bus_->get_position();
+    int stall = 0;
+
+    for (int i = 0; i < max_iter; ++i) {
+      const double target = current + (closing ? 1.0 : -1.0) * step_rad;
+      bus_->control_mit_stream(target, kp, kd, 0.3, 0.0, 0.0, 0.005);
+      bus_->update_state(0.1);
+
+      const double measured = bus_->get_position();
+      const double delta = std::fabs(measured - current);
+      std::printf("[litegrip]   [%d] pos=%.4f d=%.5f stall=%d\n", i, measured,
+                  delta, stall);
+
+      if (delta < stall_delta) {
+        if (++stall >= stall_cycles) {
+          std::printf("[litegrip]   detected the %s limit: %.6f rad\n", label,
+                      measured);
+          return measured;
+        }
+      } else {
+        stall = 0;
+      }
+      current = measured;
+    }
+    std::printf("[litegrip]   safety stop at the iteration cap: %.4f rad\n",
+                current);
+    return current;
+  };
+
+  const double opened = step_to_limit(false, "open");
+  std::printf("[litegrip] backing off\n");
+  bus_->control_mit_stream(opened - 0.15, 80.0, kd, 0.5, 0.0, 0.0, 0.005);
+  sleep_s(0.1);
+  const double closed = step_to_limit(true, "closed");
+
+  const double travel = closed - opened;
+  if (travel <= 0.0) {
+    throw CommError("calibration failed: the travel range is not positive");
+  }
+
+  CalibrationData result;
+  result.zero_position = closed;
+  result.max_position = opened;
+  result.travel_range = travel;
+  result.rad_to_mm = config_.max_stroke_mm / travel;
+  result.motor_type = motor_type_name(GripperParams::kMotorType);
+  result.can_id = config_.can_id;
+  result.mst_id = mst_id_.value_or(0);
+
+  config_.pos_closed_rad = result.zero_position;
+  config_.pos_open_rad = result.max_position;
+  config_.rad_to_mm = result.rad_to_mm;
+  return result;
+}
+
+CalibrationData LiteGrip::calibrate_manual(double duration, double settle_time,
+                                           double sample_interval) {
+  check_connected();
+  check_enabled();
+
+  // Zero-torque streaming so the jaws can be moved by hand.
+  auto scope = safety_->zero_gravity_scope("calibrate_manual");
+
+  std::printf(
+      "[litegrip] hand-push calibration: the gripper is limp. Push the jaws "
+      "fully closed, then fully open, a few times. Recording for %.0f s.\n",
+      duration);
+
+  double open_rad = std::numeric_limits<double>::infinity();
+  double close_rad = -std::numeric_limits<double>::infinity();
+  int samples = 0;
+
+  const auto sample = [&]() {
+    safety_->guard_zero_torque_frame(0.0, 0.0, 0.0, 0.0, "calibrate_manual");
+    bus_->control_mit(0.0, 0.0, 0.0, 0.0, 0.0);
+    bus_->poll(0.0);
+    const double position = bus_->get_position();
+    // Ignore readings that cannot be real feedback.
+    if (std::fabs(position) < 50.0) {
+      ++samples;
+      open_rad = std::min(open_rad, position);
+      close_rad = std::max(close_rad, position);
+    }
+  };
+
+  const double deadline = monotonic_now() + duration;
+  while (monotonic_now() < deadline) {
+    sample();
+    sleep_s(sample_interval);
+  }
+
+  std::printf("[litegrip] settling for %.0f s\n", settle_time);
+  const double settle_deadline = monotonic_now() + settle_time;
+  while (monotonic_now() < settle_deadline) {
+    sample();
+    sleep_s(sample_interval);
+  }
+
+  // Leave the gripper holding wherever it is, with the configured gains.
+  bus_->control_mit_stream(bus_->get_position(), config_.kp, config_.kd, 0.05);
+  sleep_s(0.1);
+
+  if (!std::isfinite(open_rad) || open_rad >= close_rad) {
+    throw CommError(
+        "calibration failed: no usable position range was captured — check "
+        "that the motor is enabled and producing feedback");
+  }
+
+  const double travel = close_rad - open_rad;
+  const double rad_to_mm = travel > 0.0 ? config_.max_stroke_mm / travel
+                                        : UnitConversion::kRadToMm;
+
+  CalibrationData result;
+  result.zero_position = close_rad;
+  result.max_position = open_rad;
+  result.travel_range = travel;
+  result.rad_to_mm = rad_to_mm;
+  result.motor_type = motor_type_name(GripperParams::kMotorType);
+  result.can_id = config_.can_id;
+  result.mst_id = mst_id_.value_or(0);
+
+  config_.pos_closed_rad = result.zero_position;
+  config_.pos_open_rad = result.max_position;
+  config_.rad_to_mm = result.rad_to_mm;
+
+  std::printf(
+      "[litegrip] calibrate_manual: %d samples, closed=%.6f rad open=%.6f rad "
+      "travel=%.6f rad (%.1f mm) scale=%.1f mm/rad\n",
+      samples, result.zero_position, result.max_position, result.travel_range,
+      result.travel_mm(), result.rad_to_mm);
+  return result;
+}
+
+std::string LiteGrip::save_calibration(std::optional<std::string> path) {
+  const std::string destination =
+      path.has_value() ? *path : default_calibration_path();
+  const int mst = mst_id_.value_or(0);
+  write_calibration_file(destination, config_, config_.can_id, mst,
+                         motor_type_name(GripperParams::kMotorType));
+  return destination;
+}
+
+bool LiteGrip::load_calibration(std::optional<std::string> path) {
+  const std::string user_path = path.has_value() ? *path : default_calibration_path();
+
+  // User file first, then the packaged read-only factory fallback.
+  std::optional<CalibrationFile> calibration =
+      read_calibration_file(user_path);
+  if (!calibration.has_value()) {
+    calibration = read_calibration_file(factory_calibration_path());
+  }
+  if (!calibration.has_value()) {
+    std::fprintf(stderr,
+                 "[litegrip] no calibration found in %s or the factory "
+                 "fallback; run a calibration first\n",
+                 user_path.c_str());
+    return false;
+  }
+
+  config_.pos_closed_rad = calibration->zero_position_rad;
+  config_.pos_open_rad = calibration->max_position_rad;
+  config_.rad_to_mm = calibration->rad_to_mm;
+
+  if (calibration->can_id.has_value()) {
+    config_.can_id = *calibration->can_id;
+  }
+  if (calibration->mst_id.has_value()) {
+    config_.mst_id = *calibration->mst_id;
+    mst_id_ = calibration->mst_id;
+  }
+  if (calibration->channel.has_value()) {
+    config_.can_channel = *calibration->channel;
+  }
+  if (calibration->canfd_mode.has_value()) {
+    config_.canfd_mode = *calibration->canfd_mode;
+  }
+  if (calibration->kp.has_value()) {
+    config_.kp = *calibration->kp;
+  }
+  if (calibration->kd.has_value()) {
+    config_.kd = *calibration->kd;
+  }
+  if (calibration->grasp_torque_threshold.has_value()) {
+    config_.grasp_torque_threshold = *calibration->grasp_torque_threshold;
+  }
+  return true;
+}
+
+// ── state ─────────────────────────────────────────────────────────────────
+
+GripperState LiteGrip::get_state(bool wait) {
+  check_connected();
+
+  GripperState state;
+  if (bus_ == nullptr) {
+    return state;
+  }
+
+  if (wait) {
+    bus_->update_state(0.05);
+  } else {
+    bus_->poll(0.0);
+  }
+
+  can::MotorState* motor = bus_->motor();
+  const double data_age =
+      motor != nullptr ? motor->data_age_s()
+                       : std::numeric_limits<double>::infinity();
+
+  if (wait && data_age > kStaleAfterS) {
+    std::fprintf(stderr,
+                 "[litegrip] get_state(): no fresh status frame — the returned "
+                 "values are cached/placeholder, not a measurement (a disabled "
+                 "motor does not stream status frames)\n");
+  }
+
+  const double position_rad = bus_->get_position();
+  state.position_rad = position_rad;
+  state.velocity_rad_s = bus_->get_velocity();
+  state.torque_nm = bus_->get_torque();
+  state.temperature_mos = bus_->get_temperature_mos();
+  state.temperature_coil = bus_->get_temperature_coil();
+  state.error_code = bus_->get_error();
+  state.timestamp = wall_clock_now();
+  state.data_age_s = data_age;
+  // The motor angle decreases as the gripper opens.
+  state.position_mm =
+      (config_.pos_closed_rad - position_rad) * config_.rad_to_mm;
+  state.force_n = state.torque_nm * config_.nm_to_n;
+  return state;
+}
+
+bool LiteGrip::refresh_status(double timeout_s) {
+  check_connected();
+  return bus_ != nullptr && bus_->refresh_status(timeout_s);
+}
+
+double LiteGrip::get_position_mm() { return get_state().position_mm; }
+
+double LiteGrip::get_position_rad() {
+  check_connected();
+  if (bus_ == nullptr) {
+    return 0.0;
+  }
+  bus_->update_state(0.05);
+  return bus_->get_position();
+}
+
+double LiteGrip::get_force() { return get_state().force_n; }
+
+double LiteGrip::get_torque() {
+  check_connected();
+  if (bus_ == nullptr) {
+    return 0.0;
+  }
+  bus_->update_state(0.05);
+  return bus_->get_torque();
+}
+
+int LiteGrip::get_error() {
+  check_connected();
+  if (bus_ == nullptr) {
+    return -1;
+  }
+  bus_->update_state(0.05);
+  return bus_->get_error();
+}
+
+std::pair<int, int> LiteGrip::get_temperature() {
+  check_connected();
+  if (bus_ == nullptr) {
+    return {0, 0};
+  }
+  bus_->update_state(0.05);
+  return {bus_->get_temperature_mos(), bus_->get_temperature_coil()};
+}
+
+GripperInfo LiteGrip::get_info() const {
+  GripperInfo info;
+  info.motor_type = motor_type_name(GripperParams::kMotorType);
+  info.can_id = config_.can_id;
+  info.mst_id = mst_id_.value_or(0);
+  return info;
+}
+
+bool LiteGrip::is_moving() { return get_state().is_moving(); }
+
+bool LiteGrip::is_grasped() {
+  const GripperState state = get_state();
+  return std::fabs(state.torque_nm) > config_.grasp_torque_threshold;
+}
+
+bool LiteGrip::wait_for_ready(double timeout) {
+  if (bus_ == nullptr) {
+    return false;
+  }
+  const double start = monotonic_now();
+  while (monotonic_now() - start < timeout) {
+    bus_->update_state(0.05);
+    if (bus_->get_error() == 1 && !is_moving()) {
+      return true;
+    }
+    sleep_s(0.05);
+  }
+  return false;
+}
+
+// ── parameter access ──────────────────────────────────────────────────────
+
+double LiteGrip::read_param(int rid, double timeout_s) {
+  check_connected();
+  if (bus_ == nullptr) {
+    throw NotInitializedError("not connected");
+  }
+  return bus_->read_param(rid, timeout_s);
+}
+
+void LiteGrip::write_param(int rid, double value) {
+  check_connected();
+  if (bus_ == nullptr) {
+    throw NotInitializedError("not connected");
+  }
+  bus_->write_param(rid, value);
+}
+
+// ── internal ──────────────────────────────────────────────────────────────
+
+void LiteGrip::check_connected() const {
+  if (!connected_) {
+    throw NotInitializedError(
+        "not connected — call connect() or use connect_raii()");
+  }
+}
+
+void LiteGrip::check_enabled() const {
+  if (!enabled_) {
+    throw NotInitializedError("not enabled — call init() or enable() first");
+  }
+}
+
+}  // namespace litegrip

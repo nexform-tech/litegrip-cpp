@@ -1,0 +1,38 @@
+{
+  "kind": "safety_limits",
+  "baseline_version": "0.25",
+  "is_default_baseline": false,
+  "supersedes": null,
+  "device": "LiteGrip",
+  "can_id": 8,
+  "mst_id": 24,
+
+  "mechanical_observed_min_rad": -1.272793,
+  "mechanical_observed_max_rad": 0.051308,
+  "red_open_limit_rad": -1.24,
+  "red_close_limit_rad": -0.01,
+  "red_line_enabled": true,
+
+  "hard_torque_limit_nm": 0.25,
+
+  "torque_basis": {
+    "value_nm": 0.25,
+    "meaning": "the previous, much tighter torque baseline, kept as an independent rollback path",
+    "note": "the red lines are identical to the 3.5 baseline; only the torque ceiling differs"
+  },
+
+  "provenance": [
+    "Retained so a rollback is an explicit, auditable version choice rather than an in-place edit of a file's contents.",
+    "It does NOT participate in default selection: only load_safety_baseline(\"0.25\") picks it up."
+  ],
+
+  "warnings": [
+    "★ NOT VERIFIED ON THIS UNIT — same caveat as safety_limits_350.json: the interval is the reference unit's measurement, to be re-derived before real-hardware motion.",
+    "★ This is a deliberately conservative ceiling, not a measured one: expect normal grasps to be torque-limited by it."
+  ],
+
+  "invariants": [
+    "mechanical_observed_min_rad <= red_open_limit_rad < red_close_limit_rad <= mechanical_observed_max_rad",
+    "A config file may only NARROW this baseline; any attempt to widen it is rejected."
+  ]
+}

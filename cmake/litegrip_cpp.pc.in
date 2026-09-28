@@ -1,0 +1,16 @@
+# Relocatable: the .pc is installed into <prefix>/lib/pkgconfig, so prefix is
+# derived from its own location. That way `cmake --install --prefix <dir>`
+# produces a correct .pc without a reconfigure, and a relocated install keeps
+# working.
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+datadir=${prefix}/@CMAKE_INSTALL_DATADIR@
+
+Name: litegrip_cpp
+Description: ROS-agnostic C++ SDK for the LiteGrip adaptive two-finger gripper (SocketCAN / Damiao DM4310 MIT protocol)
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -llitegrip_cpp
+Libs.private: -lpthread
+Cflags: -I${includedir}
