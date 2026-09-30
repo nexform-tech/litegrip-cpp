@@ -731,7 +731,7 @@ SafetyLimits load_safety_baseline(const std::optional<std::string>& version) {
                                : safety_baseline_path(wanted);
   if (!file_exists(path)) {
     // Fail-closed: silently falling back would make "the config was lost" look
-    // identical to "the config is correct", and the node would run with a
+    // identical to "the config is correct", and the process would run with a
     // torque ceiling nobody confirmed.
     throw SafetyConfigError("safety baseline '" + wanted +
                             "' file does not exist: " + path +

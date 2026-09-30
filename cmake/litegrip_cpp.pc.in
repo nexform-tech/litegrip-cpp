@@ -9,7 +9,7 @@ includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
 datadir=${prefix}/@CMAKE_INSTALL_DATADIR@
 
 Name: litegrip_cpp
-Description: ROS-agnostic C++ SDK for the LiteGrip adaptive two-finger gripper (SocketCAN / Damiao DM4310 MIT protocol)
+Description: C++ SDK for the LiteGrip adaptive two-finger gripper (SocketCAN / Damiao DM4310 MIT protocol)
 Version: @PROJECT_VERSION@
 Libs: -L${libdir} -llitegrip_cpp
 Libs.private: -lpthread

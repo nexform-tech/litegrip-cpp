@@ -1,14 +1,12 @@
 cmake_minimum_required(VERSION 3.16)
 project(litegrip_cpp VERSION 0.1.0 LANGUAGES CXX)
 
-# litegrip_cpp — ROS-agnostic C++ SDK for the LiteGrip adaptive two-finger gripper.
+# litegrip_cpp — C++ SDK for the LiteGrip adaptive two-finger gripper.
 #
 # Design constraints (see ../PLAN-litegrip-cpp.md):
 #   * C++17, zero third-party dependencies (stdlib + Linux SocketCAN only).
-#   * MUST NOT depend on ROS / ament / ros2_control — this library is the bottom
-#     layer that ros2_control links, and is usable from any plain C++ program.
-#   * Installable both into a ROS workspace (colcon, plain-cmake package.xml)
-#     and into a normal prefix (find_package + pkg-config).
+#   * No framework dependencies — usable from any plain C++ program.
+#   * Installable into a normal prefix (find_package + pkg-config).
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   set(LITEGRIP_CPP_IS_TOP_LEVEL ON)

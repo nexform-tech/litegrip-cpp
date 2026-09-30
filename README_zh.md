@@ -1,13 +1,12 @@
 # litegrip_cpp
 
-LiteGrip 自适应两指夹爪的 **ROS 无关 C++ SDK**。
+LiteGrip 自适应两指夹爪的 **C++ SDK**。
 
-本包是 litegrip 栈的第 1 层 —— `litegrip_cpp`（SDK）→ `litegrip_ros2_control`
-（硬件接口）→ `litegrip_moveit_config`（MoveIt）。它直接讲 SocketCAN 与达妙
-DM4310 的 MIT 协议，依赖**只有** C++17 标准库、`pthread` 和 Linux SocketCAN
-头文件：没有 ROS、没有 ament、没有第三方库。非 ROS 实现可以直接链接使用。
+litegrip 栈的最底层。它直接讲 SocketCAN 与达妙 DM4310 的 MIT 协议，依赖
+**只有** C++17 标准库、`pthread` 和 Linux SocketCAN 头文件：没有第三方库。
+任何普通 C++ 程序都可以直接链接。
 
-> 状态：**第 1 层已全部实现**（`can/*`、`GripperBus`、`LiteGrip`、
+> 状态：**SDK 已全部实现**（`can/*`、`GripperBus`、`LiteGrip`、
 > `json`/标定、`SafetyGuard`、`ControlLoop`）。
 
 ## 分层
@@ -21,7 +20,7 @@ DM4310 的 MIT 协议，依赖**只有** C++17 标准库、`pthread` 和 Linux S
 | `GripperBus` | 单爪总线 API（`init` = 持位） | `protocols/can_bus.py` |
 | `LiteGrip` | 高层 API | `gripper.py` |
 | `SafetyGuard` + `SafetyLimits` | 红线、力矩预算、看门狗、模式 | `safety_limits.py`（核心） |
-| `ControlLoop` | 后台 200 Hz 流式发送 + 限速 + 闸门 | 旧的 ROS 侧守护进程 |
+| `ControlLoop` | 后台 200 Hz 流式发送 + 限速 + 闸门 | 旧的 Python 侧守护进程 |
 
 ## 构建
 
@@ -33,21 +32,18 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-它同时可以被 `colcon` 构建（通过 `package.xml` 声明为 plain-cmake 包），
-因此 ROS 工作空间能把它和其余 ROS 包一起构建。
-
 ## 消费方式
 
 ```cmake
 find_package(litegrip_cpp REQUIRED)
-target_link_libraries(my_node PRIVATE litegrip_cpp::litegrip_cpp)
+target_link_libraries(my_app PRIVATE litegrip_cpp::litegrip_cpp)
 ```
 
 ```bash
 pkg-config --cflags --libs litegrip_cpp
 ```
 
-## 非 ROS 用法
+## 最小示例
 
 ```cpp
 #include <litegrip/litegrip.hpp>

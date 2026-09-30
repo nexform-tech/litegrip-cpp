@@ -1,4 +1,4 @@
-// litegrip_cpp — ROS-agnostic C++ SDK for the LiteGrip adaptive two-finger gripper.
+// litegrip_cpp — C++ SDK for the LiteGrip adaptive two-finger gripper.
 
 #include "litegrip/version.hpp"
 

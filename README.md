@@ -1,16 +1,15 @@
 # litegrip_cpp
 
-ROS-agnostic **C++ SDK** for the LiteGrip adaptive two-finger gripper.
+**C++ SDK** for the LiteGrip adaptive two-finger gripper.
 
 **English** · [简体中文](README_zh.md)
 
-This is layer 1 of the litegrip stack — `litegrip_cpp` (SDK) → `litegrip_ros2_control`
-(hardware interface) → `litegrip_moveit_config` (MoveIt). It speaks SocketCAN and
-the Damiao DM4310 MIT protocol directly and depends on **nothing** but the C++17
-standard library, `pthread`, and the Linux SocketCAN headers: no ROS, no ament,
-no third-party libraries. Non-ROS implementations can link it as-is.
+The bottom layer of the litegrip stack. It speaks SocketCAN and the Damiao
+DM4310 MIT protocol directly and depends on **nothing** but the C++17 standard
+library, `pthread`, and the Linux SocketCAN headers: no third-party libraries.
+Any plain C++ program can link it as-is.
 
-> Status: **layer 1 is complete** — `can/*`, `GripperBus`, `LiteGrip`,
+> Status: **the SDK is complete** — `can/*`, `GripperBus`, `LiteGrip`,
 > `json`/calibration, `SafetyGuard` and `ControlLoop` are all implemented and
 > tested.
 
@@ -80,7 +79,7 @@ motion, calibration, and the transport send/receive path.
 | `GripperBus` | single-gripper bus API (init = hold) | `protocols/can_bus.py` |
 | `LiteGrip` | high-level API | `gripper.py` |
 | `SafetyGuard` + `SafetyLimits` | red lines, torque budget, watchdog, modes | `safety_limits.py` (core) |
-| `ControlLoop` | background 200 Hz streaming + rate limit + gate | old ROS-side daemon |
+| `ControlLoop` | background 200 Hz streaming + rate limit + gate | old Python-side daemon |
 
 ## Build
 
@@ -92,21 +91,18 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-It is also buildable by `colcon` (declared as a plain-cmake package via
-`package.xml`) so a ROS workspace can build it beside the ROS packages.
-
 ## Consume
 
 ```cmake
 find_package(litegrip_cpp REQUIRED)
-target_link_libraries(my_node PRIVATE litegrip_cpp::litegrip_cpp)
+target_link_libraries(my_app PRIVATE litegrip_cpp::litegrip_cpp)
 ```
 
 ```bash
 pkg-config --cflags --libs litegrip_cpp
 ```
 
-## Non-ROS usage
+## Minimal example
 
 ```cpp
 #include <litegrip/litegrip.hpp>
