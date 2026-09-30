@@ -13,13 +13,6 @@ Any plain C++ program can link it as-is.
 > `json`/calibration, `SafetyGuard` and `ControlLoop` are all implemented and
 > tested.
 
-## What is **not** in this version
-
-Per the agreed v1 scope: `grasp()`, `set_force()`, `move_at_speed*()` and the
-public zero-gravity mode. `close(force_n=...)` accepts the argument, ignores it
-and says so, because applying a grip force needs torque feed-forward and
-verified force calibration.
-
 ## Safety wiring
 
 The motion path (`goto_rad` / `move_to` / `open` / `close` / `home`) passes
@@ -129,11 +122,3 @@ These are the safety argument and must not be relaxed:
    be bounded ⇒ do not move that way.
 4. **Strict numeric boundary** — NaN / ±inf / non-numbers are rejected before any
    comparison.
-
-## Red lines are not yet unit-specific
-
-The packaged safety baseline carries the reference unit's hand-push measurement.
-They must be re-derived per gripper (caliper + closed-end re-zero) before
-real-hardware motion, and `ControlLoopConfig::max_feedback_velocity_rad_s` must
-be calibrated first — until it is, the loop refuses to send any motion frame
-(deliberate fail-closed).
