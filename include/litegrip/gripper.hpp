@@ -1,8 +1,7 @@
 // litegrip/gripper.hpp — high-level gripper API (LiteGrip).
 //
 // Port of litegrip_driver/litegrip/gripper.py. This is the entry point most
-// non-ROS consumers use: connect, init (hold), open/close/goto, calibrate,
-// read state.
+// consumers use: connect, init (hold), open/close/goto, calibrate, read state.
 //
 // v1 capability scope (PLAN-litegrip-cpp.md D6). Deliberately NOT in v1:
 //   * grasp() / set_force()            — force control, deferred
@@ -43,7 +42,7 @@ class LiteGrip {
   LiteGrip& operator=(LiteGrip&& other) noexcept;
 
   /// Connect and return a live instance (throws ConnectError on failure).
-  /// The RAII one-liner for the non-ROS case.
+  /// The RAII one-liner: the returned object disconnects on destruction.
   static LiteGrip connect_raii(GripperConfig config = GripperConfig{});
 
   // ── properties ────────────────────────────────────────────────────────

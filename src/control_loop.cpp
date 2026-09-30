@@ -1,20 +1,20 @@
 // control_loop.cpp — the background control loop.
 //
-// Replaces the old ros2_control Python daemon + shared-memory bridge: with a
-// C++ SDK the two-process split has no reason to exist, so "rate-limit the
-// target, allocate the torque budget, gate the frame, stream it, watch the
-// feedback" now lives in one thread inside the library.
+// Replaces the old Python daemon + shared-memory bridge: with a C++ SDK the
+// two-process split has no reason to exist, so "rate-limit the target, allocate
+// the torque budget, gate the frame, stream it, watch the feedback" now lives
+// in one thread inside the library.
 //
 // R1: the loop owns a background thread. A DM motor needs a continuous MIT
 // frame stream (~900 ms of silence latches the 0xD comm-loss fault) and the
-// controller_manager cycle is not guaranteed stable, so the layer above only
-// posts a target and reads a cached snapshot.
+// caller's cycle is not guaranteed stable, so the layer above only posts a
+// target and reads a cached snapshot.
 //
 // dry_run is not "do nothing": it runs the whole control path — rate limiting,
 // torque-budget allocation and the safety gate — against a simulated plant and
 // only skips opening CAN and sending. That makes the gate and the
 // deploy-config fail-closed behaviour testable without hardware, and is what
-// makes a dry-run ros2_control stack meaningful.
+// makes a dry-run deployment meaningful.
 
 #include "litegrip/control_loop.hpp"
 

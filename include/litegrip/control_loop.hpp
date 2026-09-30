@@ -1,13 +1,13 @@
 // litegrip/control_loop.hpp — background streaming control loop.
 //
-// Replaces the old ros2_control Python daemon (hw_daemon.py + sdk_adapter.py +
-// the shared-memory bridge). With a C++ SDK the two-process split has no reason
-// to exist: the ros2_control hardware component links this class directly.
+// Replaces the old Python daemon (hw_daemon.py + sdk_adapter.py + the
+// shared-memory bridge). With a C++ SDK the two-process split has no reason to
+// exist: the layer above links this class directly.
 //
 // R1: the loop runs on its own background thread. A DM motor needs a continuous
 // MIT frame stream (~900 ms of silence latches the 0xD comm-loss fault), and
-// the controller_manager cycle is not guaranteed stable — so the plugin's
-// write() only posts a target and its read() only reads a cached snapshot.
+// the caller's cycle is not guaranteed stable — so the layer above only posts a
+// target and reads a cached snapshot.
 //
 // What the loop owns (all of it used to be spread across safety_gate.py,
 // driver_adapter.py's TrajectoryLimiter and sdk_adapter.py's _send_motion):

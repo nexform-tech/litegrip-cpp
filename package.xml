@@ -1,19 +1,16 @@
 <?xml version="1.0"?>
-<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>litegrip_cpp</name>
   <version>0.1.0</version>
   <description>
-    ROS-agnostic C++ SDK for the LiteGrip adaptive two-finger gripper.
+    C++ SDK for the LiteGrip adaptive two-finger gripper.
 
-    This is the bottom layer of the litegrip stack (sdk → ros2_control →
-    moveit_config). It speaks SocketCAN and the Damiao DM4310 MIT protocol
-    directly and depends on nothing but the C++17 standard library and the
-    Linux SocketCAN headers — deliberately no ROS, no ament, no third-party
-    libraries, so that non-ROS implementations can reuse it as-is.
+    This is the bottom layer of the litegrip stack. It speaks SocketCAN and the
+    Damiao DM4310 MIT protocol directly and depends on nothing but the C++17
+    standard library and the Linux SocketCAN headers — no third-party
+    libraries.
 
-    Declared as a plain-cmake package (build_type cmake) purely so a colcon
-    workspace can build it alongside the ROS packages; the library itself is
+    Declared as a plain-cmake package (build_type cmake); the library itself is
     built and installed like any ordinary CMake project.
   </description>
   <maintainer email="TODO@email.com">TODO</maintainer>

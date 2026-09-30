@@ -2,10 +2,10 @@
 //
 // Ported from the safety-aware SDK variant's safety_limits.py (core only —
 // exclude the contact/force/stall/no-load physics models, see
-// PLAN-litegrip-cpp.md D5), plus the ROS-side gate's two hard ceilings
+// PLAN-litegrip-cpp.md D5), plus the old Python gate's two hard ceilings
 // (TORQUE_LIMIT_CEILING_NM / MAX_COMMAND_VELOCITY_CEILING_RAD_S) so that the
-// whole stack keeps a single source of truth now that the ROS-side Python is
-// going away (D2/D4).
+// whole stack keeps a single source of truth now that the old Python is going
+// away (D2/D4).
 //
 // The Python original's long-form Chinese rationale is NOT copied here — it
 // lives in safety_limits.py and in the plan. What is preserved is the set of
@@ -62,7 +62,7 @@ inline constexpr double kProtocolQMaxRad = 12.5;
 /// protocol range / a fake 0 read from nothing.
 inline constexpr double kZeroTorqueQFallback = -0.6;
 
-/// ROS-side torque hard ceiling, N.m. Read-only: limits may only go below it.
+/// Torque hard ceiling, N.m. Read-only: limits may only go below it.
 inline constexpr double kTorqueLimitCeilingNm = 3.5;
 
 /// Command-trajectory velocity hard ceiling, rad/s. Read-only.

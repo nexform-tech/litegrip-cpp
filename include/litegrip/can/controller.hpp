@@ -1,8 +1,8 @@
 // litegrip/can/controller.hpp — manages DM motors over one CAN transport.
 //
 // Port of litegrip_driver/litegrip/can/controller.py. Kept multi-motor capable
-// even though LiteGrip uses a single motor: it is the reusable "outside ROS"
-// surface for anyone driving several Damiao motors on one bus.
+// even though LiteGrip uses a single motor: it is the general-purpose surface
+// for anyone driving several Damiao motors on one bus.
 
 #pragma once
 

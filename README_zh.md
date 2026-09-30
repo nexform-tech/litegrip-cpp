@@ -1,13 +1,12 @@
 # litegrip_cpp
 
-LiteGrip 自适应两指夹爪的 **ROS 无关 C++ SDK**。
+LiteGrip 自适应两指夹爪的 **C++ SDK**。
 
-本包是 litegrip 栈的第 1 层 —— `litegrip_cpp`（SDK）→ `litegrip_ros2_control`
-（硬件接口）→ `litegrip_moveit_config`（MoveIt）。它直接讲 SocketCAN 与达妙
-DM4310 的 MIT 协议，依赖**只有** C++17 标准库、`pthread` 和 Linux SocketCAN
-头文件：没有 ROS、没有 ament、没有第三方库。非 ROS 实现可以直接链接使用。
+litegrip 栈的最底层。它直接讲 SocketCAN 与达妙 DM4310 的 MIT 协议，依赖
+**只有** C++17 标准库、`pthread` 和 Linux SocketCAN 头文件：没有第三方库。
+任何普通 C++ 程序都可以直接链接。
 
-> 状态：**第 1 层已全部实现**（`can/*`、`GripperBus`、`LiteGrip`、
+> 状态：**SDK 已全部实现**（`can/*`、`GripperBus`、`LiteGrip`、
 > `json`/标定、`SafetyGuard`、`ControlLoop`）。
 
 ## 分层
@@ -21,7 +20,7 @@ DM4310 的 MIT 协议，依赖**只有** C++17 标准库、`pthread` 和 Linux S
 | `GripperBus` | 单爪总线 API（`init` = 持位） | `protocols/can_bus.py` |
 | `LiteGrip` | 高层 API | `gripper.py` |
 | `SafetyGuard` + `SafetyLimits` | 红线、力矩预算、看门狗、模式 | `safety_limits.py`（核心） |
-| `ControlLoop` | 后台 200 Hz 流式发送 + 限速 + 闸门 | 旧的 ROS 侧守护进程 |
+| `ControlLoop` | 后台 200 Hz 流式发送 + 限速 + 闸门 | 旧的 Python 侧守护进程 |
 
 ## 构建
 
@@ -33,21 +32,18 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
 
-它同时可以被 `colcon` 构建（通过 `package.xml` 声明为 plain-cmake 包），
-因此 ROS 工作空间能把它和其余 ROS 包一起构建。
-
 ## 消费方式
 
 ```cmake
 find_package(litegrip_cpp REQUIRED)
-target_link_libraries(my_node PRIVATE litegrip_cpp::litegrip_cpp)
+target_link_libraries(my_app PRIVATE litegrip_cpp::litegrip_cpp)
 ```
 
 ```bash
 pkg-config --cflags --libs litegrip_cpp
 ```
 
-## 非 ROS 用法
+## 最小示例
 
 ```cpp
 #include <litegrip/litegrip.hpp>
@@ -62,12 +58,6 @@ int main() {
   return state.is_stale() ? 1 : 0;
 }
 ```
-
-## 本版本**不包含**
-
-按已确认的 v1 范围：`grasp()`、`set_force()`、`move_at_speed*()`，以及公开的零重力
-模式。`close(force_n=...)` 接受该参数但**忽略并明确告警**，因为施加夹持力需要力矩
-前馈与经过验证的力标定，两者都不在 v1 范围内。
 
 ## 安全不变量
 
@@ -89,16 +79,6 @@ int main() {
   该绕过合法的依据。
 - **标定流程** —— 它们本来就要把机构顶到**机械**端点，而机械端点在红线之外。
   （标定与红线之间的正确关系仍是一个待定事项，见方案中的未决项。）
-
-## 红线尚未按本台夹爪重建
-
-随包的安全基线携带的是**参考台**的手推实测值，且文件内已明确标注
-**未在本机验证**。在真机运动之前必须重新标定（卡尺 + 闭合端重设零点）并以实测值
-重建红线；同时 `ControlLoopConfig::max_feedback_velocity_rad_s` 必须先行标定 ——
-在该值给出之前，控制环**拒绝发送任何运动帧**（这是刻意的 fail-closed）。
-
-推论：若某台夹爪的标定使闭合端落在红线之外，本 SDK 会（正确地）**拒绝一切运动**，
-直到红线被重建。
 
 ## 测试
 
@@ -125,7 +105,3 @@ ctest --test-dir build --output-on-failure
 覆盖** —— 需要 vcan 接口（需 root）或真机。
 
 同样没有覆盖、需要真机的部分：连接、`init`/使能、运动、标定。
-
-## 许可证
-
-MIT。
