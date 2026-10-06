@@ -18,5 +18,6 @@
 #include "litegrip/hold_policy.hpp"
 #include "litegrip/json.hpp"
 #include "litegrip/models.hpp"
+#include "litegrip/motion.hpp"
 #include "litegrip/safety.hpp"
 #include "litegrip/version.hpp"

@@ -15,12 +15,68 @@ Any plain C++ program can link it as-is.
 
 ## Safety wiring
 
-The motion path (`goto_rad` / `move_to` / `open` / `close` / `home`) passes
-through `SafetyGuard::guard_motion_frame`, and rejections are **raised, not
-clamped**. Two paths deliberately bypass it, each documented at its definition:
-`stop()` (an emergency stop must work from outside the red lines — it asserts
-the zero-torque invariant instead) and the calibration routines (they drive to
-the mechanical stops, which lie outside the red lines).
+The position-motion path (`goto_rad` / `move_to` / `home`) passes through
+`SafetyGuard::guard_motion_frame`, and rejections are **raised, not clamped**.
+Three paths deliberately bypass it, each documented at its definition:
+
+- `stop()` — an emergency stop must work from outside the red lines; it
+  asserts the zero-torque invariant instead.
+- the calibration routines — they drive to the mechanical stops, which lie
+  outside the red lines.
+- the **action engine** (`open` / `close` / `grasp` / `set_force` /
+  `move_at_speed` / zero-gravity) — it re-aims the target every frame, which
+  the gate's one-target-per-call shape cannot express. It carries its own
+  bounds: every frame's kp / kd / tau / dq is re-checked against the guard's
+  `TemporaryParams`, and a move that starts with the measured position outside
+  the red lines is first driven back inside — inward only, at the recovery
+  ceilings, `tau = 0` — by an engine-side recovery crawl that fails closed.
+  That crawl is the engine-side twin of `guard_recovery_frame()`, which cannot
+  do the job today because it admits only positions inside the packaged
+  mechanical envelope (the reference unit's unverified hand-push bound, which
+  no shipped calibration's stops lie inside); the open item is written up at
+  `MotionEngine::recover_to_interior`.
+
+## Mount direction
+
+The two calibrated limits carry the direction: whichever is numerically larger
+is the closed side, and every mm / force conversion derives its sign from that
+ordering (`GripperConfig::close_sign()`). Direction is data, not a switch, so
+there is no second place for it to disagree with itself.
+
+A reverse-mounted unit is declared by loading the matching template:
+
+```cpp
+gripper.load_template("reverse");    // or load_calibration(path) for a file
+gripper.config().mount();            // "reverse" — read back, not stored
+```
+
+`load_template()` is strict on purpose: an unknown name throws, and an
+unreadable template never falls back to the factory file — that file is a
+*normal* mount, and quietly answering "reverse" with "normal" is the one
+failure the name exists to prevent.
+
+Calibrations are per channel (`~/.litegrip/<channel>_calibration.json`; the
+legacy single-file location is still read): every LiteGrip ships at CAN id
+0x08, so on a two-gripper machine the channel is the only identity key, and
+the automatic load skips a file that declares a different one.
+`GripperConfig::calibrated` is false until a calibration or a template is
+loaded; before that `mount()` reports nothing rather than guessing.
+
+## Actions
+
+`open` / `close` / `grasp` / `set_force` / `move_at_speed(_rad)` /
+`enter_zero_gravity` / `exit_zero_gravity` run the same frame-by-frame engine
+as the online Python SDK (`MotionConfig` carries the tuned defaults; a
+`MoveResult` / `GraspResult` reports `ok` / `reached` / `stalled`). `open()`
+and `close()` no longer take gains or a duration — they take an optional speed
+and press onto the mechanical stop, and their truthiness still means "pressed
+onto the stop". The old `close(force_n=...)` is gone with them: use
+`grasp(force_n, hold_s)` to close onto an object and squeeze.
+
+⚠ `grasp()` / `set_force()` apply `force_n` as a torque feed-forward
+(`close_sign * force_n * 0.1` Nm), byte-for-byte like the Python SDK — but the
+N value is **NOT force-calibrated** in this SDK; do not build force-limited
+behaviour on it.
 
 ## Mount direction
 
@@ -71,13 +127,14 @@ on `can0`): it only reads an interface MTU, checks the missing-interface error
 path, and opens/closes a socket. The send/receive path is not yet covered by a
 test — it needs a vcan interface (root) or the real device.
 
-`test_bus.cpp`, `test_gripper.cpp`, `test_safety.cpp` and
+`test_bus.cpp`, `test_gripper.cpp`, `test_safety.cpp`, `test_motion.cpp` and
 `test_control_loop.cpp` cover the behaviour that must hold **without** hardware:
 lifecycle refusals while disconnected, the missing-interface error path, config
-plumbing, the injectable hold policy, the calibration file round-trip, every
-safety criterion — including the adversarial "must reject" cases, since each of
-those is a case where accepting it would move hardware — and the control loop
-itself via `dry_run`.
+plumbing, the injectable hold policy, the calibration file round-trip, the
+action engine's ramps / lead caps / stall window / recovery crawl (against a
+kinematic fake motor), every safety criterion — including the adversarial
+"must reject" cases, since each of those is a case where accepting it would
+move hardware — and the control loop itself via `dry_run`.
 
 `dry_run` is not "do nothing": it runs the whole control path (rate limiting,
 torque-budget allocation, the gate, the watchdogs) against a simulated plant and
@@ -97,6 +154,7 @@ motion, calibration, and the transport send/receive path.
 | `can::MotorController` | multi-motor dispatch on one bus | `can/controller.py` |
 | `GripperBus` | single-gripper bus API (init = hold) | `protocols/can_bus.py` |
 | `LiteGrip` | high-level API | `gripper.py` |
+| `MotionEngine` | action engine: open/close/grasp/set_force/speed moves/zero-gravity | `actions.py` + `gripper.py` |
 | `SafetyGuard` + `SafetyLimits` | red lines, torque budget, watchdog, modes | `safety_limits.py` (core) |
 | `ControlLoop` | background 200 Hz streaming + rate limit + gate | old Python-side daemon |
 

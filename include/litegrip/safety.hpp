@@ -91,7 +91,10 @@ inline constexpr double kMaxCommandVelocityCeilingRadS = 1.5;
 
 /// Torque sign convention was verified on hardware (tau > 0 => closing).
 inline constexpr bool kTorqueDirectionVerified = true;
-/// Force/contact calibration was NOT verified — force feed-forward is refused.
+/// Force/contact calibration was NOT verified. Force feed-forward is still
+/// issued — the action engine's set_force()/grasp() apply the Python SDK's
+/// torque-per-newton constant so the two SDKs agree — but the N values are
+/// NOT physical. Do not build force-limited behaviour on them.
 inline constexpr bool kForceCalibrationVerified = false;
 
 /// Control and protection ceilings.
