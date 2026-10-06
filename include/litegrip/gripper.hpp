@@ -296,13 +296,6 @@ class LiteGrip : private MotionIo {
   void apply_calibration(const CalibrationFile& calibration,
                          const std::string& instance_channel);
 
-  /// Copy a decoded calibration into the config. `instance_channel` is the
-  /// channel *before* the copy: a file naming a different one is worth a
-  /// warning (the channel is the identity key when two grippers share CAN id
-  /// 0x08) but is not fatal, since older files predate the field.
-  void apply_calibration(const CalibrationFile& calibration,
-                         const std::string& instance_channel);
-
   GripperConfig config_;
   std::unique_ptr<GripperBus> bus_;
   std::unique_ptr<SafetyGuard> safety_;
