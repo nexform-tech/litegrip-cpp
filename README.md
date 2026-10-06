@@ -78,32 +78,6 @@ onto the stop". The old `close(force_n=...)` is gone with them: use
 N value is **NOT force-calibrated** in this SDK; do not build force-limited
 behaviour on it.
 
-## Mount direction
-
-The two calibrated limits carry the direction: whichever is numerically larger
-is the closed side, and every mm / force conversion derives its sign from that
-ordering (`GripperConfig::close_sign()`). Direction is data, not a switch, so
-there is no second place for it to disagree with itself.
-
-A reverse-mounted unit is declared by loading the matching template:
-
-```cpp
-gripper.load_template("reverse");    // or load_calibration(path) for a file
-gripper.config().mount();            // "reverse" — read back, not stored
-```
-
-`load_template()` is strict on purpose: an unknown name throws, and an
-unreadable template never falls back to the factory file — that file is a
-*normal* mount, and quietly answering "reverse" with "normal" is the one
-failure the name exists to prevent.
-
-Calibrations are per channel (`~/.litegrip/<channel>_calibration.json`; the
-legacy single-file location is still read): every LiteGrip ships at CAN id
-0x08, so on a two-gripper machine the channel is the only identity key, and
-the automatic load skips a file that declares a different one.
-`GripperConfig::calibrated` is false until a calibration or a template is
-loaded; before that `mount()` reports nothing rather than guessing.
-
 ## Testing
 
 ```bash

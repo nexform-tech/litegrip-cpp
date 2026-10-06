@@ -125,28 +125,6 @@ gripper.config().mount();            // "reverse" —— 读回来的，不是�
 （`close_sign * force_n * 0.1` Nm）下发，与 Python SDK 逐字节一致 —— 但本
 SDK 中 N 值**未经力标定**，不要拿它做力受限的行为。
 
-## 安装方向
-
-两个标定限位本身就携带安装方向：数值大的那一端是闭合侧，所有 mm / 力的换算
-符号都由这个顺序推出（`GripperConfig::close_sign()`）。方向是数据而不是开关，
-不存在第二个可以跟它矛盾的地方。
-
-反装的机器靠加载模板声明：
-
-```cpp
-gripper.load_template("reverse");    // 或用 load_calibration(path) 直接给文件
-gripper.config().mount();            // "reverse" —— 读回来的，不是存下来的
-```
-
-`load_template()` 刻意严格：未知名字抛错；模板读不出来时**绝不**回退出厂文件
-—— 出厂文件是正装，把「反装」静默地答成「正装」正是模板名字要防的那件事。
-
-标定按通道各存各的（`~/.litegrip/<channel>_calibration.json`，旧的单文件位置
-仍会读取）：每台 LiteGrip 出厂都是 CAN id 0x08，一台电脑接两台时通道是唯一
-的身份键，自动加载会跳过声明了别的通道的文件。`GripperConfig::calibrated`
-在标定或模板载入之前为 false，此时 `mount()` 不报方向 —— 报「正装」会是一个
-声明，而不是一个读数。
-
 ## 测试
 
 ```bash
