@@ -1,20 +1,24 @@
 // gripper.cpp — LiteGrip, the high-level API, ported from
 // litegrip_driver/litegrip/gripper.py and wired to the safety core.
 //
-// Scope is v1 (plan D6): lifecycle, hold-based init, calibration, position
-// motion, state and parameter access. Force control (grasp / set_force),
-// constant-speed moves and the public zero-gravity mode are deliberately absent.
+// Scope: lifecycle, hold-based init, calibration, position motion, the action
+// engine (open/close/grasp/set_force/constant-speed moves/zero-gravity — see
+// motion.hpp), state and parameter access. Trajectory record/playback and
+// teleop are later stages.
 //
-// Safety wiring (D4): the MOTION path (goto_rad / move_to / open / close / home)
-// goes through SafetyGuard::guard_motion_frame, so a target outside the red
-// lines, a measured position already outside them, over-ceiling gains, an
-// over-budget feed-forward torque, or a velocity beyond the deceleration zone
-// are all refused with a diagnosable reason and nothing is sent.
+// Safety wiring (D4): the POSITION-MOTION path (goto_rad / move_to / home) goes
+// through SafetyGuard::guard_motion_frame, so a target outside the red lines, a
+// measured position already outside them, over-ceiling gains, an over-budget
+// feed-forward torque, or a velocity beyond the deceleration zone are all
+// refused with a diagnosable reason and nothing is sent.
 //
-// The expert paths that must keep working when the gripper is outside the red
-// lines do NOT go through that gate, and each says why at its definition:
-// stop() / zero-torque frames (an emergency stop has to work from anywhere) and
-// the calibration routines (they deliberately drive to the mechanical stops).
+// The paths that must keep working when the gripper is outside the red lines do
+// NOT go through that gate, and each says why at its definition:
+//   * stop() / zero-torque frames — an emergency stop has to work from anywhere;
+//   * the calibration routines — they deliberately drive to the mechanical stops;
+//   * the action engine (src/motion.cpp) — it re-aims the target every frame,
+//     which the gate's one-target-per-call shape cannot express; it carries its
+//     own per-frame ceilings and an engine-side recovery drive-in instead.
 
 #include "litegrip/gripper.hpp"
 
@@ -277,28 +281,65 @@ bool LiteGrip::home() {
   return move_to(config_.pos_closed_rad, std::nullopt, std::nullopt, 0.0, 1.0);
 }
 
-bool LiteGrip::open(std::optional<double> kp, std::optional<double> kd,
-                    double duration) {
+// The action engine (src/motion.cpp). There is nothing to keep between calls,
+// so each entry constructs one engine; the engine checks enabled + latch and
+// owns the frame cadence, the lead caps and the recovery drive-in, all written
+// up at its definitions.
+
+MoveResult LiteGrip::open(std::optional<double> speed_mm_s,
+                          MoveProgressCallback progress) {
   check_connected();
-  check_enabled();
-  return move_to(config_.pos_open_rad, kp, kd, 0.0, duration);
+  MotionEngine engine(*this, *safety_);
+  return engine.open(speed_mm_s, std::move(progress));
 }
 
-bool LiteGrip::close(std::optional<double> kp, std::optional<double> kd,
-                     std::optional<double> force_n, double duration) {
+MoveResult LiteGrip::close(std::optional<double> speed_mm_s,
+                           MoveProgressCallback progress) {
   check_connected();
-  check_enabled();
+  MotionEngine engine(*this, *safety_);
+  return engine.close(speed_mm_s, std::move(progress));
+}
 
-  if (force_n.has_value()) {
-    // Applying a grip force needs torque feed-forward, which needs force
-    // calibration — not verified in this SDK, and force control is out of v1
-    // scope. Silently ignoring it would be worse than saying so.
-    std::fprintf(stderr,
-                 "[litegrip] close(force_n=...) is not supported in this "
-                 "version: applying a grip force needs torque feed-forward and "
-                 "verified force calibration. The value is ignored.\n");
-  }
-  return move_to(config_.pos_closed_rad, kp, kd, 0.0, duration);
+GraspResult LiteGrip::grasp(std::optional<double> force_n, double hold_s,
+                            MoveProgressCallback progress) {
+  check_connected();
+  MotionEngine engine(*this, *safety_);
+  return engine.grasp(force_n, hold_s, std::move(progress));
+}
+
+bool LiteGrip::set_force(double force_n, double duration_s) {
+  check_connected();
+  MotionEngine engine(*this, *safety_);
+  return engine.set_force(force_n, duration_s);
+}
+
+bool LiteGrip::move_at_speed(double target_mm, double speed_mm_s,
+                             std::optional<double> kp,
+                             std::optional<double> kd) {
+  check_connected();
+  MotionEngine engine(*this, *safety_);
+  return engine.move_at_speed(target_mm, speed_mm_s, kp, kd);
+}
+
+bool LiteGrip::move_at_speed_rad(double target_rad, double speed_rad_s,
+                                 std::optional<double> kp,
+                                 std::optional<double> kd) {
+  check_connected();
+  MotionEngine engine(*this, *safety_);
+  return engine.move_at_speed_rad(target_rad, speed_rad_s, kp, kd);
+}
+
+void LiteGrip::enter_zero_gravity(double duration_s) {
+  check_connected();
+  MotionEngine engine(*this, *safety_);
+  engine.enter_zero_gravity(duration_s);
+}
+
+void LiteGrip::exit_zero_gravity() {
+  // Deliberately no check_connected(): Python's exit is a silent no-op when
+  // the motor is not enabled, and that includes "never connected".
+  MotionEngine engine(*this, *safety_);
+  engine.exit_zero_gravity();
 }
 
 bool LiteGrip::goto_mm(double position_mm, std::optional<double> kp,

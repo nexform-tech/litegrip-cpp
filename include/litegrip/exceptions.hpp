@@ -100,12 +100,6 @@ class SafetyFault : public LiteGripError {
   using LiteGripError::LiteGripError;
 };
 
-/// Force feed-forward was requested while force calibration is not verified.
-class ForceCalibrationRequired : public SafetyFault {
- public:
-  using ForceCalibrationRequired::SafetyFault::SafetyFault;
-};
-
 /// A safety-limits configuration is malformed or tries to *loosen* a baseline.
 class SafetyConfigError : public LiteGripError {
  public:

@@ -34,7 +34,14 @@ static_assert(std::is_base_of_v<litegrip::LiteGripError, litegrip::ConnectError>
 static_assert(std::is_base_of_v<litegrip::LiteGripError, litegrip::LimitViolation>);
 static_assert(std::is_base_of_v<litegrip::SafetyFault, litegrip::LimitViolation> == false);
 static_assert(std::is_base_of_v<litegrip::LiteGripError, litegrip::SafetyFault>);
-static_assert(std::is_base_of_v<litegrip::SafetyFault, litegrip::ForceCalibrationRequired>);
+// The action engine's value types cross callbacks and return values.
+static_assert(std::is_default_constructible_v<litegrip::MotionConfig>);
+static_assert(std::is_copy_constructible_v<litegrip::MoveResult>);
+static_assert(std::is_copy_constructible_v<litegrip::GraspResult>);
+static_assert(std::is_copy_constructible_v<litegrip::MoveProgress>);
+
+// The engine drives a polymorphic seam (test_motion substitutes a fake io).
+static_assert(std::has_virtual_destructor_v<litegrip::MotionIo>);
 
 // Protocol frame sizes are part of the wire contract, and are asserted with
 // real golden vectors in test_protocol (T2) — not here, since these packers are

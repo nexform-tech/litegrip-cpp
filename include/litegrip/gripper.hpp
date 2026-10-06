@@ -3,11 +3,10 @@
 // Port of litegrip_driver/litegrip/gripper.py. This is the entry point most
 // consumers use: connect, init (hold), open/close/goto, calibrate, read state.
 //
-// v1 capability scope (PLAN-litegrip-cpp.md D6). Deliberately NOT in v1:
-//   * grasp() / set_force()            — force control, deferred
-//   * move_at_speed() / move_at_speed_rad() — deferred
-//   * public zero-gravity mode         — the calibration flows use zero-torque
-//     streaming internally
+// Capability scope: lifecycle, hold-based init, calibration, position motion,
+// the action engine (open/close/grasp/set_force/move_at_speed/zero-gravity —
+// motion.hpp), state and parameter access. Trajectory record/playback and
+// teleop are later stages.
 //
 // Naming: `goto` is a C++ keyword, so the millimetre-target method is goto_mm().
 
@@ -21,6 +20,7 @@
 #include "litegrip/bus.hpp"
 #include "litegrip/calibration.hpp"
 #include "litegrip/models.hpp"
+#include "litegrip/motion.hpp"
 #include "litegrip/safety.hpp"
 
 namespace litegrip {
@@ -31,7 +31,10 @@ namespace litegrip {
 /// must be valid without hardware. connect() opens it explicitly (or use
 /// connect_raii()); the destructor always disconnects, so a connected gripper
 /// is never left enabled by accident.
-class LiteGrip {
+///
+/// Implements MotionIo by private inheritance — LiteGrip is the IO the action
+/// engine drives; the seam's methods keep their existing public names.
+class LiteGrip : private MotionIo {
  public:
   explicit LiteGrip(GripperConfig config = GripperConfig{});
   ~LiteGrip();
@@ -51,8 +54,11 @@ class LiteGrip {
   int can_id() const noexcept { return config_.can_id; }
   std::optional<int> mst_id() const noexcept { return mst_id_; }
   bool is_connected() const noexcept { return connected_; }
-  bool is_enabled() const noexcept { return enabled_; }
-  const GripperConfig& config() const noexcept { return config_; }
+  /// True when the motor is enabled. Also the engine's MotionIo::is_enabled:
+  /// disconnect() clears enabled_, so this matches Python's
+  /// `self._can is not None and self._enabled` in every reachable state.
+  bool is_enabled() const noexcept override { return enabled_; }
+  const GripperConfig& config() const noexcept override { return config_; }
   GripperConfig& config() noexcept { return config_; }
   /// Whether disconnect() disables the motor first. Default true; set false
   /// to leave the motor enabled (holding position with torque) after the bus
@@ -99,7 +105,7 @@ class LiteGrip {
   /// through goto_rad() / move_to()). For custom control loops that manage
   /// their own timing.
   bool send_mit_frame(double q, double kp, double kd, double dq = 0.0,
-                      double tau = 0.0);
+                      double tau = 0.0) override;
 
   /// Poll one CAN frame and update the cached state.
   bool poll(double timeout_s = 0.0);
@@ -110,18 +116,65 @@ class LiteGrip {
   /// limit, so a reverse-mounted gripper homes to the correct end.
   bool home();
 
-  bool open(std::optional<double> kp = std::nullopt,
-            std::optional<double> kd = std::nullopt, double duration = 1.0);
-
-  /// Close the gripper.
+  /// Full open / close — the action engine's ramp (motion.hpp): a velocity
+  /// feed-forward per frame, a lead cap that narrows near the calibrated
+  /// limit, then a light press onto the mechanical stop, which ends the move.
+  /// `speed_mm_s` empty = MotionConfig::speed_mm_s.
   ///
-  /// `force_n` is accepted for source compatibility with the Python API but is
-  /// IGNORED in v1 and logs a warning: applying a grip force needs torque
-  /// feed-forward, which requires force calibration (kForceCalibrationVerified
-  /// is false in this SDK) and is out of v1 scope.
-  bool close(std::optional<double> kp = std::nullopt,
-             std::optional<double> kd = std::nullopt,
-             std::optional<double> force_n = std::nullopt, double duration = 1.0);
+  /// Returns a MoveResult whose bool is `ok` = pressed onto the stop (stalled
+  /// and parked within MotionConfig::stop_tol of the limit), so the old
+  /// `if (gripper.open())` idiom keeps working. Blocked halfway is also a
+  /// stall, but far from the stop, and is falsy.
+  ///
+  /// Breaking change: the old open(kp, kd, duration) / close(kp, kd, force_n,
+  /// duration) signatures are gone. close() takes no force at all — the
+  /// online Python SDK's close() doesn't either; use grasp() to close onto an
+  /// object and squeeze.
+  MoveResult open(std::optional<double> speed_mm_s = std::nullopt,
+                  MoveProgressCallback progress = {});
+  MoveResult close(std::optional<double> speed_mm_s = std::nullopt,
+                   MoveProgressCallback progress = {});
+
+  /// Close onto an object and then hold it with force_n newtons (empty =
+  /// MotionConfig::force_n); the closing leg stops INSIDE the calibrated
+  /// limit, so it stalls on the object, not on the empty stop. `hold_s` = 0
+  /// holds until a fault.
+  ///
+  /// The N value is NOT force-calibrated in this SDK
+  /// (kForceCalibrationVerified is false): it is applied as a torque
+  /// feed-forward of close_sign * force_n * 0.1 Nm, exactly like the Python
+  /// SDK — the two SDKs agree, but not because the newtons are physical. Do
+  /// not build force-limited behaviour on this number.
+  GraspResult grasp(std::optional<double> force_n = std::nullopt,
+                    double hold_s = 0.0, MoveProgressCallback progress = {});
+
+  /// Apply force_n at the current position for duration_s (torque
+  /// feed-forward; same not-force-calibrated caveat as grasp()).
+  bool set_force(double force_n, double duration_s = 0.3);
+
+  /// Constant-speed move to an absolute opening in mm (0 = closed), with a
+  /// short hold at the target. True after a completed move and for the
+  /// "nothing to do" cases (already there / speed <= 0).
+  bool move_at_speed(double target_mm, double speed_mm_s = 30.0,
+                     std::optional<double> kp = std::nullopt,
+                     std::optional<double> kd = std::nullopt);
+
+  /// Constant-speed move to an absolute angle in rad.
+  bool move_at_speed_rad(double target_rad, double speed_rad_s = 0.5,
+                         std::optional<double> kp = std::nullopt,
+                         std::optional<double> kd = std::nullopt);
+
+  /// Zero-gravity mode: the motor stays enabled but exerts no torque and can
+  /// be back-driven by hand. duration_s > 0 streams zero-torque frames for
+  /// that long; 0 sends one bootstrap frame and the caller must keep polling
+  /// (or sending frames) to sustain the mode. Any motion command resumes
+  /// normal control.
+  void enter_zero_gravity(double duration_s = 0.0);
+
+  /// Leave zero-gravity: one hold frame at the measured position under the
+  /// configured gains, so the gripper must not jump toward a stale target.
+  /// Silent no-op when the motor is not enabled.
+  void exit_zero_gravity();
 
   /// Move to an absolute position in millimetres (0 = closed).
   bool goto_mm(double position_mm, std::optional<double> kp = std::nullopt,
@@ -202,7 +255,7 @@ class LiteGrip {
   /// A disabled motor does not stream status frames, so the snapshot may hold
   /// constructor defaults — check is_stale() / data_age_s before trusting it,
   /// or send a refresh frame first.
-  GripperState get_state(bool wait = true);
+  GripperState get_state(bool wait = true) override;
 
   /// Request a status frame even while disabled (0xCC refresh).
   bool refresh_status(double timeout_s = 0.5);
@@ -234,7 +287,7 @@ class LiteGrip {
 
  private:
   void check_connected() const;
-  void check_enabled() const;
+  void check_enabled() const override;
 
   /// Copy a decoded calibration into the config. `instance_channel` is the
   /// channel *before* the copy: a file naming a different one is worth a
