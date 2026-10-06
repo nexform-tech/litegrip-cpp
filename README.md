@@ -78,6 +78,24 @@ onto the stop". The old `close(force_n=...)` is gone with them: use
 N value is **NOT force-calibrated** in this SDK; do not build force-limited
 behaviour on it.
 
+Behind those names sits the actions layer (`gripper.actions()`, ported from
+`actions.py`), which owns the `MotionConfig` every action runs with
+(`gripper.motion_config()`, mutable in place). `enable()` now retries with a
+status readback: it keeps attempting until a status frame reports
+`error_code == 1` (really enabled), clearing a real fault in between, up to
+`MotionConfig::enable_retries` attempts. It returns an `EnableResult`
+(`ok` / `state` / `tries`, truthy when enabled), so `if (gripper.enable())`
+still compiles. `zero()` is the full calibrate-then-save from Python.
+
+`calibrate()` now has the Python SDK's defaults (kp 20, 0.05 rad steps, a
+2 Nm torque ceiling) and the same two guards: the command lead is re-derived
+from the measured position every step, and the probe stops the moment |tau|
+reaches the ceiling. At a hard stop the encoder keeps creeping, so a
+position-only stall test (and an accumulating command lead) could press
+indefinitely — the guards exist for exactly that. The probe direction comes
+from `close_sign()`, so a reverse mount declared by a loaded template is
+preserved.
+
 ## Testing
 
 ```bash
@@ -101,14 +119,16 @@ on `can0`): it only reads an interface MTU, checks the missing-interface error
 path, and opens/closes a socket. The send/receive path is not yet covered by a
 test — it needs a vcan interface (root) or the real device.
 
-`test_bus.cpp`, `test_gripper.cpp`, `test_safety.cpp`, `test_motion.cpp` and
-`test_control_loop.cpp` cover the behaviour that must hold **without** hardware:
-lifecycle refusals while disconnected, the missing-interface error path, config
-plumbing, the injectable hold policy, the calibration file round-trip, the
-action engine's ramps / lead caps / stall window / recovery crawl (against a
-kinematic fake motor), every safety criterion — including the adversarial
-"must reject" cases, since each of those is a case where accepting it would
-move hardware — and the control loop itself via `dry_run`.
+`test_bus.cpp`, `test_gripper.cpp`, `test_safety.cpp`, `test_motion.cpp`,
+`test_actions.cpp` and `test_control_loop.cpp` cover the behaviour that must
+hold **without** hardware: lifecycle refusals while disconnected, the
+missing-interface error path, config plumbing, the injectable hold policy, the
+calibration file round-trip, the action engine's ramps / lead caps / stall
+window / recovery crawl (against a kinematic fake motor), the actions layer's
+enable retry / readback (the Python suite's TestEnable, case for case) and its
+zero() / motion_config plumbing, every safety criterion — including the
+adversarial "must reject" cases, since each of those is a case where accepting
+it would move hardware — and the control loop itself via `dry_run`.
 
 `dry_run` is not "do nothing": it runs the whole control path (rate limiting,
 torque-budget allocation, the gate, the watchdogs) against a simulated plant and
@@ -128,6 +148,7 @@ motion, calibration, and the transport send/receive path.
 | `can::MotorController` | multi-motor dispatch on one bus | `can/controller.py` |
 | `GripperBus` | single-gripper bus API (init = hold) | `protocols/can_bus.py` |
 | `LiteGrip` | high-level API | `gripper.py` |
+| `GripperActions` | the six actions + enable retry/readback + zero() | `actions.py` |
 | `MotionEngine` | action engine: open/close/grasp/set_force/speed moves/zero-gravity | `actions.py` + `gripper.py` |
 | `SafetyGuard` + `SafetyLimits` | red lines, torque budget, watchdog, modes | `safety_limits.py` (core) |
 | `ControlLoop` | background 200 Hz streaming + rate limit + gate | old Python-side daemon |

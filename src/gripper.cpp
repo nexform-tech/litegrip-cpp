@@ -1,10 +1,11 @@
 // gripper.cpp — LiteGrip, the high-level API, ported from
 // litegrip_driver/litegrip/gripper.py and wired to the safety core.
 //
-// Scope: lifecycle, hold-based init, calibration, position motion, the action
-// engine (open/close/grasp/set_force/constant-speed moves/zero-gravity — see
-// motion.hpp), state and parameter access. Trajectory record/playback and
-// teleop are later stages.
+// Scope: lifecycle, hold-based init, calibration, position motion, the
+// actions layer (open/close/grasp/zero/enable — actions.hpp) and the action
+// engine it forwards to (open/close/grasp/set_force/constant-speed moves/
+// zero-gravity — motion.hpp), state and parameter access. Trajectory
+// record/playback and teleop are later stages.
 //
 // Safety wiring (D4): the POSITION-MOTION path (goto_rad / move_to / home) goes
 // through SafetyGuard::guard_motion_frame, so a target outside the red lines, a
@@ -25,6 +26,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <limits>
 #include <string>
 #include <thread>
@@ -53,6 +55,25 @@ void sleep_s(double seconds) {
   if (seconds > 0.0) {
     std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
   }
+}
+
+/// Python's round(value, digits) for the calibration results: half-to-even,
+/// i.e. nearbyint on the scaled value (the same rule the Python suite's fake
+/// motor relies on).
+double round_n(double value, int digits) {
+  const double scale = std::pow(10.0, digits);
+  return std::nearbyint(value * scale) / scale;
+}
+
+/// Local wall-clock timestamp, "%Y-%m-%d %H:%M:%S" — matches the Python
+/// SDK's calibration_time stamp.
+std::string local_time_string() {
+  const std::time_t now = std::time(nullptr);
+  std::tm calendar{};
+  localtime_r(&now, &calendar);
+  char buffer[32];
+  std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &calendar);
+  return std::string(buffer);
 }
 
 const char* motor_type_name(can::MotorType type) noexcept {
@@ -109,10 +130,11 @@ Feedback measured_feedback(can::MotorState* motor) {
 
 }  // namespace
 
-LiteGrip::LiteGrip(GripperConfig config)
+LiteGrip::LiteGrip(GripperConfig config, MotionConfig motion_config)
     : config_(std::move(config)),
       bus_(std::make_unique<GripperBus>(config_)),
       safety_(std::make_unique<SafetyGuard>(canonical_baseline())),
+      actions_(*this, *safety_, std::move(motion_config)),
       mst_id_(config_.mst_id) {}
 
 LiteGrip::~LiteGrip() { disconnect(); }
@@ -121,11 +143,18 @@ LiteGrip::LiteGrip(LiteGrip&& other) noexcept
     : config_(std::move(other.config_)),
       bus_(std::move(other.bus_)),
       safety_(std::move(other.safety_)),
+      actions_(*this, *safety_, std::move(other.actions_.config)),
       mst_id_(other.mst_id_),
       connected_(other.connected_),
       enabled_(other.enabled_),
       disable_on_disconnect_(other.disable_on_disconnect_),
-      status_flags_(other.status_flags_) {
+      status_flags_(other.status_flags_),
+      session_owner_(std::move(other.session_owner_)) {
+  // The actions layer holds raw host/safety pointers: re-bind them to the new
+  // object, and null the moved-from side's safety so any use of a moved-from
+  // gripper's actions fails loudly instead of touching this one's guard.
+  other.actions_.rebind(&other, nullptr);
+  other.session_owner_.reset();
   other.mst_id_.reset();
   other.connected_ = false;
   other.enabled_ = false;
@@ -138,11 +167,18 @@ LiteGrip& LiteGrip::operator=(LiteGrip&& other) noexcept {
     config_ = std::move(other.config_);
     bus_ = std::move(other.bus_);
     safety_ = std::move(other.safety_);
+    // The guard moved, so the actions layer's pointers are re-bound to this
+    // object's new members (and the moved-from side's nulled).
+    actions_.rebind(this, safety_.get());
+    actions_.config = std::move(other.actions_.config);
     mst_id_ = other.mst_id_;
     connected_ = other.connected_;
     enabled_ = other.enabled_;
     disable_on_disconnect_ = other.disable_on_disconnect_;
     status_flags_ = other.status_flags_;
+    session_owner_ = std::move(other.session_owner_);
+    other.actions_.rebind(&other, nullptr);
+    other.session_owner_.reset();
     other.mst_id_.reset();
     other.connected_ = false;
     other.enabled_ = false;
@@ -192,7 +228,22 @@ void LiteGrip::disconnect() {
 
 // ── enable / init / fault ─────────────────────────────────────────────────
 
-bool LiteGrip::enable() {
+EnableResult LiteGrip::enable(std::optional<int> retries) {
+  // The whole orchestration (attempt, readback, fault clearing, retry, the
+  // final truth being the status frame's error_code == 1) lives in the
+  // actions layer; this wrapper keeps the enabled flag in step with the
+  // readback, exactly like Python's LiteGrip.enable.
+  EnableResult result = actions_.enable(retries);
+  enabled_ = result.ok;
+  if (result.ok) {
+    status_flags_ |= GripperStatus::kEnabled;
+  } else {
+    status_flags_ &= ~GripperStatus::kEnabled;
+  }
+  return result;
+}
+
+bool LiteGrip::enable_once() {
   check_connected();
 
   // A latched fault has to be cleared before the motor will accept an enable;
@@ -223,12 +274,22 @@ bool LiteGrip::init() {
   return enabled_;
 }
 
-bool LiteGrip::disable() {
+bool LiteGrip::disable() { return actions_.disable(); }
+
+bool LiteGrip::disable_once() {
   check_connected();
-  const bool result = bus_->disable();
-  enabled_ = false;
-  status_flags_ &= ~GripperStatus::kEnabled;
-  return result;
+  try {
+    const bool result = bus_->disable();
+    enabled_ = false;
+    status_flags_ &= ~GripperStatus::kEnabled;
+    return result;
+  } catch (const LiteGripError&) {
+    // Python parity (_disable_once): a failed disable command reports "not
+    // disabled", it does not raise.
+    enabled_ = false;
+    status_flags_ &= ~GripperStatus::kEnabled;
+    return false;
+  }
 }
 
 bool LiteGrip::clear_fault() {
@@ -281,35 +342,34 @@ bool LiteGrip::home() {
   return move_to(config_.pos_closed_rad, std::nullopt, std::nullopt, 0.0, 1.0);
 }
 
-// The action engine (src/motion.cpp). There is nothing to keep between calls,
-// so each entry constructs one engine; the engine checks enabled + latch and
-// owns the frame cadence, the lead caps and the recovery drive-in, all written
-// up at its definitions.
+// The actions layer (src/actions.cpp) owns open/close/grasp/zero/enable, each
+// action constructing its own MotionEngine; LiteGrip's methods are thin
+// forwards. The remaining engine entries below (set_force / speed moves /
+// zero-gravity) construct one engine per call against the same MotionConfig.
+// The engine checks enabled + latch and owns the frame cadence, the lead caps
+// and the recovery drive-in, all written up at its definitions.
 
 MoveResult LiteGrip::open(std::optional<double> speed_mm_s,
                           MoveProgressCallback progress) {
   check_connected();
-  MotionEngine engine(*this, *safety_);
-  return engine.open(speed_mm_s, std::move(progress));
+  return actions_.open(speed_mm_s, std::move(progress));
 }
 
 MoveResult LiteGrip::close(std::optional<double> speed_mm_s,
                            MoveProgressCallback progress) {
   check_connected();
-  MotionEngine engine(*this, *safety_);
-  return engine.close(speed_mm_s, std::move(progress));
+  return actions_.close(speed_mm_s, std::move(progress));
 }
 
 GraspResult LiteGrip::grasp(std::optional<double> force_n, double hold_s,
                             MoveProgressCallback progress) {
   check_connected();
-  MotionEngine engine(*this, *safety_);
-  return engine.grasp(force_n, hold_s, std::move(progress));
+  return actions_.grasp(force_n, hold_s, std::move(progress));
 }
 
 bool LiteGrip::set_force(double force_n, double duration_s) {
   check_connected();
-  MotionEngine engine(*this, *safety_);
+  MotionEngine engine(*this, *safety_, actions_.config);
   return engine.set_force(force_n, duration_s);
 }
 
@@ -317,7 +377,7 @@ bool LiteGrip::move_at_speed(double target_mm, double speed_mm_s,
                              std::optional<double> kp,
                              std::optional<double> kd) {
   check_connected();
-  MotionEngine engine(*this, *safety_);
+  MotionEngine engine(*this, *safety_, actions_.config);
   return engine.move_at_speed(target_mm, speed_mm_s, kp, kd);
 }
 
@@ -325,20 +385,20 @@ bool LiteGrip::move_at_speed_rad(double target_rad, double speed_rad_s,
                                  std::optional<double> kp,
                                  std::optional<double> kd) {
   check_connected();
-  MotionEngine engine(*this, *safety_);
+  MotionEngine engine(*this, *safety_, actions_.config);
   return engine.move_at_speed_rad(target_rad, speed_rad_s, kp, kd);
 }
 
 void LiteGrip::enter_zero_gravity(double duration_s) {
   check_connected();
-  MotionEngine engine(*this, *safety_);
+  MotionEngine engine(*this, *safety_, actions_.config);
   engine.enter_zero_gravity(duration_s);
 }
 
 void LiteGrip::exit_zero_gravity() {
   // Deliberately no check_connected(): Python's exit is a silent no-op when
   // the motor is not enabled, and that includes "never connected".
-  MotionEngine engine(*this, *safety_);
+  MotionEngine engine(*this, *safety_, actions_.config);
   engine.exit_zero_gravity();
 }
 
@@ -394,74 +454,154 @@ bool LiteGrip::move_to(double target_rad, std::optional<double> kp,
 // it documents intent and controls whether an out-of-range FEEDBACK reading
 // latches. See the plan's open item on calibration vs. the red lines.
 
+CalibrationData LiteGrip::zero() {
+  check_connected();
+  check_enabled();
+  return actions_.zero();
+}
+
 CalibrationData LiteGrip::calibrate(double kp, double kd, double step_rad,
                                     double stall_delta, int stall_cycles,
-                                    int max_iter) {
+                                    int max_iter,
+                                    std::optional<double> tau_limit) {
   check_connected();
   check_enabled();
 
   auto scope = safety_->maintenance_scope("calibrate");
 
-  bus_->update_state(0.1);
-  const double initial = bus_->get_position();
-  std::printf("[litegrip] calibrate: initial position %.4f rad\n", initial);
+  // A stall only says "something stopped me" — both ends are hard stops, so
+  // it can never say WHICH end was hit. The direction is data
+  // (close_sign(), from the calibrated limits / a loaded template), and this
+  // routine preserves it.
+  const double s = config_.close_sign();
 
-  const auto find_limit = [&](bool closing) -> double {
-    const double sign = closing ? 1.0 : -1.0;
+  bus_->update_state(0.1);
+  const double init_pos = bus_->get_position();
+  std::printf("[litegrip] calibrate: starting at %.4f rad (%s mount)\n",
+              init_pos, s > 0.0 ? "normal" : "reverse");
+
+  // Two independent guards bound the pressing force; see the header for why
+  // neither is optional. (1) the command lead is re-derived from the MEASURED
+  // position every step, so it is at most kp x step_rad; (2) the probe stops
+  // as soon as |tau| reaches tau_limit.
+  const auto find_limit = [&](Toward toward) -> double {
+    const bool closing = toward == Toward::kClose;
+    const double sign = closing ? s : -s;
+    const char* label = closing ? "closed" : "open";
+    std::printf("[litegrip]   probing the %s limit...\n", label);
+
     bus_->update_state(0.05);
     double current = bus_->get_position();
-    double target = current;
     int stall = 0;
 
     for (int i = 0; i < max_iter; ++i) {
-      target += sign * step_rad;
+      // target = measured + one step. Accumulating a running target
+      // (target += sign * step_rad) would let the lead grow without bound
+      // once the stop is reached, and the pressing torque (kp x lead) would
+      // grow with it.
+      const double target = current + sign * step_rad;
       bus_->control_mit_stream(target, kp, kd, 0.3, 0.0, 0.0, 0.005);
       bus_->update_state(0.1);
 
-      const double measured = bus_->get_position();
-      const double delta = std::fabs(measured - current);
-      std::printf("[litegrip]   [%d] target=%+.3f pos=%.4f d=%.5f stall=%d\n", i,
-                  target, measured, delta, stall);
+      const double new_pos = bus_->get_position();
+      const double delta = std::fabs(new_pos - current);
+      const double tau = bus_->get_torque();
+
+      std::printf(
+          "[litegrip]     [%d] tgt=%+.3f pos=%.4f d=%.5f tau=%+.3f st=%d\n",
+          i, target, new_pos, delta, tau, stall);
+
+      if (tau_limit.has_value() && std::fabs(tau) >= *tau_limit) {
+        std::printf(
+            "[litegrip]     torque ceiling %.2f Nm reached (%+.3f) — "
+            "stopping the advance, holding at %.6f rad\n",
+            *tau_limit, tau, new_pos);
+        return new_pos;
+      }
 
       if (delta < stall_delta) {
         if (++stall >= stall_cycles) {
-          std::printf("[litegrip]   reached %s limit: %.6f rad\n",
-                      closing ? "closed" : "open", measured);
-          return measured;
+          std::printf("[litegrip]     %s limit: %.6f rad\n", label, new_pos);
+          return new_pos;
         }
       } else {
         stall = 0;
       }
-      current = measured;
+      current = new_pos;
     }
-    std::printf("[litegrip]   safety stop at the iteration cap: %.4f rad\n",
-                current);
+
+    std::printf(
+        "[litegrip]     safety stop at the iteration cap (%d): %.4f rad\n",
+        max_iter, current);
     return current;
   };
 
-  // Back off first, so probing does not start against a stop.
-  bus_->control_mit_stream(initial + 0.2, 80.0, kd, 0.5);
-  bus_->update_state(0.1);
+  // Move toward `target` under the same guards as the probe: one step of
+  // lead at a time (a single constant command at kp=80 would hold kp x 0.2 =
+  // 16 Nm for its whole duration if the jaws already sit at a stop), and the
+  // same |tau| ceiling.
+  const auto bounded_move = [&](double target, const char* label) {
+    double current = bus_->get_position();
+    const double sign = target >= current ? 1.0 : -1.0;
+    for (int i = 0; i < max_iter; ++i) {
+      if (std::fabs(target - current) <= step_rad) {
+        return;
+      }
+      bus_->control_mit_stream(current + sign * step_rad, kp, kd, 0.1, 0.0,
+                               0.0, 0.005);
+      bus_->update_state(0.1);
+      const double new_pos = bus_->get_position();
+      const double tau = bus_->get_torque();
+      if (tau_limit.has_value() && std::fabs(tau) >= *tau_limit) {
+        std::printf(
+            "[litegrip]     %s: torque ceiling %.2f Nm reached (%+.3f) — "
+            "stopping\n",
+            label, *tau_limit, tau);
+        return;
+      }
+      if (std::fabs(new_pos - current) < stall_delta) {
+        std::printf("[litegrip]     %s: position no longer moving — stopping\n",
+                    label);
+        return;
+      }
+      current = new_pos;
+    }
+  };
 
-  const double closed = find_limit(true);
-  bus_->control_mit_stream(closed + 0.3, 80.0, kd, 0.5);
-  bus_->update_state(0.1);
-  const double opened = find_limit(false);
+  // 1. Safe back-off — a nudge toward the close side, flipped with the mount.
+  std::printf("[litegrip]   safe back-off...\n");
+  bounded_move(init_pos + s * 0.2, "back-off");
 
-  const double travel = closed - opened;  // closed is numerically larger
+  // 2. Find zero (close direction).
+  const double zero_pos = find_limit(Toward::kClose);
+
+  // 3. Back off, away from the close stop toward the open side.
+  std::printf("[litegrip]   backing off...\n");
+  bounded_move(zero_pos - s * 0.3, "back-off");
+
+  // 4. Find max (open direction).
+  const double max_pos = find_limit(Toward::kOpen);
+
+  // 5. Compute the results. Which of zero/max is numerically larger depends
+  //    on the mount, so the travel is a magnitude. A run that measured no
+  //    travel at all refuses instead of saving a made-up scale (Python falls
+  //    back to a nominal 105.26 mm/rad here; this port keeps the existing
+  //    refusal — the same "refuse, never guess" line as load_template()).
+  const double travel = std::fabs(zero_pos - max_pos);
   if (travel <= 0.0) {
     throw CommError("calibration failed: the travel range is not positive");
   }
   const double rad_to_mm = config_.max_stroke_mm / travel;
 
   CalibrationData result;
-  result.zero_position = closed;
-  result.max_position = opened;
-  result.travel_range = travel;
-  result.rad_to_mm = rad_to_mm;
+  result.zero_position = round_n(zero_pos, 6);  // closed -> 0 mm
+  result.max_position = round_n(max_pos, 6);    // open -> max mm
+  result.travel_range = round_n(travel, 6);
+  result.rad_to_mm = round_n(rad_to_mm, 2);
   result.motor_type = motor_type_name(GripperParams::kMotorType);
   result.can_id = config_.can_id;
   result.mst_id = mst_id_.value_or(0);
+  result.calibration_time = local_time_string();
 
   config_.pos_closed_rad = result.zero_position;
   config_.pos_open_rad = result.max_position;
@@ -927,6 +1067,18 @@ void LiteGrip::write_param(int rid, double value) {
     throw NotInitializedError("not connected");
   }
   bus_->write_param(rid, value);
+}
+
+// ── sessions (recording / playback / teleop) ─────────────────────────────
+//
+// One long-running session at a time; the claim/release pair (declared in the
+// header) is used by the recording, playback and teleop layers in the later
+// stages. Nothing in this file takes a session yet, so session() always
+// reports empty today.
+
+std::optional<std::string> LiteGrip::session() const {
+  std::lock_guard<std::mutex> lock(session_mutex_);
+  return session_owner_;
 }
 
 // ── internal ──────────────────────────────────────────────────────────────

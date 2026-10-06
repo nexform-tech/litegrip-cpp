@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "litegrip/actions.hpp"
 #include "litegrip/bus.hpp"
 #include "litegrip/calibration.hpp"
 #include "litegrip/can/controller.hpp"

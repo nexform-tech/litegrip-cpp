@@ -42,6 +42,7 @@ add_library(litegrip_cpp
   src/safety.cpp
   src/gripper.cpp
   src/motion.cpp
+  src/actions.cpp
   src/control_loop.cpp
 )
 add_library(litegrip_cpp::litegrip_cpp ALIAS litegrip_cpp)

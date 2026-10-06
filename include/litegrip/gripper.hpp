@@ -13,10 +13,12 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <utility>
 
+#include "litegrip/actions.hpp"
 #include "litegrip/bus.hpp"
 #include "litegrip/calibration.hpp"
 #include "litegrip/models.hpp"
@@ -32,11 +34,13 @@ namespace litegrip {
 /// connect_raii()); the destructor always disconnects, so a connected gripper
 /// is never left enabled by accident.
 ///
-/// Implements MotionIo by private inheritance — LiteGrip is the IO the action
-/// engine drives; the seam's methods keep their existing public names.
-class LiteGrip : private MotionIo {
+/// Implements ActionsHost (and through it MotionIo) by private inheritance —
+/// LiteGrip is what the actions layer and the motion engine drive; the seam's
+/// methods keep their existing public names.
+class LiteGrip : private ActionsHost {
  public:
-  explicit LiteGrip(GripperConfig config = GripperConfig{});
+  explicit LiteGrip(GripperConfig config = GripperConfig{},
+                    MotionConfig motion_config = MotionConfig{});
   ~LiteGrip();
   LiteGrip(const LiteGrip&) = delete;
   LiteGrip& operator=(const LiteGrip&) = delete;
@@ -80,9 +84,19 @@ class LiteGrip : private MotionIo {
 
   // ── enable / init / fault ─────────────────────────────────────────────
 
-  /// Enable, clearing a latched fault first if one is present. The motor ends
-  /// up holding its current position (see HoldPolicy / init()).
-  bool enable();
+  /// Enable with retry and status readback (Python's enable()), through the
+  /// actions layer: each attempt clears a latched fault if one is present and
+  /// runs the enable sequence, then a status frame is read back — only
+  /// error_code == 1 counts as enabled — and the attempt repeats up to
+  /// `retries` times (empty = MotionConfig::enable_retries), clearing a real
+  /// fault in between. The motor ends up holding its current position (see
+  /// HoldPolicy / init()).
+  ///
+  /// Returns an EnableResult and sets the enabled flag from its `ok`, i.e.
+  /// from the readback rather than from any single attempt's return value.
+  /// Breaking change: the result is EnableResult, not bool — `if
+  /// (gripper.enable())` still compiles.
+  EnableResult enable(std::optional<int> retries = std::nullopt);
 
   /// Initialise = enable and hold. This SDK's `init` means exactly that and
   /// nothing else; the behaviour lives behind HoldPolicy (R2) so it can be
@@ -93,11 +107,32 @@ class LiteGrip : private MotionIo {
 
   /// Clear latched faults (UV / OC / OT): disable -> clear (0xFB) -> enable,
   /// retried up to kFaultClearRetries times. Throws HardwareError on failure.
-  bool clear_fault();
+  /// Also the actions layer's clear_fault() (see actions.hpp).
+  bool clear_fault() override;
 
   /// Emergency stop: send a zero-torque MIT frame. Does NOT disable the motor —
   /// it stays enabled but exerts zero torque, so it can be back-driven.
   void stop();
+
+  // ── actions / config ──────────────────────────────────────────────────
+
+  /// The actions layer this gripper's six actions live in (Python's
+  /// LiteGrip.actions): open / close / grasp / zero / enable / disable. The
+  /// public methods above forward to it.
+  GripperActions& actions() noexcept { return actions_; }
+  const GripperActions& actions() const noexcept { return actions_; }
+
+  /// The action-layer tunables (Python's motion_config property): the
+  /// MotionConfig every action runs with. Mutable in place — a write here
+  /// reaches the next action and nothing else.
+  MotionConfig& motion_config() noexcept { return actions_.config; }
+  const MotionConfig& motion_config() const noexcept { return actions_.config; }
+
+  /// Which long-running session is active: empty, "record", "play" or
+  /// "teleop". At most one runs at a time; the recording / playback / teleop
+  /// layers claim the slot (later stages, see claim_session). Until then
+  /// this always reports empty.
+  std::optional<std::string> session() const;
 
   // ── low-level frame access ────────────────────────────────────────────
 
@@ -192,11 +227,34 @@ class LiteGrip : private MotionIo {
 
   // ── calibration ───────────────────────────────────────────────────────
 
-  /// Automatic calibration: back off, step toward close until stall, back off,
-  /// step toward open until stall, then derive the conversion factor.
-  CalibrationData calibrate(double kp = 60.0, double kd = 2.0,
-                            double step_rad = 0.1, double stall_delta = 0.0003,
-                            int stall_cycles = 8, int max_iter = 30);
+  /// Full calibration then save (Python's zero()): probe both mechanical
+  /// stops with the MotionConfig calib_* values, then write the result to
+  /// this channel's default calibration path (save_calibration()). The
+  /// gripper drives against both ends — make sure the travel is clear.
+  CalibrationData zero();
+
+  /// Automatic calibration, the Python SDK's current routine: back off, step
+  /// toward the close limit until stall, back off, step toward the open limit
+  /// until stall, then derive the conversion factor. The probe direction
+  /// comes from close_sign(), so a reverse mount declared by a loaded
+  /// template is preserved — a stall alone can never say which end was hit.
+  ///
+  /// Two guards bound the pressing force and neither is optional: the command
+  /// lead is re-derived from the MEASURED position every step (bounded to
+  /// step_rad, so pressing torque <= kp x step_rad), and the probe stops the
+  /// moment |tau| reaches `tau_limit` (empty = no ceiling). At a hard stop
+  /// the encoder keeps creeping (backlash, elastic deformation), so the
+  /// position-based stall test alone can never fire and an accumulating
+  /// command lead would grow until something breaks. That is why both
+  /// guards exist.
+  ///
+  /// Defaults are the Python SDK's; this replaces the old signature (kp was
+  /// 60, step 0.1, no torque ceiling).
+  CalibrationData calibrate(double kp = 20.0, double kd = 2.0,
+                            double step_rad = 0.05,
+                            double stall_delta = 0.0015, int stall_cycles = 5,
+                            int max_iter = 200,
+                            std::optional<double> tau_limit = 2.0) override;
 
   /// Guided two-step calibration with the operator confirming each limit.
   CalibrationData calibrate_guided(double kp = 60.0, double kd = 2.0,
@@ -216,7 +274,8 @@ class LiteGrip : private MotionIo {
   /// by default, so a calibration saved here is picked up automatically next
   /// run. One file per channel is what keeps two grippers on one machine from
   /// overwriting each other.
-  std::string save_calibration(std::optional<std::string> path = std::nullopt);
+  std::string save_calibration(std::optional<std::string> path = std::nullopt)
+      override;
 
   /// Load calibration into config. Two of the three ways to say which file:
   ///
@@ -289,6 +348,10 @@ class LiteGrip : private MotionIo {
   void check_connected() const;
   void check_enabled() const override;
 
+  // ── ActionsHost (driven by GripperActions; see actions.hpp) ───────────
+  bool enable_once() override;
+  bool disable_once() override;
+
   /// Copy a decoded calibration into the config. `instance_channel` is the
   /// channel *before* the copy: a file naming a different one is worth a
   /// warning (the channel is the identity key when two grippers share CAN id
@@ -296,14 +359,47 @@ class LiteGrip : private MotionIo {
   void apply_calibration(const CalibrationFile& calibration,
                          const std::string& instance_channel);
 
+  /// Take the exclusive session slot, or throw `Error` when another session
+  /// already holds it. Templated on the error type so each layer throws its
+  /// own (TeleopBusyError / TrajectoryBusyError in the later stages).
+  template <class Error>
+  void claim_session(const std::string& owner) {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    if (session_owner_.has_value()) {
+      throw Error("a session is already running (session '" +
+                  *session_owner_ +
+                  "') — teleop, recording and playback are mutually "
+                  "exclusive");
+    }
+    session_owner_ = owner;
+  }
+
+  /// Give the slot back. Harmless when `owner` no longer holds it.
+  void release_session(const std::string& owner) noexcept {
+    std::lock_guard<std::mutex> lock(session_mutex_);
+    if (session_owner_.has_value() && *session_owner_ == owner) {
+      session_owner_.reset();
+    }
+  }
+
   GripperConfig config_;
   std::unique_ptr<GripperBus> bus_;
   std::unique_ptr<SafetyGuard> safety_;
+  /// Declared after safety_ so its host/safety pointers are valid by the
+  /// time it is constructed (and so the ctor's init list reads in order).
+  GripperActions actions_;
   std::optional<int> mst_id_;
   bool connected_ = false;
   bool enabled_ = false;
   bool disable_on_disconnect_ = true;
   GripperStatus status_flags_ = GripperStatus::kNone;
+  /// The session slot (one long-running session at a time). The mutex is
+  /// never moved: the move operations default-construct it and carry only
+  /// the owner string, so LiteGrip stays movable (connect_raii). Moving an
+  /// object that holds a live session is a caller bug the layers never
+  /// commit.
+  mutable std::mutex session_mutex_;
+  std::optional<std::string> session_owner_;
 };
 
 }  // namespace litegrip

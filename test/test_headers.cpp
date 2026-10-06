@@ -43,6 +43,12 @@ static_assert(std::is_copy_constructible_v<litegrip::MoveProgress>);
 // The engine drives a polymorphic seam (test_motion substitutes a fake io).
 static_assert(std::has_virtual_destructor_v<litegrip::MotionIo>);
 
+// The actions layer: the same seam idea one level up, and value-type results.
+static_assert(std::is_base_of_v<litegrip::MotionIo, litegrip::ActionsHost>);
+static_assert(std::has_virtual_destructor_v<litegrip::ActionsHost>);
+static_assert(std::is_default_constructible_v<litegrip::EnableResult>);
+static_assert(std::is_copy_constructible_v<litegrip::EnableResult>);
+
 // Protocol frame sizes are part of the wire contract, and are asserted with
 // real golden vectors in test_protocol (T2) — not here, since these packers are
 // declarations only at T1.

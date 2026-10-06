@@ -17,6 +17,7 @@ set(LITEGRIP_CPP_TESTS
   test_safety.cpp
   test_gripper.cpp
   test_motion.cpp
+  test_actions.cpp
   test_control_loop.cpp
 )
 

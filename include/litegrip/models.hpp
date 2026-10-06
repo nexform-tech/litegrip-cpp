@@ -191,9 +191,12 @@ struct GripperInfo {
 
 /// Result of a calibration run. Mirrors models.CalibrationData.
 struct CalibrationData {
-  double zero_position = 0.0;   // closed limit (rad)
-  double max_position = 1.14;   // open limit (rad)
-  double travel_range = 1.14;   // |max - zero| (rad)
+  // Defaults mirror the Python SDK's models.CalibrationData: the normal-mount
+  // convention (closed is numerically the larger end). A real calibration run
+  // overwrites every field.
+  double zero_position = GripperParams::kPosClosedRad;  // closed limit (rad)
+  double max_position = GripperParams::kPosOpenRad;     // open limit (rad)
+  double travel_range = 1.14;                           // |max - zero| (rad)
   double rad_to_mm = UnitConversion::kRadToMm;
   std::string motor_type = "DM4310";
   int can_id = GripperParams::kCanId;

@@ -19,6 +19,7 @@ litegrip 栈的最底层。它直接讲 SocketCAN 与达妙 DM4310 的 MIT 协�
 | `can::MotorController` | 一条总线上的多电机派发 | `can/controller.py` |
 | `GripperBus` | 单爪总线 API（`init` = 持位） | `protocols/can_bus.py` |
 | `LiteGrip` | 高层 API | `gripper.py` |
+| `GripperActions` | 六个动作 + enable 重试回读 + zero() | `actions.py` |
 | `MotionEngine` | 动作引擎：open/close/grasp/set_force/速度移动/零重力 | `actions.py` + `gripper.py` |
 | `SafetyGuard` + `SafetyLimits` | 红线、力矩预算、看门狗、模式 | `safety_limits.py`（核心） |
 | `ControlLoop` | 后台 200 Hz 流式发送 + 限速 + 闸门 | 旧的 Python 侧守护进程 |
@@ -125,6 +126,19 @@ gripper.config().mount();            // "reverse" —— 读回来的，不是�
 （`close_sign * force_n * 0.1` Nm）下发，与 Python SDK 逐字节一致 —— 但本
 SDK 中 N 值**未经力标定**，不要拿它做力受限的行为。
 
+这些名字下面还压着一层 actions（`gripper.actions()`，移植自 `actions.py`）：
+它持有每个动作共用的 `MotionConfig`（`gripper.motion_config()`，就地可改）。
+`enable()` 改为「重试 + 状态帧回读」：直到状态帧回读到 `error_code == 1`
+（真使能）为止，真故障先清，最多 `MotionConfig::enable_retries` 次；返回
+`EnableResult`（`ok` / `state` / `tries`，可做 bool），`if (gripper.enable())`
+照样工作。`zero()` 是「完整标定 + 存盘」。
+
+`calibrate()` 换成 Python SDK 的默认值（kp 20、步进 0.05 rad、2 Nm 力矩上限）
+和同样的两道护栏：指令领先量每步都从**实测**位置重新推导，`|tau|` 一到上限
+立即停止推进。顶住机械止点时编码器会一直蠕动，只看「位置不再变化」永远停不
+下来，累积式指令领先量会越顶越大 —— 护栏正是为此存在。探测方向取自
+`close_sign()`，加载模板声明的反装因此得以保留。
+
 ## 测试
 
 ```bash
@@ -141,10 +155,12 @@ ctest --test-dir build --output-on-failure
   改动 Python 原件后重新生成：`python3 test/generate_golden.py`。
 
 `test_bus.cpp`、`test_gripper.cpp`、`test_safety.cpp`、`test_motion.cpp`、
-`test_control_loop.cpp` 覆盖**无硬件**时也必须成立的行为：未连接时的各项拒绝、
-接口缺失的错误路径、配置透传、可注入的持位策略、标定文件往返、动作引擎的斜坡 /
-领先上限 / 堵转窗口 / 回收驶入（跑在运动学假电机上），以及安全闸门的每一条
-判据（含所有「必须拒绝」的对抗性用例 —— 每一条被放行都会让硬件动起来）。
+`test_actions.cpp`、`test_control_loop.cpp` 覆盖**无硬件**时也必须成立的行为：
+未连接时的各项拒绝、接口缺失的错误路径、配置透传、可注入的持位策略、标定文件
+往返、动作引擎的斜坡 / 领先上限 / 堵转窗口 / 回收驶入（跑在运动学假电机上）、
+actions 层的 enable 重试回读（Python 套件的 TestEnable 逐条移植）与
+zero() / motion_config 透传，以及安全闸门的每一条判据（含所有「必须拒绝」的
+对抗性用例 —— 每一条被放行都会让硬件动起来）。
 
 `test_transport.cpp` 刻意**不发送任何帧**（本机可能接有真机）：它只读取接口 MTU、
 验证接口缺失的错误路径、并在 `can0` 上开/关 socket。**发送/接收路径尚无测试
