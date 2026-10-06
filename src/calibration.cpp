@@ -29,6 +29,50 @@ const char* env_or_null(const char* name) {
   return (value != nullptr && value[0] != '\0') ? value : nullptr;
 }
 
+/// Candidate locations for a packaged data file, strongest first.
+///
+/// No machine-dependent path is baked into the source: the installed location
+/// is discovered at run time, with an explicit override for deployments that
+/// move the data elsewhere.
+std::vector<std::string> data_file_candidates(const std::string& relative) {
+  std::vector<std::string> candidates;
+  if (const char* data_dir = env_or_null("LITEGRIP_DATA_DIR")) {
+    candidates.push_back(std::string(data_dir) + "/calibration/" + relative);
+  }
+  candidates.emplace_back("calibration/" + relative);
+  candidates.emplace_back("../calibration/" + relative);
+  candidates.emplace_back(relative);
+  return candidates;
+}
+
+std::string resolve_data_file(const std::string& relative) {
+  const std::vector<std::string> candidates = data_file_candidates(relative);
+  for (const std::string& candidate : candidates) {
+    if (file_exists(candidate)) {
+      return candidate;
+    }
+  }
+  // Nothing found: return the primary candidate so the caller's error message
+  // names a path someone can actually act on.
+  return candidates.front();
+}
+
+/// The packaged mount templates, in declaration order (normal first).
+///
+/// A template declares a *direction* and nothing else: it deliberately carries
+/// no channel, CAN ids or gains, because adopting an identity or a tuning from
+/// a file that exists to state a direction would silently rewrite what the
+/// caller set. Mirrors the Python SDK's CALIB_TEMPLATES.
+struct CalibrationTemplate {
+  const char* name;
+  const char* file;
+};
+
+constexpr CalibrationTemplate kCalibrationTemplates[] = {
+    {"normal", "normal.json"},
+    {"reverse", "reverse.json"},
+};
+
 }  // namespace
 
 std::string default_calibration_path() {
@@ -42,30 +86,57 @@ std::string default_calibration_path() {
   return std::string(home) + "/.litegrip/litegrip_calibration.json";
 }
 
+std::string default_calibration_path(const std::string& channel) {
+  if (const char* override_path = env_or_null(kCalibEnvVar)) {
+    return override_path;
+  }
+  const char* home = env_or_null("HOME");
+  if (home == nullptr) {
+    return ".litegrip/" + channel + "_calibration.json";
+  }
+  return std::string(home) + "/.litegrip/" + channel + "_calibration.json";
+}
+
 std::string factory_calibration_path() {
-  // No machine-dependent path is baked into the source: the installed location
-  // is discovered at run time, with an explicit override for deployments that
-  // move the data elsewhere.
+  // An explicit override wins: deployments that move the data elsewhere use
+  // it, and the tests pin the fallback order with it.
   if (const char* explicit_path = env_or_null("LITEGRIP_FACTORY_CALIB")) {
     return explicit_path;
   }
+  // Otherwise the installed location is discovered at run time — no
+  // machine-dependent path is baked into the source.
+  return resolve_data_file("factory_calibration.json");
+}
 
-  std::vector<std::string> candidates;
-  if (const char* data_dir = env_or_null("LITEGRIP_DATA_DIR")) {
-    candidates.push_back(std::string(data_dir) + "/calibration/factory_calibration.json");
+std::vector<std::string> list_calibration_templates() {
+  std::vector<std::string> names;
+  for (const CalibrationTemplate& entry : kCalibrationTemplates) {
+    names.emplace_back(entry.name);
   }
-  candidates.emplace_back("calibration/factory_calibration.json");
-  candidates.emplace_back("../calibration/factory_calibration.json");
-  candidates.emplace_back("factory_calibration.json");
+  return names;
+}
 
-  for (const std::string& candidate : candidates) {
-    if (file_exists(candidate)) {
-      return candidate;
+std::string calibration_template_path(const std::string& name) {
+  for (const CalibrationTemplate& entry : kCalibrationTemplates) {
+    if (name == entry.name) {
+      return resolve_data_file(entry.file);
     }
   }
-  // Nothing found: return the primary candidate so the caller's error message
-  // names a path someone can actually act on.
-  return candidates.front();
+
+  std::string available;
+  for (const CalibrationTemplate& entry : kCalibrationTemplates) {
+    if (!available.empty()) {
+      available += ", ";
+    }
+    available += std::string("'") + entry.name + "'";
+  }
+  // Strict on purpose: answering an unknown (or mistyped) name with the
+  // factory file would turn a request for a reverse mount into a normal one
+  // without a sound. Mirrors the Python SDK's _resolve_template().
+  throw CommandError("unknown calibration template '" + name +
+                     "'; the available templates are " + available +
+                     " (an explicit calibration file path can still be passed "
+                     "to load_calibration)");
 }
 
 std::optional<CalibrationFile> read_calibration_file(const std::string& path) {
@@ -117,6 +188,12 @@ std::optional<CalibrationFile> read_calibration_file(const std::string& path) {
   if (document->contains("motor_type")) {
     out.motor_type = document->get_string("motor_type", "");
   }
+  // Absence leaves the optional empty, which every consumer reads as "yes":
+  // files written before the flag existed always came from a real calibration
+  // run. Mirrors the Python SDK's `data.get("calibrated", True)`.
+  if (document->contains("calibrated")) {
+    out.calibrated = document->get_bool("calibrated", true);
+  }
   return out;
 }
 
@@ -128,8 +205,11 @@ void write_calibration_file(const std::string& path, const GripperConfig& config
   json::Value document = json::Value::make_object();
   document.set("channel", config.can_channel);
   document.set("can_id", can_id);
-  document.set("mst_id", mst_id);
   document.set("canfd_mode", config.canfd_mode);
+  // Anything written from a live config states a direction on purpose, so the
+  // numbers are a claim even when they were never measured. Mirrors the
+  // Python SDK stamping the flag unconditionally.
+  document.set("calibrated", true);
   document.set("zero_position_rad", config.pos_closed_rad);
   document.set("max_position_rad", config.pos_open_rad);
   document.set("travel_range_rad",
@@ -139,6 +219,13 @@ void write_calibration_file(const std::string& path, const GripperConfig& config
   document.set("kp", config.kp);
   document.set("kd", config.kd);
   document.set("grasp_torque_threshold", config.grasp_torque_threshold);
+  // Only stamp mst_id when it is actually known. Writing a falsy 0 would pin
+  // auto-detection: load_calibration would install an RX filter of 0x000,
+  // every reply from the motor would be dropped, and enable() would fail
+  // after a long retry loop. (Python appends this key last, same reason.)
+  if (mst_id != 0) {
+    document.set("mst_id", mst_id);
+  }
 
   if (!document.write_file(path)) {
     throw CommError("cannot write calibration file: " + path);

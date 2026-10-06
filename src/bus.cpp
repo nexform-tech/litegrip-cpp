@@ -51,16 +51,17 @@ bool GripperBus::connect() {
   return true;
 }
 
-void GripperBus::disconnect() {
+void GripperBus::disconnect(bool disable) {
   if (!connected_) {
     return;
   }
 
-  // Disable on the way out. The condition also covers a bare enable() that was
-  // never preceded by init(): the Python original would have left that motor
-  // enabled (holding position with torque) after disconnect.
-  if (motor_ != nullptr && (initialized_ || motor_->is_enabled())) {
-    disable();
+  // Disable on the way out unless the caller asked the motor to stay enabled.
+  // The condition also covers a bare enable() that was never preceded by
+  // init(): the Python original would have left that motor enabled (holding
+  // position with torque) after disconnect.
+  if (disable && motor_ != nullptr && (initialized_ || motor_->is_enabled())) {
+    GripperBus::disable();
   }
 
   if (controller_) {

@@ -5,14 +5,22 @@
 // phase (see PLAN-litegrip-cpp.md D8).
 //
 // Path resolution mirrors the Python original:
-//   * env var LITEGRIP_CALIB, else ~/.litegrip/litegrip_calibration.json
-//   * when that file does not exist, fall back to the packaged, read-only
-//     factory_calibration.json
+//   * per channel: env LITEGRIP_CALIB, else ~/.litegrip/<channel>_calibration.json
+//   * then the legacy single-file location ~/.litegrip/litegrip_calibration.json
+//   * then the packaged, read-only factory_calibration.json
+// A candidate that declares a *different* channel is skipped, not adopted:
+// every LiteGrip ships at CAN id 0x08, so on a two-gripper machine the channel
+// is the only identity key (see LiteGrip::load_calibration).
+//
+// Mount templates (normal.json / reverse.json) declare a direction by name and
+// never fall back to the factory file — the fallback would be a *normal*
+// mount, which is exactly what a "reverse" request must not silently become.
 
 #pragma once
 
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "litegrip/models.hpp"
 
@@ -21,14 +29,42 @@ namespace litegrip {
 /// Environment variable overriding the user calibration path.
 inline constexpr const char* kCalibEnvVar = "LITEGRIP_CALIB";
 
-/// Default user calibration path: $LITEGRIP_CALIB, else ~/.litegrip/litegrip_calibration.json.
+/// Legacy user calibration path: $LITEGRIP_CALIB, else
+/// ~/.litegrip/litegrip_calibration.json.
 ///
-/// A stable absolute location, so a calibration saved without an explicit path
-/// is picked up next run regardless of the process working directory.
+/// The pre-per-channel location, kept so a calibration saved by an older
+/// version still loads; it is now the *legacy* entry of load_calibration()'s
+/// automatic chain rather than the primary one. A calibration saved here is
+/// still picked up next run regardless of the process working directory.
 std::string default_calibration_path();
+
+/// Per-channel user calibration path: $LITEGRIP_CALIB, else
+/// ~/.litegrip/<channel>_calibration.json.
+///
+/// Every LiteGrip ships at CAN id 0x08, so when two grippers share a machine
+/// the *channel* is the only thing that tells them apart — which is why the
+/// per-channel file comes first and why a candidate naming a different channel
+/// is skipped rather than adopted. Mirrors gripper.default_calib_path().
+std::string default_calibration_path(const std::string& channel);
 
 /// Path of the packaged factory calibration (read-only fallback).
 std::string factory_calibration_path();
+
+/// Names of the packaged mount templates, in declaration order.
+///
+/// A template declares a *direction* — which end of the travel is closed — and
+/// nothing else. It deliberately carries no channel, CAN ids or gains: adopting
+/// a device identity or a tuning from a file that exists to state a direction
+/// would silently rewrite what the caller set. Mirrors gripper.list_templates().
+std::vector<std::string> list_calibration_templates();
+
+/// Path of a packaged mount template.
+///
+/// Throws CommandError for an unknown name — never falls back to the factory
+/// file. The factory file is a *normal* mount, so answering a request for
+/// "reverse" with "normal" is precisely the failure the template name exists to
+/// prevent. Mirrors gripper._resolve_template().
+std::string calibration_template_path(const std::string& name);
 
 /// Calibration file contents, decoded.
 struct CalibrationFile {
@@ -48,6 +84,10 @@ struct CalibrationFile {
   std::optional<double> kd;
   std::optional<double> grasp_torque_threshold;
   std::optional<std::string> motor_type;
+
+  /// Whether the numbers in this file are a real measurement. Absent means
+  /// yes, matching the Python SDK's `data.get("calibrated", True)`.
+  std::optional<bool> calibrated;
 };
 
 /// Read + decode a calibration file. Returns nullopt when the file is missing

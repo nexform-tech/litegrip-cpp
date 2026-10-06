@@ -24,6 +24,7 @@
 #include <limits>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "litegrip/calibration.hpp"
 #include "litegrip/constants.hpp"
@@ -119,6 +120,7 @@ LiteGrip::LiteGrip(LiteGrip&& other) noexcept
       mst_id_(other.mst_id_),
       connected_(other.connected_),
       enabled_(other.enabled_),
+      disable_on_disconnect_(other.disable_on_disconnect_),
       status_flags_(other.status_flags_) {
   other.mst_id_.reset();
   other.connected_ = false;
@@ -135,6 +137,7 @@ LiteGrip& LiteGrip::operator=(LiteGrip&& other) noexcept {
     mst_id_ = other.mst_id_;
     connected_ = other.connected_;
     enabled_ = other.enabled_;
+    disable_on_disconnect_ = other.disable_on_disconnect_;
     status_flags_ = other.status_flags_;
     other.mst_id_.reset();
     other.connected_ = false;
@@ -172,11 +175,11 @@ void LiteGrip::disconnect() {
   if (!connected_) {
     return;
   }
-  if (enabled_) {
+  if (enabled_ && disable_on_disconnect_) {
     disable();
   }
   if (bus_ != nullptr) {
-    bus_->disconnect();
+    bus_->disconnect(disable_on_disconnect_);
   }
   connected_ = false;
   enabled_ = false;
@@ -269,8 +272,9 @@ bool LiteGrip::poll(double timeout_s) {
 bool LiteGrip::home() {
   check_connected();
   check_enabled();
-  return move_to(GripperParams::kPosClosedRad, std::nullopt, std::nullopt, 0.0,
-                 1.0);
+  // The calibrated closed limit, not the placeholder constant: a
+  // reverse-mounted gripper closes at the numerically *other* end.
+  return move_to(config_.pos_closed_rad, std::nullopt, std::nullopt, 0.0, 1.0);
 }
 
 bool LiteGrip::open(std::optional<double> kp, std::optional<double> kd,
@@ -301,10 +305,8 @@ bool LiteGrip::goto_mm(double position_mm, std::optional<double> kp,
                        std::optional<double> kd, double duration) {
   check_connected();
   check_enabled();
-  // The motor angle decreases as the gripper opens.
-  const double position_rad =
-      config_.pos_closed_rad - position_mm / config_.rad_to_mm;
-  return goto_rad(position_rad, kp, kd, 0.0, 0.0, duration);
+  return goto_rad(config_.rad_for_opening_mm(position_mm), kp, kd, 0.0, 0.0,
+                  duration);
 }
 
 bool LiteGrip::goto_rad(double position_rad, std::optional<double> kp,
@@ -423,6 +425,9 @@ CalibrationData LiteGrip::calibrate(double kp, double kd, double step_rad,
   config_.pos_closed_rad = result.zero_position;
   config_.pos_open_rad = result.max_position;
   config_.rad_to_mm = result.rad_to_mm;
+  // The ordering the two limits ended up in *is* the direction declaration,
+  // and a measured run is exactly what `calibrated` claims.
+  config_.calibrated = true;
 
   std::printf(
       "[litegrip] calibrate: closed(0mm)=%.6f rad open=%.6f rad travel=%.6f "
@@ -497,6 +502,7 @@ CalibrationData LiteGrip::calibrate_guided(double kp, double kd,
   config_.pos_closed_rad = result.zero_position;
   config_.pos_open_rad = result.max_position;
   config_.rad_to_mm = result.rad_to_mm;
+  config_.calibrated = true;
   return result;
 }
 
@@ -569,6 +575,7 @@ CalibrationData LiteGrip::calibrate_manual(double duration, double settle_time,
   config_.pos_closed_rad = result.zero_position;
   config_.pos_open_rad = result.max_position;
   config_.rad_to_mm = result.rad_to_mm;
+  config_.calibrated = true;
 
   std::printf(
       "[litegrip] calibrate_manual: %d samples, closed=%.6f rad open=%.6f rad "
@@ -578,9 +585,93 @@ CalibrationData LiteGrip::calibrate_manual(double duration, double settle_time,
   return result;
 }
 
+namespace {
+
+/// Join paths for a diagnostic message.
+std::string join_paths(const std::vector<std::string>& paths) {
+  std::string out;
+  for (const std::string& path : paths) {
+    if (!out.empty()) {
+      out += ", ";
+    }
+    out += path;
+  }
+  return out;
+}
+
+/// Drop repeats, keep order — LITEGRIP_CALIB can alias several chain entries.
+std::vector<std::string> dedupe_paths(const std::vector<std::string>& paths) {
+  std::vector<std::string> out;
+  for (const std::string& path : paths) {
+    bool seen = false;
+    for (const std::string& kept : out) {
+      if (kept == path) {
+        seen = true;
+        break;
+      }
+    }
+    if (!seen) {
+      out.push_back(path);
+    }
+  }
+  return out;
+}
+
+}  // namespace
+
+void LiteGrip::apply_calibration(const CalibrationFile& calibration,
+                                 const std::string& instance_channel) {
+  config_.pos_closed_rad = calibration.zero_position_rad;
+  config_.pos_open_rad = calibration.max_position_rad;
+  config_.rad_to_mm = calibration.rad_to_mm;
+
+  // A falsy id counts as "unknown", not as id 0: an mst_id of 0 would pin the
+  // CAN RX filter to 0x000 and every reply from the motor would be dropped,
+  // so enable() would fail after a long retry loop. Mirrors the Python SDK's
+  // truthiness checks.
+  if (calibration.can_id.has_value() && *calibration.can_id != 0) {
+    config_.can_id = *calibration.can_id;
+  }
+  if (calibration.mst_id.has_value() && *calibration.mst_id != 0) {
+    config_.mst_id = *calibration.mst_id;
+    mst_id_ = *calibration.mst_id;
+  }
+  if (calibration.channel.has_value()) {
+    config_.can_channel = *calibration.channel;
+  }
+  if (calibration.canfd_mode.has_value()) {
+    config_.canfd_mode = *calibration.canfd_mode;
+  }
+  if (calibration.kp.has_value()) {
+    config_.kp = *calibration.kp;
+  }
+  if (calibration.kd.has_value()) {
+    config_.kd = *calibration.kd;
+  }
+  if (calibration.grasp_torque_threshold.has_value()) {
+    config_.grasp_torque_threshold = *calibration.grasp_torque_threshold;
+  }
+
+  // A file from before the flag existed always came from a real calibration
+  // run, so absence means calibrated. Mirrors `data.get("calibrated", True)`.
+  config_.calibrated = calibration.calibrated.value_or(true);
+
+  // The channel is the only identity key when two grippers share CAN id 0x08,
+  // so a file that names another channel is worth flagging — but it is not
+  // fatal, since older files may omit the field entirely.
+  if (calibration.channel.has_value() && !calibration.channel->empty() &&
+      !instance_channel.empty() && *calibration.channel != instance_channel) {
+    std::fprintf(stderr,
+                 "[litegrip] warning: this calibration names channel=%s while "
+                 "the gripper is on %s — with two grippers sharing CAN id "
+                 "0x08 the channel is the identity key; check the file\n",
+                 calibration.channel->c_str(), instance_channel.c_str());
+  }
+}
+
 std::string LiteGrip::save_calibration(std::optional<std::string> path) {
   const std::string destination =
-      path.has_value() ? *path : default_calibration_path();
+      path.has_value() ? *path : default_calibration_path(config_.can_channel);
   const int mst = mst_id_.value_or(0);
   write_calibration_file(destination, config_, config_.can_id, mst,
                          motor_type_name(GripperParams::kMotorType));
@@ -588,48 +679,77 @@ std::string LiteGrip::save_calibration(std::optional<std::string> path) {
 }
 
 bool LiteGrip::load_calibration(std::optional<std::string> path) {
-  const std::string user_path = path.has_value() ? *path : default_calibration_path();
+  const std::string instance_channel = config_.can_channel;
 
-  // User file first, then the packaged read-only factory fallback.
-  std::optional<CalibrationFile> calibration =
-      read_calibration_file(user_path);
-  if (!calibration.has_value()) {
-    calibration = read_calibration_file(factory_calibration_path());
+  std::vector<std::string> sources;
+  bool skip_other_channels = false;
+  if (path.has_value()) {
+    // An explicit path is the caller's deliberate override: it may be
+    // anywhere (including a template's path), and when it cannot be read the
+    // packaged factory calibration is the documented fallback.
+    sources = {*path, factory_calibration_path()};
+  } else {
+    // This channel's own file first, then the legacy single-file location,
+    // then the factory one. LITEGRIP_CALIB can make several entries the same
+    // path; dedupe so the diagnostics do not repeat themselves.
+    sources = dedupe_paths({default_calibration_path(instance_channel),
+                            default_calibration_path(),
+                            factory_calibration_path()});
+    skip_other_channels = true;
   }
+
+  std::optional<CalibrationFile> calibration;
+  for (const std::string& source : sources) {
+    calibration = read_calibration_file(source);
+    if (!calibration.has_value()) {
+      continue;
+    }
+    if (skip_other_channels && calibration->channel.has_value() &&
+        !calibration->channel->empty() && !instance_channel.empty() &&
+        *calibration->channel != instance_channel) {
+      // Every LiteGrip ships at CAN id 0x08, so a can1 unit must not
+      // silently adopt the can0 unit's direction and travel.
+      std::fprintf(stderr,
+                   "[litegrip] skipping %s: it declares channel=%s, not this "
+                   "gripper's %s\n",
+                   source.c_str(), calibration->channel->c_str(),
+                   instance_channel.c_str());
+      calibration.reset();
+      continue;
+    }
+    break;
+  }
+
   if (!calibration.has_value()) {
     std::fprintf(stderr,
-                 "[litegrip] no calibration found in %s or the factory "
-                 "fallback; run a calibration first\n",
-                 user_path.c_str());
+                 "[litegrip] no calibration found (tried: %s); run a "
+                 "calibration first, or load a mount template (normal / "
+                 "reverse)\n",
+                 join_paths(sources).c_str());
     return false;
   }
 
-  config_.pos_closed_rad = calibration->zero_position_rad;
-  config_.pos_open_rad = calibration->max_position_rad;
-  config_.rad_to_mm = calibration->rad_to_mm;
+  apply_calibration(*calibration, instance_channel);
+  return true;
+}
 
-  if (calibration->can_id.has_value()) {
-    config_.can_id = *calibration->can_id;
+bool LiteGrip::load_template(const std::string& name) {
+  // Resolving the name is where an unknown one becomes an error; see
+  // calibration_template_path() for why it must never fall back.
+  const std::string template_path = calibration_template_path(name);
+
+  const std::optional<CalibrationFile> calibration =
+      read_calibration_file(template_path);
+  if (!calibration.has_value()) {
+    throw CommandError(
+        "calibration template '" + name + "' cannot be read (" +
+        template_path +
+        "); refusing to fall back to the factory calibration, which declares "
+        "a normal mount — that fallback is exactly the silent direction swap "
+        "the template name exists to prevent");
   }
-  if (calibration->mst_id.has_value()) {
-    config_.mst_id = *calibration->mst_id;
-    mst_id_ = calibration->mst_id;
-  }
-  if (calibration->channel.has_value()) {
-    config_.can_channel = *calibration->channel;
-  }
-  if (calibration->canfd_mode.has_value()) {
-    config_.canfd_mode = *calibration->canfd_mode;
-  }
-  if (calibration->kp.has_value()) {
-    config_.kp = *calibration->kp;
-  }
-  if (calibration->kd.has_value()) {
-    config_.kd = *calibration->kd;
-  }
-  if (calibration->grasp_torque_threshold.has_value()) {
-    config_.grasp_torque_threshold = *calibration->grasp_torque_threshold;
-  }
+
+  apply_calibration(*calibration, config_.can_channel);
   return true;
 }
 
@@ -670,10 +790,8 @@ GripperState LiteGrip::get_state(bool wait) {
   state.error_code = bus_->get_error();
   state.timestamp = wall_clock_now();
   state.data_age_s = data_age;
-  // The motor angle decreases as the gripper opens.
-  state.position_mm =
-      (config_.pos_closed_rad - position_rad) * config_.rad_to_mm;
-  state.force_n = state.torque_nm * config_.nm_to_n;
+  state.position_mm = config_.opening_mm(position_rad);
+  state.force_n = config_.force_n_from_torque(state.torque_nm);
   return state;
 }
 

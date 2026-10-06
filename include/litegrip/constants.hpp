@@ -17,9 +17,13 @@ struct GripperParams {
   static constexpr can::MotorType kMotorType = can::MotorType::kDM4310;
   static constexpr can::ControlMode kControlMode = can::ControlMode::kMit;
 
-  // Position limits (rad). Closed is numerically *larger* than open.
-  static constexpr double kPosClosedRad = 0.0;
-  static constexpr double kPosOpenRad = 1.14;
+  // Position limits (rad). Closed is numerically *larger* than open: the
+  // ordering is what carries the mounting direction, so it is the one thing a
+  // reverse-mounted unit flips (see close_sign_for()). These placeholders
+  // match the Python SDK's GripperConfig defaults value for value; a real
+  // unit replaces them with a calibration.
+  static constexpr double kPosClosedRad = 1.14;
+  static constexpr double kPosOpenRad = 0.0;
 
   // MIT quantization limits (DM4310).
   static constexpr double kQMax = 12.5;    // rad
