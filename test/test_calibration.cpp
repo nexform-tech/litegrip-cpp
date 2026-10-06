@@ -10,8 +10,10 @@
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <vector>
 
 #include "litegrip/calibration.hpp"
+#include "litegrip/exceptions.hpp"
 #include "litegrip/json.hpp"
 #include "litegrip/models.hpp"
 
@@ -130,6 +132,8 @@ int main() {
             "kp round-trip");
       check(reloaded->channel.has_value() && *reloaded->channel == "can0",
             "channel round-trip");
+      check(reloaded->calibrated.has_value() && *reloaded->calibrated,
+            "the written file is stamped calibrated");
     }
 
     // travel_range_rad is written as the absolute difference.
@@ -139,7 +143,127 @@ int main() {
       check_near(document->get_number("travel_range_rad", 0.0),
                  std::fabs(-0.064279 - 1.775959), 1e-6,
                  "travel_range_rad is absolute");
+      check(document->get_bool("calibrated", false),
+            "the JSON itself carries the calibrated flag");
     }
+  }
+
+  // ── mount templates ───────────────────────────────────────────────────
+  {
+    // calibration_template_path() discovers the data directory at run time;
+    // in the test tree its root is the calibration/ directory's parent.
+    const std::string data_dir = std::string(LITEGRIP_TEST_DATA_DIR) + "/..";
+    ::setenv("LITEGRIP_DATA_DIR", data_dir.c_str(), 1);
+
+    const std::vector<std::string> names =
+        litegrip::list_calibration_templates();
+    check(names.size() == 2 && names[0] == "normal" && names[1] == "reverse",
+          "the templates are normal, then reverse");
+
+    const auto normal = litegrip::read_calibration_file(
+        litegrip::calibration_template_path("normal"));
+    check(normal.has_value(), "the normal template parses");
+    if (normal.has_value()) {
+      // Same numbers as the Python SDK's calibration_normal.json: the closed
+      // stop is the numerically LARGER angle (a normal mount).
+      check_near(normal->zero_position_rad, 0.114, 1e-12, "normal closed");
+      check_near(normal->max_position_rad, -1.491, 1e-12, "normal open");
+      check_near(normal->rad_to_mm, 74.8, 1e-12, "normal rad_to_mm");
+      check(normal->calibrated.has_value() && *normal->calibrated,
+            "the template declares itself calibrated");
+      // A template states a *direction*: it must carry no identity and no
+      // tuning, or loading it would silently rewrite what the caller set.
+      check(!normal->channel.has_value() && !normal->can_id.has_value() &&
+                !normal->mst_id.has_value() && !normal->kp.has_value() &&
+                !normal->kd.has_value() && !normal->canfd_mode.has_value() &&
+                !normal->grasp_torque_threshold.has_value(),
+            "the template carries no channel / ids / gains");
+    }
+
+    const auto reverse = litegrip::read_calibration_file(
+        litegrip::calibration_template_path("reverse"));
+    check(reverse.has_value(), "the reverse template parses");
+    if (normal.has_value() && reverse.has_value()) {
+      check_near(reverse->zero_position_rad, normal->max_position_rad, 1e-12,
+                 "reverse swaps the closed limit");
+      check_near(reverse->max_position_rad, normal->zero_position_rad, 1e-12,
+                 "reverse swaps the open limit");
+      check_near(reverse->rad_to_mm, normal->rad_to_mm, 1e-12,
+                 "both templates share the same scale");
+    }
+
+    // An unknown name is a hard error, and the message names the valid ones.
+    bool threw = false;
+    try {
+      litegrip::calibration_template_path("sideways");
+    } catch (const litegrip::CommandError& error) {
+      threw = true;
+      const std::string message = error.what();
+      check(message.find("normal") != std::string::npos &&
+                message.find("reverse") != std::string::npos,
+            "the unknown-template error lists the valid names");
+    }
+    check(threw, "an unknown template name throws CommandError");
+
+    // With no template available, the resolver returns the primary candidate
+    // — never the factory path. (Under ctest the working directory holds no
+    // calibration/ tree, so the data-dir candidate is conclusive.)
+    const std::string empty_dir = std::string(kFixtureDir) + "/no_data";
+    ::mkdir(empty_dir.c_str(), 0755);
+    ::setenv("LITEGRIP_DATA_DIR", empty_dir.c_str(), 1);
+    check(litegrip::calibration_template_path("normal") ==
+              empty_dir + "/calibration/normal.json",
+          "an unavailable template resolves to its own candidate, not the "
+          "factory file");
+    ::unsetenv("LITEGRIP_DATA_DIR");
+  }
+
+  // ── the calibrated flag ───────────────────────────────────────────────
+  {
+    // The shipped factory file predates the flag; absence leaves no opinion,
+    // which every consumer reads as "yes".
+    const auto factory = litegrip::read_calibration_file(kFactoryPath);
+    check(factory.has_value() && !factory->calibrated.has_value(),
+          "a file without the flag reports no opinion about being calibrated");
+
+    const std::string path = std::string(kFixtureDir) + "/uncal.json";
+    FILE* file = std::fopen(path.c_str(), "w");
+    check(file != nullptr, "write uncalibrated fixture");
+    if (file != nullptr) {
+      const std::string text =
+          "{\"calibrated\": false, \"zero_position_rad\": 0.1, "
+          "\"max_position_rad\": -1.5, \"rad_to_mm\": 74.8}";
+      std::fwrite(text.data(), 1, text.size(), file);
+      std::fclose(file);
+    }
+    const auto uncal = litegrip::read_calibration_file(path);
+    check(uncal.has_value() && uncal->calibrated.has_value() &&
+              !*uncal->calibrated,
+          "calibrated=false is decoded as such");
+  }
+
+  // ── what a save stamps ────────────────────────────────────────────────
+  {
+    litegrip::GripperConfig config;
+    const std::string path = std::string(kFixtureDir) + "/stamps.json";
+    // mst_id 0 means "unknown": it must be omitted, never stamped as a falsy
+    // 0 that would later pin auto-detection to RX filter 0x000.
+    litegrip::write_calibration_file(path, config, 8, 0, "DM4310");
+
+    const auto document = litegrip::json::Value::parse_file(path);
+    check(document.has_value(), "the stamped file parses");
+    if (document.has_value()) {
+      check(document->get_bool("calibrated", false),
+            "a written calibration declares itself calibrated");
+      check(!document->contains("mst_id"),
+            "an unknown mst_id is omitted, not written as 0");
+    }
+    const auto reloaded = litegrip::read_calibration_file(path);
+    check(reloaded.has_value() && reloaded->calibrated.has_value() &&
+              *reloaded->calibrated,
+          "the stamped flag reads back");
+    check(reloaded.has_value() && !reloaded->mst_id.has_value(),
+          "the omitted mst_id stays absent on reload");
   }
 
   // ── path resolution / overrides ───────────────────────────────────────

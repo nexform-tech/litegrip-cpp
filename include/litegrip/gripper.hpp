@@ -19,6 +19,7 @@
 #include <utility>
 
 #include "litegrip/bus.hpp"
+#include "litegrip/calibration.hpp"
 #include "litegrip/models.hpp"
 #include "litegrip/safety.hpp"
 
@@ -53,12 +54,22 @@ class LiteGrip {
   bool is_enabled() const noexcept { return enabled_; }
   const GripperConfig& config() const noexcept { return config_; }
   GripperConfig& config() noexcept { return config_; }
+  /// Whether disconnect() disables the motor first. Default true; set false
+  /// to leave the motor enabled (holding position with torque) after the bus
+  /// closes. Mirrors the Python SDK's same-named attribute.
+  bool disable_on_disconnect() const noexcept { return disable_on_disconnect_; }
+  void set_disable_on_disconnect(bool value) noexcept {
+    disable_on_disconnect_ = value;
+  }
 
   // ── connection ────────────────────────────────────────────────────────
 
   /// Open the bus and register the motor. When the config leaves mst_id unset
   /// it is auto-detected here.
   bool connect();
+
+  /// Close the bus, disabling the motor first unless
+  /// disable_on_disconnect() is false.
   void disconnect();
 
   // ── enable / init / fault ─────────────────────────────────────────────
@@ -95,7 +106,8 @@ class LiteGrip {
 
   // ── motion ────────────────────────────────────────────────────────────
 
-  /// Move to the closed (zero) position.
+  /// Move to the closed (zero) position: this instance's calibrated closed
+  /// limit, so a reverse-mounted gripper homes to the correct end.
   bool home();
 
   bool open(std::optional<double> kp = std::nullopt,
@@ -145,12 +157,42 @@ class LiteGrip {
                                    double sample_interval = 0.01);
 
   /// Persist the current calibration. Returns the path written.
+  ///
+  /// Without `path`, writes to this channel's own file
+  /// (default_calibration_path(channel)) — the file load_calibration() reads
+  /// by default, so a calibration saved here is picked up automatically next
+  /// run. One file per channel is what keeps two grippers on one machine from
+  /// overwriting each other.
   std::string save_calibration(std::optional<std::string> path = std::nullopt);
 
-  /// Load calibration into config. Tries `path` (default: the user path), then
-  /// falls back to the packaged factory calibration. Call after connect() and
-  /// before enable().
+  /// Load calibration into config. Two of the three ways to say which file:
+  ///
+  ///  * `path` — an explicit file, which may be anywhere (including a
+  ///    template's path). Falls back to the packaged factory calibration when
+  ///    that file cannot be read.
+  ///  * no argument — this channel's own file
+  ///    (default_calibration_path(channel)), then the legacy single-file
+  ///    location, then the factory one. A candidate whose `channel` field
+  ///    names a different interface is *skipped*, so a can1 unit fails loudly
+  ///    rather than silently adopting can0's calibration — every LiteGrip
+  ///    ships at CAN id 0x08, so the channel is the only identity key.
+  ///
+  /// load_template() is the third way: declaring the mount by name.
+  ///
+  /// The limits in the file decide the direction: whichever of the two is
+  /// numerically larger is the closed side (see GripperConfig::close_sign()).
+  /// Call after connect() and before enable().
   bool load_calibration(std::optional<std::string> path = std::nullopt);
+
+  /// Load a packaged mount template by name — see
+  /// list_calibration_templates(): "normal" / "reverse" — which *declares* the
+  /// mount direction.
+  ///
+  /// Strict: an unknown name or an unreadable template throws CommandError
+  /// instead of falling back. The fallback would be the factory file, and
+  /// that file is a *normal* mount, so answering a request for reverse with
+  /// normal is the one failure the name exists to prevent.
+  bool load_template(const std::string& name);
 
   // ── state ─────────────────────────────────────────────────────────────
 
@@ -194,12 +236,20 @@ class LiteGrip {
   void check_connected() const;
   void check_enabled() const;
 
+  /// Copy a decoded calibration into the config. `instance_channel` is the
+  /// channel *before* the copy: a file naming a different one is worth a
+  /// warning (the channel is the identity key when two grippers share CAN id
+  /// 0x08) but is not fatal, since older files predate the field.
+  void apply_calibration(const CalibrationFile& calibration,
+                         const std::string& instance_channel);
+
   GripperConfig config_;
   std::unique_ptr<GripperBus> bus_;
   std::unique_ptr<SafetyGuard> safety_;
   std::optional<int> mst_id_;
   bool connected_ = false;
   bool enabled_ = false;
+  bool disable_on_disconnect_ = true;
   GripperStatus status_flags_ = GripperStatus::kNone;
 };
 

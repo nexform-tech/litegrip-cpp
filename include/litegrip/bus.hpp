@@ -37,8 +37,10 @@ class GripperBus {
   /// mst_id when the config leaves it unset).
   bool connect();
 
-  /// Disable (when initialised) and close the transport.
-  void disconnect();
+  /// Disable (when initialised) and close the transport. `disable = false`
+  /// leaves the motor enabled — holding position with torque — for callers
+  /// that own the motor state themselves (LiteGrip::disable_on_disconnect).
+  void disconnect(bool disable = true);
 
   bool is_connected() const noexcept { return connected_; }
   bool is_initialized() const noexcept { return initialized_; }

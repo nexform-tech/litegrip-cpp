@@ -86,6 +86,16 @@ struct GripperState {
   double aperture_mm() const noexcept { return position_mm; }
 };
 
+/// +1 when closing is toward *larger* radians, -1 when toward smaller.
+///
+/// The sign is derived from the ordering of the two calibrated limits and is
+/// never stored: direction is data, not a switch, so there is no second place
+/// for it to disagree with. Mirrors models.GripperConfig.close_sign.
+inline constexpr double close_sign_for(double pos_closed_rad,
+                                       double pos_open_rad) noexcept {
+  return pos_closed_rad >= pos_open_rad ? 1.0 : -1.0;
+}
+
 /// Gripper configuration — tune these for your hardware.
 /// Mirrors models.GripperConfig.
 struct GripperConfig {
@@ -100,9 +110,22 @@ struct GripperConfig {
   double kd = GripperParams::kDefaultKd;
 
   // Position limits (rad), updated by calibrate().
-  // closed (0 mm) is numerically *larger* than open (full stroke).
+  // closed (0 mm) is numerically *larger* than open (full stroke) **in the
+  // normal mount**. A reverse-mounted unit has them the other way round, which
+  // is exactly what close_sign() reads back; do not "fix" the ordering here.
   double pos_closed_rad = GripperParams::kPosClosedRad;
   double pos_open_rad = GripperParams::kPosOpenRad;
+
+  /// True once a real calibration has been loaded or measured.
+  ///
+  /// This is the gate for anything that derives its target from the calibrated
+  /// limits: while it is false, "which end is closed" is a guess and both
+  /// orderings are equally plausible. Mirrors models.GripperConfig.calibrated.
+  ///
+  /// Note it does NOT gate raw motion — this repository's goto_rad()/move_to()
+  /// take an explicit angle and never consult it (the same split as Python,
+  /// where only limit_target()/press_target() call _check_calibrated).
+  bool calibrated = false;
 
   // Mechanical stroke (mm) — set to match your gripper's physical travel.
   double max_stroke_mm = 120.0;
@@ -113,6 +136,47 @@ struct GripperConfig {
 
   // Grasp detection
   double grasp_torque_threshold = 0.5;  // N.m
+
+  /// See close_sign_for(). Needed at every rad<->mm and Nm->N conversion.
+  double close_sign() const noexcept {
+    return close_sign_for(pos_closed_rad, pos_open_rad);
+  }
+
+  /// Mount name implied by the calibrated limits, or nullopt while
+  /// uncalibrated.
+  ///
+  /// Reporting "normal" before a calibration was loaded would be a claim, not
+  /// a reading. Mirrors models.GripperConfig.mount.
+  std::optional<std::string> mount() const {
+    if (!calibrated) {
+      return std::nullopt;
+    }
+    return close_sign() > 0.0 ? std::string("normal") : std::string("reverse");
+  }
+
+  // ── the unit convention, in one place ────────────────────────────────
+  //
+  // Both mountings report 0 mm at the closed stop and +max_stroke at the open
+  // stop, so a caller never has to know which way the motor turns. That is
+  // what close_sign() is for; do not open-code the arithmetic at call sites.
+
+  /// Opening in mm for a measured joint angle.
+  double opening_mm(double position_rad) const noexcept {
+    return close_sign() * (pos_closed_rad - position_rad) * rad_to_mm;
+  }
+
+  /// Joint angle that produces the given opening in mm (inverse of the above).
+  double rad_for_opening_mm(double mm) const noexcept {
+    return pos_closed_rad - close_sign() * mm / rad_to_mm;
+  }
+
+  /// Grip force in N for a measured motor torque. Positive means *squeeze*.
+  ///
+  /// ⚠ The N value is NOT force-calibrated — it is torque times a constant,
+  /// matching the Python SDK so the two agree. See set_force().
+  double force_n_from_torque(double torque_nm) const noexcept {
+    return close_sign() * torque_nm * nm_to_n;
+  }
 };
 
 /// Static device information. Mirrors models.GripperInfo.
