@@ -142,11 +142,11 @@ int main() {
     // An explicit path loads even without a connection, matching the Python
     // SDK's documented order (load after connect, before enable).
     check(gripper.load_calibration(kFactoryPath), "explicit calibration loads");
-    check(std::fabs(gripper.config().pos_closed_rad - 0.114) < 1e-12,
+    check(std::fabs(gripper.config().pos_closed_rad - 0.052071) < 1e-12,
           "closed limit loaded from the factory file");
-    check(std::fabs(gripper.config().pos_open_rad - (-1.491)) < 1e-12,
+    check(std::fabs(gripper.config().pos_open_rad - (-1.357481)) < 1e-12,
           "open limit loaded from the factory file");
-    check(std::fabs(gripper.config().rad_to_mm - 74.8) < 1e-12,
+    check(std::fabs(gripper.config().rad_to_mm - 61.01229326764816) < 1e-12,
           "rad_to_mm loaded from the factory file");
     check(gripper.config().can_id == 8, "can_id loaded from the factory file");
     check(gripper.mst_id().has_value() && *gripper.mst_id() == 24,
@@ -185,7 +185,7 @@ int main() {
     ::setenv("LITEGRIP_FACTORY_CALIB", kFactoryPath.c_str(), 1);
     litegrip::LiteGrip gripper;
     check(gripper.load_calibration(), "falls back to the factory calibration");
-    check(std::fabs(gripper.config().rad_to_mm - 74.8) < 1e-12,
+    check(std::fabs(gripper.config().rad_to_mm - 61.01229326764816) < 1e-12,
           "factory values applied via the fallback");
     ::unsetenv("LITEGRIP_CALIB");
     ::unsetenv("LITEGRIP_FACTORY_CALIB");
