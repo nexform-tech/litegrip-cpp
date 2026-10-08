@@ -99,6 +99,7 @@ struct ControlLoop::Impl {
   /// read by fault_code() without taking the mutex. Keeps the FIRST code, like
   /// a latch, so the original cause is not masked by its consequences.
   std::atomic<int> fault_code{0};
+  std::atomic<std::uint64_t> rejected_commands{0};
 
   // Loop-thread-only state.
   double trajectory_rad = 0.0;
@@ -128,6 +129,28 @@ struct ControlLoop::Impl {
       bus->poll(0.0);
     } catch (const LiteGripError&) {
       // Best effort: this path must not itself throw.
+    }
+  }
+
+  /// A "hold" frame: keep the link fed with a *light* frame aimed at the measured
+  /// position. Used when the safety gate refuses the commanded frame — skipping it
+  /// silently would let the motor latch its own comm-loss fault (~900 ms) and the
+  /// loop would then stop driving for good. Low kp keeps the commanded torque
+  /// inside the recovery ceiling, so this frame is accepted where the refused one
+  /// was not.
+  void stream_hold_frame() {
+    if (bus == nullptr || bus->motor() == nullptr) {
+      return;
+    }
+    try {
+      const double q = bus->motor()->position();
+      const double kp = std::min(config.kp, 4.0);
+      const double kd = std::min(config.kd, 0.5);
+      const double q_safe = safety->guard_recovery_frame(q, kp, kd, 0.0, 0.0, q, 0.0, "hold_frame");
+      bus->control_mit(q_safe, 0.0, kp, kd, 0.0);
+      bus->poll(0.0);
+    } catch (const LiteGripError&) {
+      stream_zero_torque();          // 连保持帧都被拒：退到零转矩（仍然不是静默）
     }
   }
 
@@ -305,8 +328,26 @@ void ControlLoop::thread_main() {
       } else {
         hardware_cycle(elapsed);
       }
+    } catch (const LimitViolation& error) {
+      // The safety gate refused this frame (measured torque already over the
+      // ceiling, velocity out of budget, position outside the red lines). That is
+      // information about the *command*, not a hardware fault: dropping torque
+      // here would let the spring open the jaws and refuse every later frame.
+      impl_->rejected_commands.fetch_add(1, std::memory_order_relaxed);
+      if (impl_->config.latch_on_limit_violation) {
+        impl_->set_fault(FaultCode::kHardwareSafeStop);
+        std::fprintf(stderr, "[litegrip] control loop fault: %s\n", error.what());
+        safe_stop();
+      } else {
+        // 不静默！SDK 自己的注释：静默会让电机 ~900 ms 后锁存通信丢失，
+        // 那时循环会停驱动、之后所有命令无响应。改发**轻载荷保持帧**：
+        // 链路不断、力矩落在恢复上限内、也不锁存。
+        std::fprintf(stderr, "[litegrip] command rejected (streaming hold frame): %s\n",
+                     error.what());
+        impl_->stream_hold_frame();
+      }
     } catch (const LiteGripError& error) {
-      // A gate rejection or a hardware error: latch a fault and stop driving.
+      // A hardware error or a latched safety condition: fail closed.
       impl_->set_fault(FaultCode::kHardwareSafeStop);
       std::fprintf(stderr, "[litegrip] control loop fault: %s\n", error.what());
       safe_stop();
@@ -564,6 +605,10 @@ GripperState ControlLoop::state() const {
 }
 
 int ControlLoop::fault_code() const { return impl_->fault_code.load(); }
+
+std::uint64_t ControlLoop::rejected_command_count() const {
+  return impl_->rejected_commands.load(std::memory_order_relaxed);
+}
 
 const SafetyLimits& ControlLoop::safety_limits() const noexcept {
   // Built in start() before the thread exists and never replaced afterwards, so
