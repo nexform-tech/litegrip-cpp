@@ -61,16 +61,18 @@ int main() {
       check(factory->has_closed && factory->has_open && factory->has_rad_to_mm,
             "required fields present");
       // Values from the file, unchanged from the Python SDK's copy.
-      check_near(factory->zero_position_rad, 0.114, 1e-12, "zero_position_rad");
-      check_near(factory->max_position_rad, -1.491, 1e-12, "max_position_rad");
-      check_near(factory->rad_to_mm, 74.8, 1e-12, "rad_to_mm");
+      check_near(factory->zero_position_rad, 0.052071, 1e-12,
+                 "zero_position_rad");
+      check_near(factory->max_position_rad, -1.357481, 1e-12,
+                 "max_position_rad");
+      check_near(factory->rad_to_mm, 61.01229326764816, 1e-12, "rad_to_mm");
       check(factory->can_id.has_value() && *factory->can_id == 8, "can_id");
       check(factory->mst_id.has_value() && *factory->mst_id == 24, "mst_id");
       check(factory->canfd_mode.has_value() && !*factory->canfd_mode,
             "canfd_mode");
       check(factory->motor_type.has_value() && *factory->motor_type == "DM4310",
             "motor_type");
-      check(factory->kp.has_value() && std::fabs(*factory->kp - 100.0) < 1e-12,
+      check(factory->kp.has_value() && std::fabs(*factory->kp - 5.0) < 1e-12,
             "kp");
       check(factory->grasp_torque_threshold.has_value() &&
                 std::fabs(*factory->grasp_torque_threshold - 0.5) < 1e-12,
