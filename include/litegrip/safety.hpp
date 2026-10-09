@@ -301,6 +301,27 @@ class SafetyGuard {
                              std::optional<double> dq_act,
                              const std::string& source = "recovery");
 
+  /// Validate a bounded-torque HOLD frame: the frame may keep pushing while the
+  /// measured torque is already over the ceiling, but only as long as the
+  /// frame's OWN estimated output torque
+  /// (`kp*(q_target-q_act) - kd*dq_act + tau_ff`) stays under the hard ceiling.
+  ///
+  /// Use this instead of guard_recovery_frame() to keep a grasp alive. The
+  /// recovery gate exists for driving back from OUTSIDE the red lines and
+  /// refuses every position that is already inside them — which is exactly
+  /// where a grasp happens — so a hold routed through it always degrades to a
+  /// zero-torque frame, and the spring then opens the jaws.
+  ///
+  /// The criterion is also the stronger one: it bounds what the frame is about
+  /// to ASK FOR, not what the loop last measured. A frame whose estimated
+  /// torque is bounded unloads whenever the measured torque is already over the
+  /// ceiling, which is the case a hold frame exists for.
+  double guard_hold_frame(double q_target, double kp, double kd,
+                          double dq_target, double tau_feedforward,
+                          std::optional<double> q_act,
+                          std::optional<double> dq_act,
+                          const std::string& source = "hold");
+
   /// Validate a zero-torque frame: kp / kd / dq / tau must all be exactly 0.
   /// This is what makes "zero-torque frames bypass the red lines" acceptable.
   void guard_zero_torque_frame(double kp, double kd, double dq, double tau,

@@ -550,6 +550,57 @@ double SafetyGuard::guard_recovery_frame(double q_target, double kp, double kd,
   return q_target;
 }
 
+double SafetyGuard::guard_hold_frame(double q_target, double kp, double kd,
+                                    double dq_target, double tau_feedforward,
+                                    std::optional<double> q_act,
+                                    std::optional<double> dq_act,
+                                    const std::string& source) {
+  check_not_latched(source);
+
+  q_target = normalize_scalar(q_target, "target angle", source);
+  kp = normalize_scalar(kp, "kp", source);
+  kd = normalize_scalar(kd, "kd", source);
+  dq_target = normalize_scalar(dq_target, "target velocity", source);
+  tau_feedforward = normalize_scalar(tau_feedforward, "feed-forward torque",
+                                    source);
+  if (!dq_act.has_value() || !finite(*dq_act)) {
+    throw SafetyFault(source + ": no valid velocity feedback — hold refused");
+  }
+
+  // A hold is not a recovery: the measured position still has to be inside the
+  // red lines, and the recovery channel is the only one that may work outside.
+  const double measured = require_act_within_red(q_act, source);
+
+  if (q_target < limits_.red_min_rad || q_target > limits_.red_max_rad) {
+    throw LimitViolation(source +
+                         ": hold target is outside the software red lines — "
+                         "command not sent");
+  }
+  const double q_safe = SafetyLimits::quantize_toward_interior(
+      q_target, limits_.red_min_rad, limits_.red_max_rad);
+
+  const TemporaryParams& p = limits_.params;
+  if (kp < 0.0 || kp > p.kp_max) {
+    throw LimitViolation(source + ": kp is outside the allowed range");
+  }
+  if (kd < 0.0 || kd > p.kd_max) {
+    throw LimitViolation(source + ": kd is outside the allowed range");
+  }
+  if (std::fabs(tau_feedforward) > p.tau_max_nm) {
+    throw LimitViolation(source + ": feed-forward torque exceeds the ceiling");
+  }
+
+  const double tau_est =
+      kp * (q_safe - measured) - kd * (*dq_act) + tau_feedforward;
+  if (std::fabs(tau_est) > p.tau_max_nm) {
+    throw LimitViolation(
+        source +
+        ": the hold frame's own torque would exceed the ceiling — command not "
+        "sent");
+  }
+  return q_safe;
+}
+
 void SafetyGuard::guard_zero_torque_frame(double kp, double kd, double dq,
                                           double tau,
                                           const std::string& source) {
