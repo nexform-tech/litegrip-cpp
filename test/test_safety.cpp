@@ -423,6 +423,63 @@ int main() {
                  });
   }
 
+  // ── guard_hold_frame ──────────────────────────────────────────────────
+  //
+  // A hold is the one frame that has to keep pushing while the measured torque
+  // is already over the ceiling: that is what holding a grasped object means.
+  // The recovery gate cannot express it (it refuses every position inside the
+  // red lines, which is where a grasp happens), so the old fallback silently
+  // degenerated into a zero-torque release.
+  {
+    litegrip::SafetyGuard guard{defaults};
+    // Pushing closed while the measured torque is already over the ceiling:
+    // refused by the motion gate, accepted by the hold gate.
+    check_throws("the motion gate refuses a hold that keeps pushing over-torque",
+                 [&] {
+                   guard.guard_motion_frame(-0.55, 8.0, 1.0, 0.0, 0.0, -0.6, 0.0,
+                                            5.0);
+                 });
+    const double held =
+        guard.guard_hold_frame(-0.55, 8.0, 1.0, 0.0, 0.0, -0.6, 0.0);
+    // The gate returns the QUANTIZED target (the 16-bit MIT field cannot
+    // represent every value), so compare within one quantization step.
+    check_near(held, -0.55, 1e-3,
+               "a bounded hold is allowed while the measured torque is over");
+
+    // The frame's OWN torque is what has to stay under the ceiling. This is the
+    // 16x-overshoot case: kp * error = 8 * 0.5 = 4 Nm > 3.5 Nm.
+    check_throws("a hold frame whose own torque exceeds the ceiling is refused",
+                 [&] {
+                   guard.guard_hold_frame(-0.1, 8.0, 1.0, 0.0, 0.0, -0.6, 0.0);
+                 });
+    // Damping counts against the same ceiling.
+    check_throws("a hold frame whose damping alone exceeds the ceiling is refused",
+                 [&] {
+                   guard.guard_hold_frame(-0.55, 8.0, 1.0, 0.0, 0.0, -0.6, 5.0);
+                 });
+
+    // A hold is not a recovery: it may not be used to work outside the red lines.
+    check_throws("a hold outside the red lines is refused",
+                 [&] {
+                   guard.guard_hold_frame(-1.3, 8.0, 1.0, 0.0, 0.0, -0.6, 0.0);
+                 });
+    check_throws("a hold with no measured position is refused",
+                 [&] {
+                   guard.guard_hold_frame(-0.55, 8.0, 1.0, 0.0, 0.0, std::nullopt,
+                                          0.0);
+                 });
+    check_throws("a hold with no velocity feedback is refused",
+                 [&] {
+                   guard.guard_hold_frame(-0.55, 8.0, 1.0, 0.0, 0.0, -0.6,
+                                          std::nullopt);
+                 });
+    // Gains still have their own ceilings.
+    check_throws("a hold above the kp ceiling is refused",
+                 [&] {
+                   guard.guard_hold_frame(-0.55, 1000.0, 1.0, 0.0, 0.0, -0.6, 0.0);
+                 });
+  }
+
   // ── latch and watchdog ────────────────────────────────────────────────
   {
     litegrip::SafetyGuard guard{defaults};

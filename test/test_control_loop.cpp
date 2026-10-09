@@ -159,6 +159,65 @@ int main() {
     loop.stop();
   }
 
+  // ── the commanded torque is capped by the budget ──────────────────────
+  //
+  // allocate_gains() only bounds `kp * max_position_error_rad`. Blocked against
+  // a hard object the real error grows past that bound, so without a saturation
+  // the loop keeps asking for more torque until the gate refuses the frame —
+  // measured on hardware as a 2.4 Hz bounce between "push hard" and "let go".
+  //
+  // The dry-run plant tracks the command exactly, so the error can only exceed
+  // the assumed bound when the assumed bound is smaller than one cycle's
+  // trajectory step. That is what this configuration arranges: step = 1.5 rad/s
+  // * 20 ms = 30 mrad, while the budget caps the error at 3.5 Nm / 200 = 17.5
+  // mrad. The plant may therefore advance at most 17.5 mrad per cycle, i.e.
+  // 875 mm/s at 100 mm/rad — not the 1500 mm/s the rate ceiling alone allows.
+  {
+    litegrip::ControlLoopConfig cfg = dry_config();
+    cfg.control_rate_hz = 50.0;
+    cfg.kp = 200.0;                      // at the gate's gain ceiling
+    cfg.kd = 0.5;
+    cfg.max_feedback_velocity_rad_s = 1.0;
+    cfg.max_position_error_rad = 0.001;  // much smaller than one cycle's step
+    cfg.max_velocity_rad_s = 1.5;
+    cfg.command_timeout_s = 10.0;
+
+    litegrip::ControlLoop loop(cfg);
+    loop.start();
+    loop.set_enable(true);
+    loop.set_target_mm(40.0);
+
+    sleep_ms(300);
+    const double early = loop.state().position_mm;
+    check(early > 0.0, "the saturated loop still moves");
+    check(early < 35.0,
+          "the commanded torque is capped by the budget, not by the rate ceiling");
+    check(loop.fault_code() == 0, "saturating the torque is not a fault");
+    loop.stop();
+  }
+
+  // ── a refused frame is counted, and does not latch by default ─────────
+  {
+    litegrip::ControlLoopConfig cfg = dry_config();
+    cfg.command_timeout_s = 10.0;
+    litegrip::ControlLoop loop(cfg);
+    loop.start();
+    loop.set_enable(true);
+    check(loop.rejected_command_count() == 0, "no refusals yet");
+
+    // Past the closed red line but inside the mechanical range: the gate has to
+    // refuse every frame (a target beyond the mechanical range is a SafetyFault
+    // instead, which does latch).
+    loop.set_target_rad(0.02);
+    sleep_ms(300);
+    check(loop.rejected_command_count() > 0,
+          "a frame the gate refuses is counted");
+    check(loop.fault_code() == 0,
+          "a refused command does not latch a hardware fault by default");
+    check(loop.is_running(), "the loop keeps streaming after a refusal");
+    loop.stop();
+  }
+
   // ── emergency stop latches a fault and stops motion ───────────────────
   {
     litegrip::ControlLoop loop(dry_config());

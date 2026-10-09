@@ -40,6 +40,12 @@ double monotonic_now() noexcept {
       .count();
 }
 
+/// Fraction of the torque budget a hold frame is allowed to pull.
+///
+/// Half the budget keeps a real clamping force with margin left under the hard
+/// ceiling, so a hold never has to be refused by its own gate.
+constexpr double kHoldTorqueFraction = 0.5;
+
 /// MIT gains allocated from a torque budget.
 ///
 /// The frame's kp/kd are handed to the driver, which evaluates them against the
@@ -99,6 +105,7 @@ struct ControlLoop::Impl {
   /// read by fault_code() without taking the mutex. Keeps the FIRST code, like
   /// a latch, so the original cause is not masked by its consequences.
   std::atomic<int> fault_code{0};
+  std::atomic<std::uint64_t> rejected_commands{0};
 
   // Loop-thread-only state.
   double trajectory_rad = 0.0;
@@ -128,6 +135,53 @@ struct ControlLoop::Impl {
       bus->poll(0.0);
     } catch (const LiteGripError&) {
       // Best effort: this path must not itself throw.
+    }
+  }
+
+  /// A "hold" frame: keep the link fed with a bounded-torque frame when the
+  /// safety gate refuses the commanded one.
+  ///
+  /// Do not aim at the measured position: the MIT law is `tau = kp*(q_des - q)`,
+  /// so that frame commands exactly zero torque, the spring opens the jaws and
+  /// the grasp is quietly released — the opposite of holding. Do not route it
+  /// through the recovery gate either: that gate exists for driving back from
+  /// OUTSIDE the red lines and refuses every position already inside them,
+  /// which is where every grasp happens, so the frame is always refused and the
+  /// fallback silently degenerates into a zero-torque release.
+  ///
+  /// Instead aim `tau_hold / kp` PAST the contact point, in the direction the
+  /// refused frame was pushing, and let guard_hold_frame() bound the frame's own
+  /// estimated torque. The result is a constant, bounded clamping force while
+  /// the object resists: a hold that holds.
+  void stream_hold_frame() {
+    can::MotorState* motor = bus != nullptr ? bus->motor() : nullptr;
+    if (motor == nullptr || safety == nullptr) {
+      return;
+    }
+    const double q = motor->position();
+    const double dq = motor->velocity();
+    const SafetyLimits& limits = safety->limits();
+    const double kp = std::min(config.kp, limits.params.kp_max);
+    const double kd = std::min(config.kd, limits.params.kd_max);
+    const double ceiling =
+        std::min(config.torque_limit_nm, limits.params.tau_max_nm);
+    const double bias = (kHoldTorqueFraction * ceiling) / std::max(kp, 1e-9);
+
+    // Keep pushing the way the refused frame was pushing: a hold must never
+    // reverse the grip.
+    const double direction = (trajectory_rad >= q) ? 1.0 : -1.0;
+    const double q_target =
+        std::clamp(q + direction * bias, limits.red_min_rad, limits.red_max_rad);
+
+    try {
+      const double q_safe = safety->guard_hold_frame(q_target, kp, kd, 0.0, 0.0,
+                                                     q, dq, "hold_frame");
+      bus->control_mit(q_safe, 0.0, kp, kd, 0.0);
+      bus->poll(0.0);
+    } catch (const LiteGripError&) {
+      // Even a bounded hold was refused: fall back to zero torque, which is
+      // loud (the object slips) rather than silent.
+      stream_zero_torque();
     }
   }
 
@@ -305,8 +359,26 @@ void ControlLoop::thread_main() {
       } else {
         hardware_cycle(elapsed);
       }
+    } catch (const LimitViolation& error) {
+      // The safety gate refused this frame (measured torque already over the
+      // ceiling, velocity out of budget, position outside the red lines). That is
+      // information about the *command*, not a hardware fault: dropping torque
+      // here would let the spring open the jaws and refuse every later frame.
+      impl_->rejected_commands.fetch_add(1, std::memory_order_relaxed);
+      if (impl_->config.latch_on_limit_violation) {
+        impl_->set_fault(FaultCode::kHardwareSafeStop);
+        std::fprintf(stderr, "[litegrip] control loop fault: %s\n", error.what());
+        safe_stop();
+      } else {
+        // 不静默！SDK 自己的注释：静默会让电机 ~900 ms 后锁存通信丢失，
+        // 那时循环会停驱动、之后所有命令无响应。改发**轻载荷保持帧**：
+        // 链路不断、力矩落在恢复上限内、也不锁存。
+        std::fprintf(stderr, "[litegrip] command rejected (streaming hold frame): %s\n",
+                     error.what());
+        impl_->stream_hold_frame();
+      }
     } catch (const LiteGripError& error) {
-      // A gate rejection or a hardware error: latch a fault and stop driving.
+      // A hardware error or a latched safety condition: fail closed.
       impl_->set_fault(FaultCode::kHardwareSafeStop);
       std::fprintf(stderr, "[litegrip] control loop fault: %s\n", error.what());
       safe_stop();
@@ -383,10 +455,14 @@ void ControlLoop::hardware_cycle(double elapsed) {
     target = impl_->target_rad;
     enabled = impl_->enable_request;
     if ((now - impl_->last_command_time) > impl_->config.command_timeout_s) {
-      // Stale command: hold where we are rather than keep driving toward a
-      // target nobody is maintaining.
-      target = motor->position();
-      impl_->trajectory_started = false;
+      // Stale command: stop ADVANCING the trajectory, but keep the last
+      // commanded position. Aiming at the measured position instead would be
+      // `tau = kp*(q - q) = 0`: the loop would let go, the spring would open
+      // the jaws and the object would slip — measured on hardware as a 2.4 Hz,
+      // 1.75 mm relaxation bounce whose period is exactly 2x this timeout.
+      // `trajectory_rad` is the last command the safety gate approved, so
+      // freezing it is both bounded and safe.
+      target = impl_->trajectory_rad;
     }
   }
 
@@ -440,9 +516,28 @@ void ControlLoop::hardware_cycle(double elapsed) {
     return;
   }
 
+  // ── bound the frame's own torque ──────────────────────────────────────
+  //
+  // allocate_gains() bounds `kp * max_position_error_rad` by the budget, which
+  // only holds while the real error stays inside that bound. Against a hard
+  // object it does not: the jaw is blocked while the trajectory keeps ramping,
+  // so the error grows without limit and with it the commanded torque — past
+  // the budget, then past the hard ceiling, where the gate refuses the frame
+  // (and a refusal used to cost the grip). Saturate the commanded position
+  // instead, so the commanded torque stops at the budget: the grasp becomes a
+  // bounded clamping force rather than a bang-bang between "push hard" and
+  // "let go".
+  double q_frame = impl_->trajectory_rad;
+  if (measured_position.has_value() && gains.kp > 0.0) {
+    const double error_limit = impl_->config.torque_limit_nm / gains.kp;
+    const double error = impl_->trajectory_rad - *measured_position;
+    q_frame = *measured_position +
+              std::max(-error_limit, std::min(error_limit, error));
+  }
+
   // ── gate and send ─────────────────────────────────────────────────────
   const double q_safe = impl_->safety->guard_motion_frame(
-      impl_->trajectory_rad, gains.kp, gains.kd, 0.0, 0.0, measured_position,
+      q_frame, gains.kp, gains.kd, 0.0, 0.0, measured_position,
       motor->velocity(), motor->torque(), "control_loop");
 
   // The dq field stays 0: the rate ceiling is applied to the TARGET above, not
@@ -475,8 +570,8 @@ void ControlLoop::dry_run_cycle(double elapsed) {
     target = impl_->target_rad;
     enabled = impl_->enable_request;
     if ((now - impl_->last_command_time) > impl_->config.command_timeout_s) {
-      target = impl_->state.position_rad;
-      impl_->trajectory_started = false;
+      // Same policy as the hardware path: stop advancing, keep the position.
+      target = impl_->trajectory_rad;
     }
   }
 
@@ -512,8 +607,16 @@ void ControlLoop::dry_run_cycle(double elapsed) {
   const double simulated_velocity =
       elapsed > 0.0 ? (impl_->trajectory_rad - previous) / elapsed : 0.0;
   const std::optional<double> measured_position(impl_->state.position_rad);
+  // Same torque saturation as the hardware path, so a dry run predicts it.
+  double q_frame = impl_->trajectory_rad;
+  if (gains.kp > 0.0) {
+    const double error_limit = impl_->config.torque_limit_nm / gains.kp;
+    const double error = impl_->trajectory_rad - *measured_position;
+    q_frame = *measured_position +
+              std::max(-error_limit, std::min(error_limit, error));
+  }
   const double q_safe = impl_->safety->guard_motion_frame(
-      impl_->trajectory_rad, gains.kp, gains.kd, 0.0, 0.0, measured_position,
+      q_frame, gains.kp, gains.kd, 0.0, 0.0, measured_position,
       simulated_velocity, 0.0, "control_loop(dry_run)");
 
   std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -564,6 +667,10 @@ GripperState ControlLoop::state() const {
 }
 
 int ControlLoop::fault_code() const { return impl_->fault_code.load(); }
+
+std::uint64_t ControlLoop::rejected_command_count() const {
+  return impl_->rejected_commands.load(std::memory_order_relaxed);
+}
 
 const SafetyLimits& ControlLoop::safety_limits() const noexcept {
   // Built in start() before the thread exists and never replaced afterwards, so

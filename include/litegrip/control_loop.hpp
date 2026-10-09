@@ -81,6 +81,16 @@ struct ControlLoopConfig {
   /// real-hardware path must calibrate it first.
   double max_feedback_velocity_rad_s = -1.0;
 
+  /// Whether a safety-gate rejection latches a hardware safe stop.
+  ///
+  /// A `LimitViolation` means "this frame would exceed the torque/velocity/position
+  /// ceiling", not "the hardware is broken". The default (`false`) skips that frame
+  /// and keeps streaming, so the caller can retry with a gentler target. Latching
+  /// instead costs the loop *all* torque: `safe_stop()` sends a zero-torque frame,
+  /// the spring opens the jaws, and every later frame is refused until
+  /// `clear_safety_latch()`. Set `true` to restore the original fail-closed policy.
+  bool latch_on_limit_violation = false;
+
   /// MIT gain upper bounds; the loop re-allocates from the budget each frame.
   double kp = 20.0;
   double kd = 0.5;
@@ -145,6 +155,11 @@ class ControlLoop {
 
   /// Latched fault code (0 = none).
   int fault_code() const;
+
+  /// Frames the safety gate refused since the loop started. They are skipped, not
+  /// latched: a rising count means the caller keeps asking for more than the
+  /// ceiling allows (grip too hard, stop reached) and should back off.
+  std::uint64_t rejected_command_count() const;
 
   /// Diagnostic read-only view of the safety limits in effect.
   const SafetyLimits& safety_limits() const noexcept;
