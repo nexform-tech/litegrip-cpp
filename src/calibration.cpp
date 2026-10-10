@@ -188,6 +188,9 @@ std::optional<CalibrationFile> read_calibration_file(const std::string& path) {
   if (document->contains("motor_type")) {
     out.motor_type = document->get_string("motor_type", "");
   }
+  if (document->contains("work_stroke_mm")) {
+    out.work_stroke_mm = document->get_number("work_stroke_mm", 0.0);
+  }
   // Absence leaves the optional empty, which every consumer reads as "yes":
   // files written before the flag existed always came from a real calibration
   // run. Mirrors the Python SDK's `data.get("calibrated", True)`.
@@ -215,6 +218,7 @@ void write_calibration_file(const std::string& path, const GripperConfig& config
   document.set("travel_range_rad",
                std::abs(config.pos_open_rad - config.pos_closed_rad));
   document.set("rad_to_mm", config.rad_to_mm);
+  document.set("work_stroke_mm", config.work_stroke_mm);
   document.set("motor_type", motor_type);
   document.set("kp", config.kp);
   document.set("kd", config.kd);

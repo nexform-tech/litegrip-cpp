@@ -198,6 +198,19 @@ class LiteGrip : private MotionIo {
                             double step_rad = 0.1, double stall_delta = 0.0003,
                             int stall_cycles = 8, int max_iter = 30);
 
+  /// Calibrate and persist in one call: calibrate() at its defaults, then
+  /// save_calibration() to this channel's own file, so the result is picked up
+  /// automatically next run. The gripper is driven against both end stops, so
+  /// make sure the travel is clear. Returns what calibrate() returned.
+  ///
+  /// Mirrors the Python SDK's zero(), which is the same pair of calls; the two
+  /// SDKs are being kept name-for-name compatible. The Python one passes its
+  /// calibration gains from the config, this one takes calibrate()'s defaults.
+  /// Calibrate-then-save is available separately when the result must be
+  /// inspected or written somewhere else — `calibrate()` does not touch the
+  /// flash or the disk.
+  CalibrationData zero();
+
   /// Guided two-step calibration with the operator confirming each limit.
   CalibrationData calibrate_guided(double kp = 60.0, double kd = 2.0,
                                    double step_rad = 0.08,

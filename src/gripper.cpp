@@ -478,6 +478,16 @@ CalibrationData LiteGrip::calibrate(double kp, double kd, double step_rad,
   return result;
 }
 
+CalibrationData LiteGrip::zero() {
+  // The same pair of calls, in the same order, as the Python SDK's zero():
+  // calibrate() first (it updates config_ and touches neither flash nor disk),
+  // then save_calibration() to this channel's own file.
+  const CalibrationData data = calibrate();
+  const std::string path = save_calibration();
+  std::printf("[litegrip] zero: calibration saved to %s\n", path.c_str());
+  return data;
+}
+
 CalibrationData LiteGrip::calibrate_guided(double kp, double kd,
                                            double step_rad,
                                            double stall_delta, int stall_cycles,
@@ -691,6 +701,12 @@ void LiteGrip::apply_calibration(const CalibrationFile& calibration,
   }
   if (calibration.grasp_torque_threshold.has_value()) {
     config_.grasp_torque_threshold = *calibration.grasp_torque_threshold;
+  }
+  // Carried so a file written here means the same thing to the Python SDK,
+  // which does act on it. Nothing in this SDK reads config_.work_stroke_mm yet
+  // — see GripperConfig::work_stroke_mm.
+  if (calibration.work_stroke_mm.has_value()) {
+    config_.work_stroke_mm = *calibration.work_stroke_mm;
   }
 
   // A file from before the flag existed always came from a real calibration

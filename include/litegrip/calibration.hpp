@@ -84,6 +84,10 @@ struct CalibrationFile {
   std::optional<double> kd;
   std::optional<double> grasp_torque_threshold;
   std::optional<std::string> motor_type;
+  /// How far open() may travel, counted from the closed zero; 0 = no limit.
+  /// Unlike the Python SDK, this SDK does not act on it yet — see
+  /// GripperConfig::work_stroke_mm.
+  std::optional<double> work_stroke_mm;
 
   /// Whether the numbers in this file are a real measurement. Absent means
   /// yes, matching the Python SDK's `data.get("calibrated", True)`.

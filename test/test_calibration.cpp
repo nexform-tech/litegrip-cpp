@@ -77,6 +77,12 @@ int main() {
       check(factory->grasp_torque_threshold.has_value() &&
                 std::fabs(*factory->grasp_torque_threshold - 0.5) < 1e-12,
             "grasp_torque_threshold");
+      // Carried so the file means the same thing to the Python SDK, which acts
+      // on it; this SDK parses and re-emits it without using it (see
+      // GripperConfig::work_stroke_mm). Same value as the Python SDK's copy.
+      check(factory->work_stroke_mm.has_value() &&
+                std::fabs(*factory->work_stroke_mm - 80.0) < 1e-12,
+            "work_stroke_mm");
     }
   }
 
@@ -113,6 +119,7 @@ int main() {
     config.pos_closed_rad = 1.775959;
     config.pos_open_rad = -0.064279;
     config.rad_to_mm = 65.21;
+    config.work_stroke_mm = 80.0;
     config.kp = 5.0;
     config.kd = 2.0;
     config.grasp_torque_threshold = 0.5;
@@ -136,6 +143,9 @@ int main() {
             "channel round-trip");
       check(reloaded->calibrated.has_value() && *reloaded->calibrated,
             "the written file is stamped calibrated");
+      check(reloaded->work_stroke_mm.has_value() &&
+                std::fabs(*reloaded->work_stroke_mm - 80.0) < 1e-9,
+            "work_stroke_mm round-trip");
     }
 
     // travel_range_rad is written as the absolute difference.
@@ -242,6 +252,37 @@ int main() {
     check(uncal.has_value() && uncal->calibrated.has_value() &&
               !*uncal->calibrated,
           "calibrated=false is decoded as such");
+  }
+
+  // ── the work stroke ───────────────────────────────────────────────────
+  {
+    // Absence leaves the field with no opinion, so loading such a file does
+    // not clobber whatever the config carries — the same `if key in data` the
+    // Python SDK does.
+    const std::string path = std::string(kFixtureDir) + "/no_work_stroke.json";
+    FILE* file = std::fopen(path.c_str(), "w");
+    check(file != nullptr, "write a file without a work stroke");
+    if (file != nullptr) {
+      const std::string text =
+          "{\"zero_position_rad\": 0.1, \"max_position_rad\": -1.5, "
+          "\"rad_to_mm\": 74.8}";
+      std::fwrite(text.data(), 1, text.size(), file);
+      std::fclose(file);
+    }
+    const auto absent = litegrip::read_calibration_file(path);
+    check(absent.has_value() && !absent->work_stroke_mm.has_value(),
+          "a file without a work stroke reports none, not zero");
+
+    // The key is written unconditionally, so a file this SDK produces always
+    // states the work stroke to the Python SDK instead of leaving it to a
+    // default. 0 means "no limit" on both sides.
+    litegrip::GripperConfig config;
+    const std::string zero_path = std::string(kFixtureDir) + "/zero_stroke.json";
+    litegrip::write_calibration_file(zero_path, config, 8, 0, "DM4310");
+    const auto document = litegrip::json::Value::parse_file(zero_path);
+    check(document.has_value() && document->contains("work_stroke_mm") &&
+              std::fabs(document->get_number("work_stroke_mm", -1.0)) < 1e-12,
+          "a save states the work stroke, with 0 meaning no limit");
   }
 
   // ── what a save stamps ────────────────────────────────────────────────
