@@ -62,6 +62,24 @@ the automatic load skips a file that declares a different one.
 `GripperConfig::calibrated` is false until a calibration or a template is
 loaded; before that `mount()` reports nothing rather than guessing.
 
+## Calibration
+
+Three routines measure the travel, and none of them touches the disk: `calibrate()`
+(self-probing, the default), `calibrate_guided()` (an operator confirms each limit)
+and `calibrate_manual()` (hand-pushed while the motor is in zero-torque mode). All
+of them drive the jaws onto the mechanical stops, which lie outside the software red
+lines — make sure the travel is clear. `zero()` is the convenience pair,
+`calibrate()` then `save_calibration()`; `save_calibration()` writes the current
+config to this channel's own file, the one the automatic load reads first, so the
+result is picked up next run without being told.
+
+A calibration file may also carry a **work stroke**, `work_stroke_mm`: how far
+`open()` may travel, counted from the closed zero, with 0 meaning no limit. This SDK
+reads, applies and re-emits the field but does **not** act on it yet — it is carried
+so one calibration file means the same thing to both SDKs, and the motion engine will
+honour it in a later change. Do not count on the opening end stopping short in this
+SDK today.
+
 ## Actions
 
 `open` / `close` / `grasp` / `set_force` / `move_at_speed(_rad)` /

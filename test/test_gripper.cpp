@@ -91,6 +91,10 @@ int main() {
                  [&] { gripper.disable(); });
     check_throws("clear_fault refuses when not connected",
                  [&] { gripper.clear_fault(); });
+    // zero() is calibrate()+save_calibration(); the probe is what refuses, and
+    // it must refuse before anything could write a file.
+    check_throws("zero refuses when not connected",
+                 [&] { gripper.zero(); });
     check_throws("get_state refuses when not connected",
                  [&] { gripper.get_state(); });
     check_throws("get_position_rad refuses when not connected",
@@ -154,9 +158,36 @@ int main() {
     check(gripper.config().calibrated, "the factory file counts as calibrated");
     check(gripper.config().mount() == std::string("normal"),
           "the factory file's limits spell out the normal mount");
+    // Carried for the Python SDK's benefit: this SDK loads and re-emits the
+    // work stroke but nothing here acts on it (see
+    // GripperConfig::work_stroke_mm).
+    check(std::fabs(gripper.config().work_stroke_mm - 80.0) < 1e-12,
+          "work_stroke_mm loaded from the factory file");
+    check(litegrip::GripperConfig{}.work_stroke_mm == 0.0,
+          "the default work stroke is 0, meaning no limit");
 
     check(!gripper.load_calibration("/tmp/litegrip_gripper_test/none.json"),
           "a missing calibration reports false and keeps the fallback order");
+  }
+  {
+    // A file that does not mention the work stroke leaves the config's own
+    // value alone — absence is "no opinion", like the calibrated flag.
+    const std::string path = "/tmp/litegrip_gripper_test/no_work_stroke.json";
+    FILE* file = std::fopen(path.c_str(), "w");
+    check(file != nullptr, "write a calibration without a work stroke");
+    if (file != nullptr) {
+      const std::string text =
+          "{\"zero_position_rad\": 1.2, \"max_position_rad\": -0.1, "
+          "\"rad_to_mm\": 65.0}";
+      std::fwrite(text.data(), 1, text.size(), file);
+      std::fclose(file);
+    }
+    litegrip::GripperConfig config;
+    config.work_stroke_mm = 75.0;
+    litegrip::LiteGrip gripper(config);
+    check(gripper.load_calibration(path), "the file loads");
+    check(std::fabs(gripper.config().work_stroke_mm - 75.0) < 1e-12,
+          "a file without a work stroke leaves the configured one in place");
   }
   {
     // Saving writes the current config back out.
@@ -164,6 +195,7 @@ int main() {
     config.pos_closed_rad = 1.2;
     config.pos_open_rad = -0.1;
     config.rad_to_mm = 65.0;
+    config.work_stroke_mm = 75.0;
     litegrip::LiteGrip gripper(config);
     const std::string path = "/tmp/litegrip_gripper_test/saved.json";
     check(gripper.save_calibration(path) == path,
@@ -175,6 +207,8 @@ int main() {
           "closed limit round-trips through the file");
     check(std::fabs(reloaded.config().rad_to_mm - 65.0) < 1e-6,
           "rad_to_mm round-trips through the file");
+    check(std::fabs(reloaded.config().work_stroke_mm - 75.0) < 1e-6,
+          "work_stroke_mm round-trips through the file");
     check(reloaded.config().calibrated,
           "a saved calibration reloads as calibrated");
   }

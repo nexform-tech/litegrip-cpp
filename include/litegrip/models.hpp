@@ -130,6 +130,18 @@ struct GripperConfig {
   // Mechanical stroke (mm) — set to match your gripper's physical travel.
   double max_stroke_mm = 120.0;
 
+  /// Work stroke (mm) — how far open() may travel, counted from the closed
+  /// zero. 0 = no limit, so open() presses onto the mechanical stop exactly as
+  /// it did before this field existed; a value at or above the measured travel
+  /// means the same thing. Mirrors models.GripperConfig.work_stroke_mm.
+  ///
+  /// ⚠ This SDK loads, applies and saves the field but nothing acts on it yet:
+  /// it is here so a calibration file means the same thing to both SDKs, and
+  /// the motion engine will honour it in a later change. Reading a file with a
+  /// work stroke therefore does not yet limit open() in this SDK — do not
+  /// count on the opening end stopping short until that change lands.
+  double work_stroke_mm = 0.0;
+
   // Unit conversion — update after calibration.
   double rad_to_mm = UnitConversion::kRadToMm;
   double nm_to_n = UnitConversion::kNmToN;
