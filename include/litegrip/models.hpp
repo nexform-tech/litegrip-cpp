@@ -127,8 +127,12 @@ struct GripperConfig {
   /// where only limit_target()/press_target() call _check_calibrated).
   bool calibrated = false;
 
-  // Mechanical stroke (mm) — set to match your gripper's physical travel.
-  double max_stroke_mm = 120.0;
+  // Jaw travel (mm) — the caliper measurement of your gripper's travel.
+  // LiteGrip::calibrate() derives rad_to_mm from it plus the probe inset,
+  // because the recorded extremes span that inset more than the jaws actually
+  // open; see GripperGeometry in constants.hpp. Mirrors
+  // models.GripperConfig.max_stroke_mm.
+  double max_stroke_mm = GripperGeometry::kJawTravelMm;
 
   /// Work stroke (mm) — how far open() may travel, counted from the closed
   /// zero. 0 = no limit, so open() presses onto the mechanical stop exactly as

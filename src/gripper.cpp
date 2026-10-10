@@ -517,7 +517,7 @@ CalibrationData LiteGrip::calibrate_guided(double kp, double kd,
   result.zero_position = closed;
   result.max_position = opened;
   result.travel_range = travel;
-  result.rad_to_mm = config_.max_stroke_mm / travel;
+  result.rad_to_mm = rad_to_mm_from_travel(config_.max_stroke_mm, travel);
   result.motor_type = motor_type_name(GripperParams::kMotorType);
   result.can_id = config_.can_id;
   result.mst_id = mst_id_.value_or(0);
@@ -592,7 +592,7 @@ CalibrationData LiteGrip::calibrate_manual(double duration, double settle_time,
   const double closed = s > 0.0 ? hi_rad : lo_rad;
   const double opened = s > 0.0 ? lo_rad : hi_rad;
   const double travel = hi_rad - lo_rad;
-  const double rad_to_mm = config_.max_stroke_mm / travel;
+  const double rad_to_mm = rad_to_mm_from_travel(config_.max_stroke_mm, travel);
 
   CalibrationData result;
   result.zero_position = closed;

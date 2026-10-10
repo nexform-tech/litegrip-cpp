@@ -9,6 +9,7 @@
 #include <cstdio>
 
 #include "litegrip/constants.hpp"
+#include "litegrip/exceptions.hpp"
 
 namespace litegrip {
 
@@ -98,6 +99,16 @@ void guarded_move_to(ProbeIo& io, double target, const ProbeConfig& config,
   }
 }
 
+double rad_to_mm_from_travel(double max_stroke_mm, double travel_rad) {
+  if (!(travel_rad > 0.0)) {
+    throw CommError(
+        "calibration failed: the two stops coincided, so no scale can be "
+        "derived from the travel — check that the jaws really do run through "
+        "their whole travel, then calibrate again");
+  }
+  return (max_stroke_mm + GripperGeometry::kStopInsetMm) / travel_rad;
+}
+
 ProbeCalibration probe_calibrate(ProbeIo& io, const ProbeConfig& config,
                                  double close_sign, double max_stroke_mm) {
   // 1. Back off first, toward the close side, so probing does not start against
@@ -123,8 +134,7 @@ ProbeCalibration probe_calibrate(ProbeIo& io, const ProbeConfig& config,
   out.closed_rad = closed;
   out.opened_rad = opened;
   out.travel_rad = std::fabs(closed - opened);
-  out.rad_to_mm = out.travel_rad > 0.0 ? max_stroke_mm / out.travel_rad
-                                       : UnitConversion::kRadToMm;
+  out.rad_to_mm = rad_to_mm_from_travel(max_stroke_mm, out.travel_rad);
   return out;
 }
 

@@ -111,8 +111,9 @@ struct MotionConfig {
   // grasp's closing leg is a set of POSITION frames, so the torque it presses
   // with when it hits the workpiece is computed by the drive — kp x lead +
   // kd x commanded speed — and has nothing to do with the force being asked
-  // for. The default 4 mm travel lead is kp x 4/74.19 = 5.4 Nm ~= 54 N at
-  // kp=100, so a 5 N grasp also arrives at 54 N (measured on the fake bench).
+  // for. The default 4 mm travel lead presses kp x max_lead_mm / rad_to_mm =
+  // 5.30 Nm ~= 53 N at the config defaults (kp=100, rad_to_mm=75.44), so a
+  // 5 N grasp also arrives at 53 N.
   // This leg hands each of a frame's three force-producing terms its share of
   // the setpoint's budget instead (see force_approach_terms), so the press
   // cannot exceed it. Same law and same number as the Python SDK's approach.
