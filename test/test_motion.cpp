@@ -401,6 +401,13 @@ void test_grasp_onto_object() {
 
   // Hold frames: index 190 on, q = the blocked position, tau = +2 Nm, and NO
   // gains — a hold frame is a pure torque source (py: kp=kd=0).
+  //
+  // There is no climb in this scenario, and that is the honest result: the
+  // approach here hands over at 5.39 Nm (its lead cap is max_lead_mm with no
+  // force budget, see the batch-4 note in hold_force), which is already past
+  // the 2.0 Nm setpoint, so the ramp starts AT the setpoint. Python's ramp is
+  // visible in a grasp only because its approach carries the setpoint's budget;
+  // the ramp itself is pinned by the tests below, which set max_lead_mm.
   for (std::size_t i = 190; i < io.frames.size(); ++i) {
     const Frame& f = io.frames[i];
     check(f.kp == 0.0 && f.kd == 0.0 && f.dq == 0.0 && f.tau_ff == 2.0,
@@ -571,38 +578,80 @@ void test_move_at_speed_noops() {
 // ── set_force (Python dump S9) ───────────────────────────────────────────
 
 void test_set_force() {
+  // In flight: 1.0 Nm, what the closing leg hands over. The setpoint is 20 N =
+  // 2.0 Nm, climbed at force_ramp_n_s — and the climb is per FRAME, so one
+  // frame adds 20 N/s x 0.005 s x 0.1 Nm/N = 0.01 Nm and the 1.0 Nm gap takes
+  // 100 frames. `duration` is the hold AFTER that climb (Python parity).
   FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
             /*stops=*/true);
   SafetyGuard guard = make_guard();
   MotionEngine engine(io, guard, instant_config());
+  io.motor_.tau = 1.0;
 
   check(engine.set_force(20.0, 0.3), "S9: ok");
-  check(io.frames.size() == 60, "S9: frames = 0.3/0.005 (py: 60)");
+  check(io.frames.size() == 160,
+        "S9: 100 climb + 60 hold frames = climb + duration/frame_interval");
   const Frame& f = io.frames[0];
   check(f.q == -1.0 && f.kp == 0.0 && f.kd == 0.0 && f.dq == 0.0,
         "S9: pure torque source at the measured position");
-  check_near(f.tau_ff, 2.0, 1e-12, "S9: tau = force_n * 0.1");
-  check(io.frames.back().tau_ff == 2.0, "S9: feed-forward on every frame");
+  check_near(f.tau_ff, 1.01, 1e-9,
+             "S9: first frame = in flight + one step (py: 1.01)");
+  check_near(io.frames[99].tau_ff, 2.0, 1e-9,
+             "S9: lands EXACTLY on the setpoint at frame 99 (py)");
 
-  // The frame count follows Python's control_mit_stream default interval
-  // (0.005), NOT frame_interval.
+  bool step_is_flat = true;
+  for (std::size_t i = 1; i < 100; ++i) {
+    step_is_flat = step_is_flat &&
+                   std::fabs((io.frames[i].tau_ff - io.frames[i - 1].tau_ff) -
+                             0.01) <= 1e-9;
+  }
+  check(step_is_flat, "S9: every climbing frame adds the same 0.01 Nm");
+
+  bool tail_at_setpoint = true;
+  for (std::size_t i = 99; i < io.frames.size(); ++i) {
+    tail_at_setpoint = tail_at_setpoint && io.frames[i].tau_ff == 2.0;
+  }
+  check(tail_at_setpoint, "S9: every frame from the landing on stays at 2.0 Nm");
+
+  // The cadence is frame_interval. (This used to assert the opposite — a
+  // hardcoded 0.005 that ignored the config, so an engine retuned to another
+  // rate streamed at the old one.) At 0.01 s frames the same wall clock is
+  // half the frames: 1.0 Nm / 0.02 Nm and 0.3 s / 0.01 s.
   MotionConfig m = instant_config();
   m.frame_interval = 0.01;
   FakeIo io2(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
              /*stops=*/true);
   SafetyGuard guard2 = make_guard();
   MotionEngine engine2(io2, guard2, m);
+  io2.motor_.tau = 1.0;
   engine2.set_force(20.0, 0.3);
-  check(io2.frames.size() == 60, "S9: frame count ignores frame_interval");
+  check(io2.frames.size() == 80,
+        "S9: 50 climb + 30 hold frames at a 0.01 s cadence");
+  check_near(io2.frames[49].tau_ff, 2.0, 1e-9, "S9: 0.01 s climb lands at 50");
+
+  // Already at the setpoint (or past it): there is nothing to climb, so the
+  // call is exactly `duration` — no padding frame for a climb that did not
+  // happen.
+  for (double in_flight : {2.0, 3.0}) {
+    FakeIo io3(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+               /*stops=*/true);
+    SafetyGuard guard3 = make_guard();
+    MotionEngine engine3(io3, guard3, instant_config());
+    io3.motor_.tau = in_flight;
+    engine3.set_force(20.0, 0.3);
+    check(io3.frames.size() == 60, "S9: no climb when already at the setpoint");
+    check_near(io3.frames[0].tau_ff, 2.0, 1e-9,
+               "S9: starts at the setpoint, does not ramp down to it");
+  }
 
   // Over the guard's torque ceiling: refused before any frame is sent.
-  FakeIo io3(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+  FakeIo io4(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
              /*stops=*/true);
-  SafetyGuard guard3 = make_guard();
-  MotionEngine engine3(io3, guard3, instant_config());
-  check_throws<LimitViolation>([&] { engine3.set_force(40.0, 0.3); },
+  SafetyGuard guard4 = make_guard();
+  MotionEngine engine4(io4, guard4, instant_config());
+  check_throws<LimitViolation>([&] { engine4.set_force(40.0, 0.3); },
                                "S9: 40 N = 4.0 Nm exceeds tau_max (3.5)");
-  check(io3.frames.empty(), "S9: refused before sending");
+  check(io4.frames.empty(), "S9: refused before sending");
 }
 
 // ── the held force is a pure torque source ───────────────────────────────
@@ -692,6 +741,8 @@ void test_set_force_carries_no_gains() {
   SafetyGuard guard = make_guard();
   MotionEngine engine(io, guard, instant_config());
 
+  // Long enough for the climb to land: from zero torque the setpoint is
+  // 20 N / 20 N/s = 1 s of climbing, before duration even starts.
   check(engine.set_force(20.0, 1.0), "set_force: ok");
   check(!io.frames.empty(), "set_force: frames were sent");
 
@@ -700,9 +751,188 @@ void test_set_force_carries_no_gains() {
     gainless = gainless && f.kp == 0.0 && f.kd == 0.0;
   }
   check(gainless, "set_force: no gains on any frame");
-  check_near(io.frames.front().tau_nm, 2.0, 1e-9,
-             "set_force: the setpoint from the first frame");
+  check_near(io.frames.front().tau_nm, 0.01, 1e-9,
+             "set_force: the first frame is one step off zero");
+  check_near(io.frames.back().tau_nm, 2.0, 1e-6,
+             "set_force: the last frame sits on the setpoint");
   check(io.motor_.pos > kObjectRad, "set_force: the workpiece yielded");
+}
+
+// ── a held force ramps to its setpoint (Python dump S10) ─────────────────
+//
+// The hold used to jump to the setpoint in one frame. At handover the motor is
+// already loaded by the closing leg's press (about 10 N on the machine), so
+// that jump is an impulse through the mechanism and the fingers bounce off
+// what they just touched — seen on the bench as "sits at 10 N, jumps to 20 N,
+// and gathers inward as it jumps".
+//
+// To put the handover torque (about 1.0 Nm) BELOW the 2.0 Nm setpoint the
+// approach's lead cap comes down to PRESS_LEAD_MM: kp x 0.74 mm / 74.19 is
+// 0.997 Nm. Python's approach additionally carries the setpoint's force budget
+// (the batch-4 change), which at 25 mm/s does not bind tighter than the lead
+// cap, so both SDKs hand over at the same torque and these numbers port
+// directly.
+
+constexpr double kPressLeadMm = 0.74;       // ~= kp x cap = 1.0 Nm
+constexpr double kApproachSpeedMmS = 25.0;  // the lead cap still binds here
+constexpr double kRampStepNm = 20.0 * kDt * 0.1;  // force_ramp_n_s x frame x 0.1
+constexpr int kFramesPerSlice = 40;         // hold_interval 0.2 / frame_interval
+
+MotionConfig ramp_config() {
+  MotionConfig m = instant_config();
+  m.max_lead_mm = kPressLeadMm;
+  m.grasp_speed_mm_s = kApproachSpeedMmS;
+  m.monotonic_fn = tick_clock(0.1);
+  return m;
+}
+
+/// The closing leg's frames (kp != 0) and the hold's (kp == 0) — Python's
+/// `_grasp` split. The gains are what separates the two legs without trusting
+/// a frame index.
+struct GraspFrames {
+  std::vector<Frame> move;
+  std::vector<Frame> hold;
+};
+
+void test_the_climb_starts_from_the_torque_in_flight() {
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, /*block_rad=*/ kObjectRad, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, ramp_config());
+
+  engine.grasp(20.0, 0.6);
+
+  GraspFrames g;
+  for (const Frame& f : io.frames) {
+    (f.kp != 0.0 ? g.move : g.hold).push_back(f);
+  }
+  check(!g.move.empty() && !g.hold.empty(), "ramp: both legs present");
+  if (g.move.empty() || g.hold.empty()) return;
+
+  const double in_flight = g.move.back().tau_nm;
+  // The handover torque is the press, and it has to sit BELOW the setpoint or
+  // this test proves nothing about a climb. It IS kp x the 0.74 mm cap, so the
+  // approach's starting point does not enter into it: the Python SDK hands over
+  // at this same torque from its own start.
+  check_near(in_flight, 0.9974390079525497, 1e-12,
+             "ramp: in flight = kp x cap (py: 0.9974390079525497)");
+  check_near(g.hold[0].tau_ff, in_flight + kRampStepNm, 1e-9,
+             "ramp: the first hold frame is in flight + ONE step");
+  check_near(g.hold[0].tau_ff, 1.0074390079525497, 1e-12,
+             "ramp: the first hold frame (py: 1.0074390079525497)");
+  check(g.hold[0].tau_ff < 2.0, "ramp: the first hold frame is under the setpoint");
+
+  // 1.0 Nm of climb at 0.01 Nm a frame is 100 climbing frames, the 101st on the
+  // setpoint. (py: the setpoint is reached on hold frame 100)
+  std::size_t climb = 0;
+  std::size_t landed = g.hold.size();
+  for (std::size_t i = 0; i < g.hold.size(); ++i) {
+    if (g.hold[i].tau_ff < 2.0) {
+      ++climb;
+    } else if (landed == g.hold.size()) {
+      landed = i;
+    }
+  }
+  check(climb == 100, "ramp: 100 climbing frames (py: 100)");
+  check(landed == 100, "ramp: the setpoint is reached on hold frame 100 (py)");
+}
+
+void test_every_climbing_frame_adds_the_same_amount() {
+  FakeIo io(test_config(), -1.0, kObjectRad, 0.0, true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, ramp_config());
+  engine.grasp(20.0, 0.6);
+
+  std::vector<double> climb;
+  for (const Frame& f : io.frames) {
+    if (f.kp == 0.0 && f.tau_ff < 2.0) climb.push_back(f.tau_ff);
+  }
+  check(climb.size() > 1, "ramp: more than one climbing frame");
+  bool flat = true;
+  for (std::size_t i = 1; i < climb.size(); ++i) {
+    flat = flat && std::fabs((climb[i] - climb[i - 1]) - kRampStepNm) <= 1e-9;
+  }
+  check(flat, "ramp: every climbing frame adds the same step");
+}
+
+void test_it_lands_exactly_on_the_setpoint_and_stays() {
+  FakeIo io(test_config(), -1.0, kObjectRad, 0.0, true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, ramp_config());
+  engine.grasp(20.0, 0.6);
+
+  std::vector<double> hold;
+  for (const Frame& f : io.frames) {
+    if (f.kp == 0.0) hold.push_back(f.tau_ff);
+  }
+  std::size_t landed = hold.size();
+  for (std::size_t i = 0; i < hold.size(); ++i) {
+    if (hold[i] >= 2.0) {
+      landed = i;
+      break;
+    }
+  }
+  check(landed < hold.size(), "ramp: a frame reaches the setpoint");
+  bool tail = landed < hold.size();
+  for (std::size_t i = landed; i < hold.size(); ++i) {
+    tail = tail && std::fabs(hold[i] - 2.0) <= 1e-9;
+  }
+  check(tail, "ramp: every frame from the landing on stays at the setpoint");
+}
+
+void test_the_climb_is_linear_in_time() {
+  FakeIo io(test_config(), -1.0, kObjectRad, 0.0, true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, ramp_config());
+  engine.grasp(20.0, 0.6);
+
+  std::vector<double> climb;
+  for (const Frame& f : io.frames) {
+    if (f.kp == 0.0 && f.tau_ff < 2.0) climb.push_back(f.tau_ff);
+  }
+  check(climb.size() > 10, "ramp: the climb is long enough to judge");
+  if (climb.size() <= 10) return;
+
+  // Equal steps per frame IS linearity: frame k sits k+1 steps above the start.
+  const double start = climb[0] - kRampStepNm;
+  const double total = 2.0 - start;
+  bool evenly = true;
+  for (std::size_t k = 0; k < climb.size(); k += 7) {
+    evenly = evenly &&
+             std::fabs(climb[k] - (start + static_cast<double>(k + 1) * kRampStepNm)) <=
+                 1e-9;
+  }
+  check(evenly, "ramp: the climb is linear in time");
+
+  // Halfway through the climb the force is halfway up — the exponential
+  // approach this replaced (0.05 s time constant) would already be at the top.
+  const std::size_t mid = climb.size() / 2;
+  check(std::fabs(climb[mid] - (start + total / 2)) <= kRampStepNm + 1e-9,
+        "ramp: the midpoint of the climb is at half the rise");
+  check(climb[mid] < start + 0.7 * total,
+        "ramp: the midpoint is not already at the top");
+}
+
+void test_advancing_once_per_frame_not_once_per_slice() {
+  FakeIo io(test_config(), -1.0, kObjectRad, 0.0, true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, ramp_config());
+  engine.grasp(20.0, 0.6);
+
+  std::vector<double> hold;
+  for (const Frame& f : io.frames) {
+    if (f.kp == 0.0) hold.push_back(f.tau_ff);
+  }
+  check(hold.size() > 1, "ramp: more than one hold frame");
+  if (hold.size() <= 1) return;
+
+  // Stepping once per 40-frame slice would put 0.4 Nm between neighbouring
+  // frames inside a slice — a 4 N stair, not a climb.
+  const double within_slice = hold[1] - hold[0];
+  check(std::fabs(within_slice - kRampStepNm) <= 1e-9,
+        "ramp: neighbouring frames inside a slice differ by one step");
+  check(std::fabs(within_slice - kRampStepNm * kFramesPerSlice) > 1e-9,
+        "ramp: ... not by a whole slice's worth");
 }
 
 // ── zero-gravity (Python dump S7) ────────────────────────────────────────
@@ -1000,6 +1230,11 @@ int main() {
   test_a_yielding_workpiece_does_not_erode_the_hold_force();
   test_the_hold_frame_carries_no_gains();
   test_set_force_carries_no_gains();
+  test_the_climb_starts_from_the_torque_in_flight();
+  test_every_climbing_frame_adds_the_same_amount();
+  test_it_lands_exactly_on_the_setpoint_and_stays();
+  test_the_climb_is_linear_in_time();
+  test_advancing_once_per_frame_not_once_per_slice();
   test_zero_gravity();
   test_ceilings_and_refusals();
   test_recovery_from_open_stop();

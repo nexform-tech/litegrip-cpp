@@ -60,6 +60,18 @@ int frame_count_round(double ratio) {
   return static_cast<int>(std::nearbyint(ratio));
 }
 
+/// Move `value` toward `target` by at most `step`, landing EXACTLY on `target`
+/// (Python's actions._toward). Landing on the setpoint rather than approaching
+/// it matters: a ramp that only ever covers a fraction of the remaining
+/// distance never arrives, and the operator reads the hold's result off the
+/// value it stopped at.
+double toward(double value, double target, double step) {
+  if (value < target) {
+    return std::min(value + step, target);
+  }
+  return std::max(value - step, target);
+}
+
 /// Python's int() truncates here (frame counts from a duration ratio).
 int frame_count_trunc(double ratio) {
   if (!(ratio > 0.0)) {
@@ -569,12 +581,25 @@ MotionEngine::HoldOutcome MotionEngine::hold_force(
   // Squeezing may mean increasing or decreasing rad depending on the mount;
   // close_sign carries that. The N -> Nm factor is the Python constant, NOT a
   // force calibration (see grasp()'s caveat).
-  const double tau_nm = gcfg.close_sign() * force_n * UnitConversion::kNToNm;
+  const double target_nm = gcfg.close_sign() * force_n * UnitConversion::kNToNm;
+  if (std::fabs(target_nm) > safety_.limits().params.tau_max_nm) {
+    // Refused before the first frame rather than part-way up the ramp: a hold
+    // the guard will not let finish must not be started. (Python has no guard
+    // and would ramp to it — this is the C++ safety addition.)
+    throw LimitViolation("grasp: " + std::to_string(force_n) +
+                         " N = " + std::to_string(target_nm) +
+                         " Nm exceeds tau_max_nm=" +
+                         std::to_string(safety_.limits().params.tau_max_nm));
+  }
 
   const bool bounded = hold_s > 0.0;
   const double deadline = bounded ? now_s() + hold_s : 0.0;
   const int frames_per_slice = std::max(
       1, frame_count_round(config_.hold_interval / config_.frame_interval));
+  // One step per FRAME. Stepping once per slice would turn 20 N/s into 4 N
+  // stairs in a 0.2 s slice, which is not a climb.
+  const double step_nm = config_.force_ramp_n_s * config_.frame_interval *
+                         UnitConversion::kNToNm;
 
   HoldOutcome outcome;
   GripperState st = io_.get_state(true);
@@ -582,11 +607,17 @@ MotionEngine::HoldOutcome MotionEngine::hold_force(
     throw SafetyFault("grasp: no valid feedback — the hold is refused");
   }
   double pos = st.position_rad;
+  // Entering force mode: continue from the torque in flight so the handover is
+  // continuous. Torque already past the setpoint starts AT the setpoint — that
+  // step goes down, so it is not an impulse.
+  double tau_cmd = std::fabs(st.torque_nm) < std::fabs(target_nm) ? st.torque_nm
+                                                                 : target_nm;
 
   while (!bounded || now_s() < deadline) {
     for (int f = 0; f < frames_per_slice; ++f) {
+      tau_cmd = toward(tau_cmd, target_nm, step_nm);
       // kp=kd=0: a pure torque source, so the force does not follow the jaws.
-      emit(pos, 0.0, tau_nm, 0.0, 0.0, "grasp-hold");
+      emit(pos, 0.0, tau_cmd, 0.0, 0.0, "grasp-hold");
     }
     ++outcome.cycles;
     st = io_.get_state(true);
@@ -619,8 +650,14 @@ MotionEngine::HoldOutcome MotionEngine::hold_force(
 
 bool MotionEngine::set_force(double force_n, double duration_s) {
   check_entry("set_force");
-  const double tau_nm =
+  const double target_nm =
       io_.config().close_sign() * force_n * UnitConversion::kNToNm;
+  if (std::fabs(target_nm) > safety_.limits().params.tau_max_nm) {
+    throw LimitViolation("set_force: " + std::to_string(force_n) + " N = " +
+                         std::to_string(target_nm) +
+                         " Nm exceeds tau_max_nm=" +
+                         std::to_string(safety_.limits().params.tau_max_nm));
+  }
 
   const GripperState st = io_.get_state(true);
   if (!st.has_data()) {
@@ -628,17 +665,41 @@ bool MotionEngine::set_force(double force_n, double duration_s) {
   }
   const double q = st.position_rad;
 
-  // Python streams for max(1, int(duration / interval)) frames (truncation,
-  // not rounding). Failures are NOT wrapped into CommError the way Python
-  // does: the typed exception (LimitViolation for an over-budget torque,
-  // CommandError for an unsent frame) carries more than "force control
-  // failed" ever could.
-  // Python streams via control_mit_stream's DEFAULT interval_s = 0.005, not
-  // frame_interval — keep the same literal so the frame counts match.
-  const int frames = std::max(1, frame_count_trunc(duration_s / 0.005));
-  for (int i = 0; i < frames; ++i) {
-    // kp=kd=0: a pure torque source, so the force does not follow the jaws.
-    emit(q, 0.0, tau_nm, 0.0, 0.0, "set_force");
+  // The frames carry the feed-forward torque alone (kp=kd=0), ramped at
+  // force_ramp_n_s from the torque in flight — see hold_force() for why.
+  const double step_nm = config_.force_ramp_n_s * config_.frame_interval *
+                         UnitConversion::kNToNm;
+  double tau_cmd = std::fabs(st.torque_nm) < std::fabs(target_nm) ? st.torque_nm
+                                                                 : target_nm;
+
+  // Climb first, then hold. `duration_s` is the hold AFTER the climb, not a
+  // budget that includes it, so the call's wall clock is climb + duration and
+  // a short duration still reaches the full force. duration_s = 0 means "ramp
+  // to the setpoint and return" — the climb still completes.
+  int climb_frames = 0;
+  if (step_nm > 0.0) {
+    for (double probe = tau_cmd; probe != target_nm; ) {
+      probe = toward(probe, target_nm, step_nm);
+      ++climb_frames;
+    }
+  }
+  const int hold_frames =
+      std::max(0, frame_count_round(duration_s / config_.frame_interval));
+
+  // Failures are NOT wrapped into CommError the way Python does: the typed
+  // exception (LimitViolation for an over-budget torque, CommandError for an
+  // unsent frame) carries more than "force control failed" ever could.
+  for (int i = 0; i < climb_frames + hold_frames; ++i) {
+    if (i < climb_frames) {
+      tau_cmd = toward(tau_cmd, target_nm, step_nm);
+    } else {
+      tau_cmd = target_nm;
+    }
+    send_frame(q, 0.0, 0.0, 0.0, tau_cmd, "set_force");
+    // Drain incoming frames between sends: without this nothing reads the
+    // drive's status frames for the whole call.
+    io_.get_state(/*wait=*/false);
+    sleep_s(config_.frame_interval);
   }
   return true;
 }
