@@ -334,6 +334,17 @@ int main() {
       }
     };
 
+    // Nothing under kFixtureDir is cleaned between runs, and the assertions
+    // below read that directory: the first can1 check is precisely that its
+    // per-channel file does not exist yet. Clear the slots this block writes
+    // before reading any of them, so a second run starts where the first did
+    // instead of adopting the previous run's file and failing two checks.
+    for (const char* const name : {"litegrip_calibration.json",
+                                   "can1_calibration.json",
+                                   "can2_calibration.json"}) {
+      ::unlink((dot_litegrip + "/" + name).c_str());
+    }
+
     // The legacy slot holds a *can0* calibration (the pre-per-channel era had
     // one shared file). A can0 unit adopts it...
     seed(dot_litegrip + "/litegrip_calibration.json",
