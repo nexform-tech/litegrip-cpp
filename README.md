@@ -125,6 +125,37 @@ onto the stop". The old `close(force_n=...)` is gone with them: use
 N value is **NOT force-calibrated** in this SDK; do not build force-limited
 behaviour on it.
 
+### Approaching with a force
+
+`grasp`'s closing leg carries the setpoint's force, but it is still a set of
+**position** frames: what it presses with on contact is the drive's own
+`kp x lead + kd x dq`, which has nothing to do with the force being asked for.
+The default 4 mm travel lead is `kp x 4/74.19` = 5.4 Nm ≈ 54 N at `kp = 100`, so
+before this change a 5 N grasp arrived at the same 54 N as a 40 N one.
+
+Every frame of that leg now draws what it can produce force with from one
+budget, `force_n x UnitConversion::kNToNm x MotionConfig::press_safety` (0.9, so
+the press lands just under the setpoint). The order is deliberate: one frame's
+own travel first, by lowering the commanded speed; then the damping, never above
+the caller's `kd`; the lead last, with one frame's travel as its floor. Serving
+the lead first would cut the damping to zero at the low-speed end and leave the
+frame with nothing but a position term.
+
+**Do not** read this as a force limit. The N is still not force-calibrated (see
+above), and `close()`, which carries no setpoint, still presses
+`kp x max_lead_mm` onto whatever it meets — about 54 N at the defaults.
+
+Three things change for a consumer:
+
+- a low setpoint can lower the **approach speed**, because a frame cannot travel
+  further than the budget without pressing harder than it: a 5 N grip asked to
+  close at 100 mm/s approaches at 67 mm/s, a 1 N grip at 100 mm/s at 13 mm/s;
+- a frame's **damping** can be below `MotionConfig`'s `kd`: 5 N at 25 mm/s runs
+  `kd = 0.835` instead of 2.0;
+- the hold's ramp is now visible in an ordinary `grasp`. A 20 N grip used to hand
+  over *above* its 2.0 Nm setpoint and start there; it hands over on the lead's
+  share of the budget — 0.452 Nm at 50 mm/s — and climbs to the setpoint.
+
 ### Holding a force
 
 A hold frame (`grasp`'s hold and every `set_force` frame) is a **pure torque

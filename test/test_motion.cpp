@@ -16,6 +16,7 @@
 // safety guard, while the C++ engine first drives a gripper that starts
 // outside the red lines back inside (see recover_to_interior tests below).
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <functional>
@@ -399,19 +400,22 @@ void test_grasp_onto_object() {
   check_near(res.target_rad, 0.02346115, 1e-12, "S3: approach target");
   check(io.frames.size() == 310, "S3: frame count (py: 310)");
 
-  // Hold frames: index 190 on, q = the blocked position, tau = +2 Nm, and NO
-  // gains — a hold frame is a pure torque source (py: kp=kd=0).
+  // Hold frames: index 190 on, q = the blocked position, and NO gains — a hold
+  // frame is a pure torque source (py: kp=kd=0).
   //
-  // There is no climb in this scenario, and that is the honest result: the
-  // approach here hands over at 5.39 Nm (its lead cap is max_lead_mm with no
-  // force budget, see the batch-4 note in hold_force), which is already past
-  // the 2.0 Nm setpoint, so the ramp starts AT the setpoint. Python's ramp is
-  // visible in a grasp only because its approach carries the setpoint's budget;
-  // the ramp itself is pinned by the tests below, which set max_lead_mm.
+  // The torque now CLIMBS here, and that is the point of the force-carrying
+  // approach: with the closing leg kept inside the setpoint's budget its press
+  // in flight is only the lead's share of that budget at this speed — 100 x
+  // 0.004521094488 = 0.4521094488 Nm — so the hold hands over BELOW the 2.0 Nm
+  // setpoint and steps up 0.01 Nm a frame. 120 hold frames is not enough to land
+  // (155 are needed), so this scenario pins the climb's shape from below; the
+  // landing is pinned by the S9 ramp tests.
   for (std::size_t i = 190; i < io.frames.size(); ++i) {
     const Frame& f = io.frames[i];
-    check(f.kp == 0.0 && f.kd == 0.0 && f.dq == 0.0 && f.tau_ff == 2.0,
+    check(f.kp == 0.0 && f.kd == 0.0 && f.dq == 0.0,
           "S3: hold frame strictly feed-forward (py: kp=kd=0)");
+    check_near(f.tau_ff, 0.4521094488 + 0.01 * static_cast<double>(i - 189),
+               1e-9, "S3: hold frame climbs one 0.01 Nm step per frame");
     check_near(f.q, -0.5, 1e-12, "S3: hold frame q");
   }
   check(io.frames[189].tau_ff == 0.0, "S3: frame 189 is still the approach");
@@ -428,6 +432,254 @@ void test_grasp_onto_object() {
     check(progress[19].total_steps == 0 && progress[19].delta_rad == 0.0,
           "S3: hold snapshot shape");
   }
+}
+
+// ── the force-carrying approach's budget (Python force_approach_terms) ────
+//
+// grasp's closing leg carries the setpoint's force, but it is still a set of
+// POSITION frames: what the drive presses with on contact is kp x lead +
+// kd x dq, which the setpoint never reaches unless the frame's three
+// force-producing terms are handed shares of a budget taken off that setpoint.
+// The arithmetic first, then the frames a grasp actually puts on the bus.
+
+/// kp x lead + kd x speed — the torque a position frame presses a workpiece
+/// with. The kp here is the gripper config's default (100), which is what
+/// force_approach_terms is called with.
+double press_nm(const ApproachTerms& t) {
+  return GripperParams::kDefaultKp * t.lead_ceiling_rad +
+         t.kd * t.speed_rad_s;
+}
+
+/// Python's TestForceApproachTerms.terms(): kp=100 / kd=2 / dt=0.005, the
+/// budget coming straight off force_n x N_TO_NM x press_safety unless given.
+ApproachTerms terms_of(double force_n, double speed_mm_s,
+                       std::optional<double> budget_nm = std::nullopt,
+                       double ceiling_mm = 4.0) {
+  const double budget = budget_nm.value_or(
+      force_n * UnitConversion::kNToNm * MotionConfig().press_safety);
+  return force_approach_terms(GripperParams::kDefaultKp,
+                              GripperParams::kDefaultKd, speed_mm_s / kRadToMm,
+                              kDt, budget, ceiling_mm / kRadToMm);
+}
+
+void test_force_approach_terms() {
+  // Whatever the setpoint and the speed, the three terms stay inside the
+  // budget: that is the whole contract.
+  for (double force_n : {0.5, 1.0, 5.0, 20.0, 40.0}) {
+    for (double speed_mm_s : {5.0, 25.0, 50.0, 150.0}) {
+      const ApproachTerms t = terms_of(force_n, speed_mm_s);
+      check(press_nm(t) <=
+                force_n * UnitConversion::kNToNm * MotionConfig().press_safety +
+                    1e-12,
+            "FAT: the three terms never add up past the budget");
+    }
+  }
+
+  // Budget 0 means "no force asked for": an ordinary move, handed back whole.
+  {
+    const ApproachTerms t = force_approach_terms(
+        GripperParams::kDefaultKp, GripperParams::kDefaultKd, 0.5, kDt, 0.0,
+        0.05);
+    check_near(t.speed_rad_s, 0.5, 1e-12, "FAT: no budget keeps the speed");
+    check_near(t.kd, GripperParams::kDefaultKd, 1e-12,
+               "FAT: no budget keeps the damping");
+    check_near(t.lead_ceiling_rad, 0.05, 1e-12,
+               "FAT: no budget keeps the lead ceiling");
+  }
+
+  // The lead's floor is one frame's own displacement. The engine already relies
+  // on that to keep the ramp's own step, and the torque of that step IS the
+  // first share of the budget, so the floor cannot break it.
+  for (double speed_mm_s : {5.0, 50.0, 150.0}) {
+    const ApproachTerms t = terms_of(1.0, speed_mm_s);
+    check(t.lead_ceiling_rad >= t.speed_rad_s * kDt - 1e-12,
+          "FAT: the lead never drops below one frame");
+  }
+
+  // A generous setpoint must not RAISE the ceiling it was handed.
+  {
+    const ApproachTerms t = terms_of(400.0, 5.0);
+    check_near(t.lead_ceiling_rad, 4.0 / kRadToMm, 1e-12,
+               "FAT: the lead never exceeds the ceiling it was given");
+  }
+
+  // Damping is served BEFORE the lead, and that order is the point: at the
+  // low-speed end the damping's share is only a newton or two, so spending it
+  // on the lead instead would cut the damping to zero and leave the frame with
+  // nothing but kp x (command - measured) — a force that follows the jaws, so
+  // a workpiece yielding under the setpoint takes the force down with it.
+  {
+    const ApproachTerms t = terms_of(10.0, 25.0);
+    check_near(t.kd, GripperParams::kDefaultKd, 1e-12,
+               "FAT: the budget does not cut damping it can afford");
+    check_near(press_nm(t),
+               10.0 * UnitConversion::kNToNm * MotionConfig().press_safety,
+               1e-12, "FAT: the lead pays for that damping");
+  }
+
+  // A setpoint too small for the speed slows the leg down. This is the one
+  // place the setpoint still decides the approach SPEED, and it is this
+  // frame's arithmetic rather than a policy: the frame cannot travel further
+  // than the budget without pressing harder than the budget.
+  {
+    const ApproachTerms t = terms_of(0.5, 150.0);
+    check(t.speed_rad_s * kRadToMm < 150.0, "FAT: a small setpoint slows it");
+    check_near(GripperParams::kDefaultKp * t.speed_rad_s * kDt,
+               0.5 * UnitConversion::kNToNm * MotionConfig().press_safety,
+               1e-12, "FAT: one frame's travel is the whole budget");
+    check_near(t.kd, 0.0, 1e-12, "FAT: nothing is left for damping");
+  }
+}
+
+/// One grasp scenario: the fake plant, its guard and the engine over it.
+/// Python's TestForceApproachPressBudget._grasp().
+struct GraspBench {
+  GraspBench(double start_rad, std::optional<double> block_rad,
+             double speed_mm_s, bool stops = true)
+      : io(test_config(), start_rad, block_rad, /*sticky_rad=*/0.0, stops),
+        guard(make_guard()),
+        config(grasp_config(speed_mm_s)),
+        engine(io, guard, config) {}
+
+  static MotionConfig grasp_config(double speed_mm_s) {
+    MotionConfig m = instant_config();
+    m.monotonic_fn = tick_clock(0.1);  // a hold of 0.2 s is 1 slice
+    m.grasp_speed_mm_s = speed_mm_s;
+    return m;
+  }
+
+  FakeIo io;
+  SafetyGuard guard;
+  MotionConfig config;
+  MotionEngine engine;
+};
+
+constexpr double kWorkpieceRad = (kPosOpenRad + kPosClosedRad) / 2;
+
+/// Python's _presses(): the torque of the frames actually LEANING ON the
+/// workpiece. Only frames whose post-step position sits exactly on the block
+/// count — the fake's torque model is kp x (cmd - pos), which equals the
+/// machine's contact press only while the jaws are held there; in free travel
+/// it measures how far the command trails the reading, which is not a press.
+/// Hold frames are excluded: they stream feed-forward only.
+std::vector<double> presses_on(const std::vector<Frame>& frames, double block) {
+  std::vector<double> out;
+  for (const Frame& f : frames) {
+    if (f.tau_ff == 0.0 && std::fabs(f.pos_after - block) < 1e-12) {
+      out.push_back(std::fabs(f.tau_nm) + f.kd * std::fabs(f.dq));
+    }
+  }
+  return out;
+}
+
+double peak(const std::vector<double>& v) {
+  double m = 0.0;
+  for (double x : v) m = std::max(m, x);
+  return m;
+}
+
+void test_the_approach_never_presses_past_the_setpoint() {
+  // 30 N is the largest setpoint the guard's tau_max_nm (3.5) admits, and the
+  // point is the same at every size: what is pinned is the budget, not a N.
+  for (double force_n : {5.0, 20.0, 30.0}) {
+    for (double speed_mm_s : {25.0, 50.0, 100.0}) {
+      GraspBench bench(-1.0, kWorkpieceRad, speed_mm_s);
+      const GraspResult res = bench.engine.grasp(force_n, 0.2);
+      const std::vector<double> presses = presses_on(bench.io.frames,
+                                                    kWorkpieceRad);
+      check(!presses.empty(),
+            "FAP: the approach leans on the workpiece at all");
+      check(peak(presses) <= force_n * UnitConversion::kNToNm *
+                                 bench.config.press_safety + 1e-9,
+            "FAP: the frame never presses past the setpoint");
+      check(res.stalled, "FAP: it still reaches the workpiece");
+    }
+  }
+}
+
+void test_the_press_follows_the_setpoint() {
+  double peaks[3] = {0.0, 0.0, 0.0};
+  const double forces[3] = {10.0, 20.0, 30.0};
+  for (int i = 0; i < 3; ++i) {
+    GraspBench bench(-1.0, kWorkpieceRad, 50.0);
+    bench.engine.grasp(forces[i], 0.2);
+    peaks[i] = peak(presses_on(bench.io.frames, kWorkpieceRad));
+    check_near(peaks[i],
+               forces[i] * UnitConversion::kNToNm *
+                   MotionConfig().press_safety,
+               1e-9, "FAP: the peak press is the setpoint's budget");
+  }
+  check(peaks[0] < peaks[1] && peaks[1] < peaks[2],
+        "FAP: a bigger setpoint presses harder");
+}
+
+void test_an_unbudgeted_close_still_presses_the_travel_cap() {
+  // A plain close carries no setpoint, so it still presses kp x max_lead_mm:
+  // the difference on this same block comes from the budget, not from it.
+  //
+  // The start is inside the red lines (the C++ engine first crawls a gripper
+  // back in, which Python's raw fake has no counterpart for) and the workpiece
+  // just above it, so a close meets the block well inside the travel leg, where
+  // the lead cap is still max_lead_mm rather than the narrow stop cap.
+  const double block = -0.9;
+  GraspBench close_bench(-1.0, block, 50.0);
+  close_bench.engine.close(50.0);
+  double unbounded = 0.0;
+  for (const Frame& f : close_bench.io.frames) {
+    unbounded = std::max(unbounded, std::fabs(f.tau_nm));
+  }
+  check_near(unbounded, close_bench.io.config().kp *
+                             (close_bench.config.max_lead_mm / kRadToMm),
+             1e-4, "FAP: a plain close still presses the travel cap");
+
+  GraspBench grasp_bench(-1.0, block, 50.0);
+  const GraspResult res = grasp_bench.engine.grasp(5.0, 0.2);
+  const double budget =
+      5.0 * UnitConversion::kNToNm * grasp_bench.config.press_safety;
+  check(unbounded > 10.0 * budget,
+        "FAP: the unbudgeted press really is far past the setpoint");
+  check(peak(presses_on(grasp_bench.io.frames, block)) < budget + 1e-9,
+        "FAP: the budgeted one is not");
+  check(res.stalled, "FAP: and it still stalls on the workpiece");
+}
+
+void test_a_low_setpoint_decides_the_speed() {
+  // When the budget cannot even cover one frame's travel, the approach speed
+  // is set by the setpoint rather than by the config.
+  GraspBench bench(-1.0, kWorkpieceRad, 100.0);
+  const GraspResult res = bench.engine.grasp(1.0, 0.2);
+  const double cap_rad_s = (1.0 * UnitConversion::kNToNm *
+                            bench.config.press_safety) /
+                           (bench.io.config().kp * kDt);
+  double fastest = 0.0;
+  for (const Frame& f : bench.io.frames) {
+    fastest = std::max(fastest, std::fabs(f.dq));
+  }
+  check_near(fastest, cap_rad_s, 1e-9, "FAP: the setpoint decides the speed");
+  check(cap_rad_s * kRadToMm < 100.0, "FAP: slower than the config's speed");
+  check(res.stalled, "FAP: it still reaches the workpiece");
+}
+
+void test_an_empty_grasp_still_reaches_the_target() {
+  // A budget must not turn an empty grip into a stall: a small lead presses
+  // lightly, it does not stop the jaws getting there.
+  GraspBench bench(-1.0, std::nullopt, 50.0);
+  const GraspResult res = bench.engine.grasp(5.0, 0.2);
+  check(res.reached, "FAP: an empty grip still reaches the target");
+  check(!res.stalled, "FAP: and does not report a stall");
+  check(res.ok, "FAP: and reports ok");
+  check_near(bench.io.motor_.pos, res.target_rad,
+             bench.config.reach_tol + 1e-12,
+             "FAP: the jaws end on the target");
+  // 5 N buys one frame of travel at 50 mm/s several times over, so the budget
+  // does not bind and the leg runs at the config's speed — the contrast with
+  // test_a_low_setpoint_decides_the_speed.
+  double fastest = 0.0;
+  for (const Frame& f : bench.io.frames) {
+    fastest = std::max(fastest, std::fabs(f.dq));
+  }
+  check_near(fastest, 50.0 / kRadToMm, 1e-12,
+             "FAP: a budget it can afford leaves the speed alone");
 }
 
 // ── stall / press-zone / stiction (Python dump S4-S6) ────────────────────
@@ -768,10 +1020,9 @@ void test_set_force_carries_no_gains() {
 //
 // To put the handover torque (about 1.0 Nm) BELOW the 2.0 Nm setpoint the
 // approach's lead cap comes down to PRESS_LEAD_MM: kp x 0.74 mm / 74.19 is
-// 0.997 Nm. Python's approach additionally carries the setpoint's force budget
-// (the batch-4 change), which at 25 mm/s does not bind tighter than the lead
-// cap, so both SDKs hand over at the same torque and these numbers port
-// directly.
+// 0.997 Nm. Both SDKs' approaches also carry the setpoint's force budget, which
+// at 25 mm/s does not bind tighter than this lead cap, so the two hand over at
+// the same torque and these numbers port directly.
 
 constexpr double kPressLeadMm = 0.74;       // ~= kp x cap = 1.0 Nm
 constexpr double kApproachSpeedMmS = 25.0;  // the lead cap still binds here
@@ -1219,6 +1470,12 @@ int main() {
   test_close_from_inside_red();
   test_open_from_inside_red();
   test_grasp_onto_object();
+  test_force_approach_terms();
+  test_the_approach_never_presses_past_the_setpoint();
+  test_the_press_follows_the_setpoint();
+  test_an_unbudgeted_close_still_presses_the_travel_cap();
+  test_a_low_setpoint_decides_the_speed();
+  test_an_empty_grasp_still_reaches_the_target();
   test_blocked_mid_travel_is_not_success();
   test_protection_follows_the_release_setting();
   test_stiction_does_not_false_stall();
