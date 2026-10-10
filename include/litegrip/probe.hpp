@@ -80,12 +80,29 @@ double probe_to_limit(ProbeIo& io, double direction, const ProbeConfig& config,
 void guarded_move_to(ProbeIo& io, double target, const ProbeConfig& config,
                      const char* label);
 
+/// A probed travel in radians -> millimetres per radian. Mirrors the Python
+/// SDK's LiteGrip._scale_from_travel, and is the ONE place any calibration path
+/// derives the scale.
+///
+/// The numerator is `max_stroke_mm + kStopInsetMm` rather than `max_stroke_mm`:
+/// the probe presses *into* the open stop to find it, so the two recorded
+/// extremes span about a millimetre more than the jaws can actually travel. See
+/// GripperGeometry in constants.hpp.
+///
+/// Deriving the scale from the jaw travel alone is a 1.2% short scale — 1 mm
+/// lost per full stroke — and it is what this used to do, on top of a nominal
+/// stroke (120 mm) that belonged to no gripper in this family.
+///
+/// @throws CommError the two stops coincide, so no scale can be derived. A
+///         calibration that cannot produce a scale must not invent one.
+double rad_to_mm_from_travel(double max_stroke_mm, double travel_rad);
+
 /// What one self-probing pass measured.
 struct ProbeCalibration {
   double closed_rad = 0.0;  // the stop found going toward "closed"
   double opened_rad = 0.0;  // the stop found going toward "open"
   double travel_rad = 0.0;  // |closed_rad - opened_rad|
-  double rad_to_mm = 0.0;   // max_stroke_mm / travel_rad
+  double rad_to_mm = 0.0;   // rad_to_mm_from_travel(max_stroke_mm, travel_rad)
 };
 
 /// The pass calibrate() runs: back off, probe the closed stop, back off the
@@ -96,6 +113,8 @@ struct ProbeCalibration {
 /// taken from the config and preserved; a reverse-mounted unit must have loaded
 /// a template (or a calibration) first. The order the two probes run in is the
 /// order LiteGrip assigns the limits in, which is what `close_sign` reads back.
+///
+/// @throws CommError the two stops coincided, so no scale could be derived.
 ProbeCalibration probe_calibrate(ProbeIo& io, const ProbeConfig& config,
                                  double close_sign, double max_stroke_mm);
 

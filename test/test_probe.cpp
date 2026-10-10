@@ -18,6 +18,8 @@
 #include <string>
 #include <vector>
 
+#include "litegrip/constants.hpp"
+#include "litegrip/exceptions.hpp"
 #include "litegrip/models.hpp"
 #include "litegrip/probe.hpp"
 
@@ -40,6 +42,20 @@ void check_near(double got, double want, double eps, const std::string& what) {
                 want, eps);
     ++g_failures;
   }
+}
+
+/// True when `fn()` throws a CommError — what a calibration that cannot
+/// produce a scale is supposed to do, rather than inventing one.
+template <typename Fn>
+bool throws_comm_error(Fn fn) {
+  try {
+    fn();
+  } catch (const CommError&) {
+    return true;
+  } catch (const LiteGripError&) {
+    return false;
+  }
+  return false;
 }
 
 // ── the plant ────────────────────────────────────────────────────────────
@@ -204,8 +220,10 @@ void test_the_pass_takes_its_direction_from_close_sign() {
     check_near(data.closed_rad, kStopHi, 1e-6, "normal: closed at the high stop");
     check_near(data.opened_rad, kStopLo, 1e-6, "normal: opened at the low stop");
     check_near(data.travel_rad, kStopHi - kStopLo, 1e-6, "normal: travel");
-    check_near(data.rad_to_mm, max_stroke_mm / (kStopHi - kStopLo), 1e-6,
-               "normal: mm/rad from the measured travel");
+    check_near(data.rad_to_mm,
+               (max_stroke_mm + GripperGeometry::kStopInsetMm) /
+                   (kStopHi - kStopLo),
+               1e-6, "normal: mm/rad from the measured travel");
     check(litegrip::close_sign_for(data.closed_rad, data.opened_rad) > 0.0,
           "normal: the result still reads back as a normal mount");
   }
@@ -220,6 +238,52 @@ void test_the_pass_takes_its_direction_from_close_sign() {
     check(litegrip::close_sign_for(data.closed_rad, data.opened_rad) < 0.0,
           "reverse: the result still reads back as a reverse mount");
   }
+}
+
+// ── the scale comes from the jaw travel plus the probe's inset ───────────
+
+void test_the_reference_scale_is_the_hand_recorded_one() {
+  // (85 + 1) / 1.409552 must be the number the shipped factory calibration
+  // file carries, so re-probing a shipped unit reproduces its own scale
+  // instead of writing a different one.
+  check_near(rad_to_mm_from_travel(GripperGeometry::kJawTravelMm, 1.409552),
+             61.01229326764816, 1e-9,
+             "the reference scale (py: 61.01229326764816)");
+}
+
+void test_deriving_from_the_jaw_travel_alone_would_be_short() {
+  // The counter-example, pinned so the numerator cannot quietly lose the
+  // inset: 85 / 1.409552 is 0.69 mm/rad away from the recorded scale.
+  const double short_scale = GripperGeometry::kJawTravelMm / 1.409552;
+  check(short_scale < 61.01229326764816, "the short scale is short");
+  check(61.01229326764816 - short_scale < 0.8,
+        "short by a coarse amount, not by a typo");
+}
+
+void test_the_default_config_carries_the_measured_travel() {
+  // The Python SDK's default was a nominal 120 mm, 1.40x the measurement.
+  const GripperConfig config{};
+  check_near(config.max_stroke_mm, 85.0, 1e-12,
+             "max_stroke_mm defaults to the measured travel");
+  check_near(UnitConversion::kRadToMm,
+             GripperGeometry::kSpanMm / 1.14, 1e-12,
+             "the nominal scale is the span over the placeholder travel");
+}
+
+void test_a_coincident_travel_refuses_instead_of_inventing_a_scale() {
+  // It used to fall back to UnitConversion::kRadToMm on a zero travel, which
+  // wrote a scale that described nothing and marked the config calibrated.
+  check(throws_comm_error([] { rad_to_mm_from_travel(85.0, 0.0); }),
+        "a zero travel throws");
+  check(throws_comm_error([] { rad_to_mm_from_travel(85.0, -1.0); }),
+        "a negative travel throws");
+}
+
+void test_the_helper_uses_the_configured_stroke() {
+  // The numerator follows max_stroke_mm, not a hardcoded 85.
+  check_near(rad_to_mm_from_travel(40.0, 0.5),
+             (40.0 + GripperGeometry::kStopInsetMm) / 0.5, 1e-12,
+             "the numerator follows the configured stroke");
 }
 
 // ── the back-off is guarded like the probe ───────────────────────────────
@@ -263,6 +327,11 @@ int main() {
   test_the_probe_never_leads_the_measurement_by_more_than_a_step();
   test_the_ceiling_stops_a_probe_the_position_test_cannot();
   test_the_pass_takes_its_direction_from_close_sign();
+  test_the_reference_scale_is_the_hand_recorded_one();
+  test_deriving_from_the_jaw_travel_alone_would_be_short();
+  test_the_default_config_carries_the_measured_travel();
+  test_a_coincident_travel_refuses_instead_of_inventing_a_scale();
+  test_the_helper_uses_the_configured_stroke();
   test_the_back_off_clears_the_stop_it_just_probed();
   test_the_back_off_does_not_press_against_a_stop();
 

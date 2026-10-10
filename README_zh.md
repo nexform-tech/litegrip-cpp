@@ -125,6 +125,23 @@ gripper.config().mount();            // "reverse" —— 读回来的，不是�
 方向，所以反装的机器必须先载入模板（或一份标定）；`calibrate_manual()` 同样按这
 条规则给两个极值定性，而不是按哪个数值更大。
 
+**比例来自你给的一个测量值。** `rad_to_mm` 由两爪的行程（mm，卡尺读数）推出，放在
+`GripperConfig::max_stroke_mm` —— 默认 85 mm，就是出厂这台：
+
+```text
+rad_to_mm = (max_stroke_mm + GripperGeometry::kStopInsetMm) / 探到的跨度_rad
+```
+
+压入量不是凑出来的数。探针是**压进**张开限位约 1 mm 才找到它的，所以记录下来的两端比两爪真正
+能走的行程宽出这么多（`GripperGeometry::kSpanMm` 86 mm，对 `kJawTravelMm` 85 mm）。搞错它会
+得到两个等大反向的误差：只拿卡尺读数除以探到的跨度，每个按 mm 走的目标都短 1.2%（满行程丢
+1 mm）；而把探到的跨度填进 `max_stroke_mm`，等于把那 1 mm 又加了一遍。出厂这台用默认值重推，
+结果和出厂文件自带的比例分毫不差：`86 / 1.409552 = 61.0123 mm/rad`。两端止点重合的探测推不出
+比例，会直接报错（`CommError`），而不是写下一个标称值。
+
+只有当你量到的行程不是 85 mm 时，才需要设 `max_stroke_mm`。任何标定文件都不带它 —— 文件自带的
+`rad_to_mm` 是照读的，所以这个数只在重新标定时起作用。
+
 两道护栏防止探测器把结构顶变形（`probe.hpp`，都由 `test/test_probe.cpp` 覆盖）：
 
 - **每一步的指令都从实测位置重新推算**，绝不累加，于是领先量不超过一个

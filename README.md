@@ -79,6 +79,27 @@ The probes take it from `GripperConfig::close_sign()`, so a reverse-mounted unit
 have loaded a template (or a calibration) first, and `calibrate_manual()` assigns its
 two extremes by that same rule rather than by which is numerically larger.
 
+**The scale comes from a measurement you supply.** `rad_to_mm` is derived from the jaws' travel in
+millimetres, as read off calipers, which you put in `GripperConfig::max_stroke_mm` — 85 mm by
+default, the shipped hardware:
+
+```text
+rad_to_mm = (max_stroke_mm + GripperGeometry::kStopInsetMm) / recorded_travel_rad
+```
+
+The inset is not a fudge factor. The probe finds the open stop by pressing about a millimetre
+*into* it, so the two recorded extremes span that much more than the jaws actually travel
+(`GripperGeometry::kSpanMm`, 86 mm, against `kJawTravelMm`, 85 mm). Two errors follow from getting
+it wrong, and they are equal and opposite: dividing the recorded span by the caliper measurement
+alone leaves every mm-based move 1.2% short — 1 mm lost per full stroke — while putting the
+recorded span into `max_stroke_mm` adds the same millimetre a second time. On the shipped unit the
+defaults reproduce the factory file's own scale exactly: `86 / 1.409552 = 61.0123 mm/rad`. A probe
+whose two stops coincide has no scale to derive and says so (`CommError`) instead of writing the
+nominal one.
+
+Set `max_stroke_mm` only when the jaws you measured are not 85 mm. No calibration file carries it:
+a file's own `rad_to_mm` is read as-is, so the number matters only when you re-probe.
+
 Two guards keep a probe from pressing the structure apart (`probe.hpp`, both covered
 by `test/test_probe.cpp`):
 
