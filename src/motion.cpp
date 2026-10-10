@@ -124,6 +124,30 @@ TargetSpec press_target(const GripperConfig& config, Toward toward,
   return make_target(config, toward, overshoot, /*press=*/true);
 }
 
+/// Split a force-carrying approach frame's torque budget across the three terms
+/// that can produce force. The header carries the derivation and the reason the
+/// damping is served before the lead.
+ApproachTerms force_approach_terms(double kp, double kd, double speed_rad_s,
+                                   double frame_interval, double budget_nm,
+                                   double lead_ceiling_rad) {
+  ApproachTerms terms{speed_rad_s, kd, lead_ceiling_rad};
+  if (!(budget_nm > 0.0) || !(kp > 0.0) || !(speed_rad_s > 0.0)) {
+    return terms;  // no force asked for: an ordinary move, untouched
+  }
+  // One frame's own displacement is the floor on how far the command can trail
+  // the measurement, so the speed alone must not be able to eat the budget.
+  terms.speed_rad_s = std::min(speed_rad_s, budget_nm / (kp * frame_interval));
+  const double tick_nm = kp * terms.speed_rad_s * frame_interval;
+  const double tick_rad = terms.speed_rad_s * frame_interval;
+  terms.kd =
+      std::max(0.0, std::min(kd, (budget_nm - tick_nm) / terms.speed_rad_s));
+  const double lead_budget_rad =
+      (budget_nm - terms.kd * terms.speed_rad_s) / kp;
+  terms.lead_ceiling_rad =
+      std::min(lead_ceiling_rad, std::max(tick_rad, lead_budget_rad));
+  return terms;
+}
+
 // ── construction / seams ─────────────────────────────────────────────────
 
 MotionEngine::MotionEngine(MotionIo& io, SafetyGuard& safety,
@@ -349,7 +373,8 @@ void MotionEngine::recover_to_interior(const char* source) {
 // ── the ramp (Python actions._move_to_limit) ─────────────────────────────
 
 MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
-                                       bool press, const char* source,
+                                       bool press, std::optional<double> force_n,
+                                       const char* source,
                                        const MoveProgressCallback& progress) {
   check_entry(source);
   const GripperConfig& gcfg = io_.config();
@@ -363,11 +388,32 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
 
   // A speed the frame gate would refuse must fail before the recovery
   // drive-in moves anything.
-  const double speed_rad_s = speed_mm_s / gcfg.rad_to_mm;
+  double speed_rad_s = speed_mm_s / gcfg.rad_to_mm;
   if (std::fabs(speed_rad_s) > kMaxCommandVelocityCeilingRadS) {
     throw LimitViolation(std::string(source) + ": speed " +
                          std::to_string(speed_mm_s) +
                          " mm/s exceeds the commanded-velocity ceiling");
+  }
+
+  // Carrying a force makes this a POSITION leg still, so on contact the drive
+  // presses with kp x lead + kd x dq — the setpoint never reaches it unless the
+  // frame's three force-producing terms are handed shares of the setpoint's
+  // budget (force_approach_terms). An ordinary move keeps the config kd and the
+  // travel lead ceiling untouched.
+  double kd_frame = gcfg.kd;
+  double lead_ceiling_rad = config_.max_lead_mm / gcfg.rad_to_mm;
+  if (force_n.has_value()) {
+    const ApproachTerms terms = force_approach_terms(
+        gcfg.kp, gcfg.kd, speed_rad_s, config_.frame_interval,
+        *force_n * UnitConversion::kNToNm * config_.press_safety,
+        lead_ceiling_rad);
+    speed_rad_s = terms.speed_rad_s;
+    kd_frame = terms.kd;
+    lead_ceiling_rad = terms.lead_ceiling_rad;
+    // The budget only lowers the speed, but everything downstream — ramp length,
+    // speed feed-forward and the stall threshold — has to follow that lower one,
+    // or the ramp finishes with the jaw still part-way.
+    speed_mm_s = speed_rad_s * gcfg.rad_to_mm;
   }
 
   recover_to_interior(source);
@@ -402,8 +448,7 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
       std::max(config_.stall_delta,
                config_.stall_ratio * speed_rad_s * win_s);
   const double min_cap_rad = speed_rad_s * interval;
-  const double travel_cap_rad =
-      std::max(config_.max_lead_mm / gcfg.rad_to_mm, min_cap_rad);
+  const double travel_cap_rad = std::max(lead_ceiling_rad, min_cap_rad);
   const double stop_cap_rad =
       std::max(config_.stop_lead_mm / gcfg.rad_to_mm, min_cap_rad);
   const double press_zone_rad = config_.press_zone_mm / gcfg.rad_to_mm;
@@ -444,7 +489,7 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
     const double cmd = lead > lead_cap_rad ? pos + sign * lead_cap_rad : q_sched;
 
     last_cmd = cmd;
-    emit(cmd, dq, 0.0, std::nullopt, std::nullopt, source);
+    emit(cmd, dq, 0.0, std::nullopt, kd_frame, source);
     last_i = i;
 
     if (i % sample_every != 0 && i != total_steps) {
@@ -543,13 +588,15 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
 MoveResult MotionEngine::open(std::optional<double> speed_mm_s,
                               MoveProgressCallback progress) {
   const double speed = speed_mm_s.value_or(config_.speed_mm_s);
-  return move_to_limit(Toward::kOpen, speed, /*press=*/true, "open", progress);
+  return move_to_limit(Toward::kOpen, speed, /*press=*/true, std::nullopt, "open",
+                       progress);
 }
 
 MoveResult MotionEngine::close(std::optional<double> speed_mm_s,
                                MoveProgressCallback progress) {
   const double speed = speed_mm_s.value_or(config_.speed_mm_s);
-  return move_to_limit(Toward::kClose, speed, /*press=*/true, "close", progress);
+  return move_to_limit(Toward::kClose, speed, /*press=*/true, std::nullopt,
+                       "close", progress);
 }
 
 // ── grasp / force hold ───────────────────────────────────────────────────
@@ -559,9 +606,12 @@ GraspResult MotionEngine::grasp(std::optional<double> force_n, double hold_s,
   const double force = force_n.value_or(config_.force_n);
 
   // The approach stops INSIDE the limit (press=false): on an empty gripper it
-  // reaches; on a workpiece it stalls early, which is the point.
+  // reaches; on a workpiece it stalls early, which is the point. It carries the
+  // setpoint's force, so the torque it meets the workpiece with is bounded by
+  // the same setpoint it will hold (force_approach_terms).
   const MoveResult move = move_to_limit(Toward::kClose, config_.grasp_speed_mm_s,
-                                        /*press=*/false, "grasp", progress);
+                                        /*press=*/false, force, "grasp",
+                                        progress);
   const HoldOutcome hold = hold_force(force, hold_s, progress);
 
   GraspResult result;

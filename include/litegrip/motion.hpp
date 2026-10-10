@@ -107,6 +107,22 @@ struct MotionConfig {
   // ── torque / command caps ─────────────────────────────────────────────
   double max_lead_mm = 4.0;        // travel-phase lead cap, mm (~= kp x cap)
 
+  // ── the force-carrying approach's torque budget (grasp's closing leg) ──
+  // grasp's closing leg is a set of POSITION frames, so the torque it presses
+  // with when it hits the workpiece is computed by the drive — kp x lead +
+  // kd x commanded speed — and has nothing to do with the force being asked
+  // for. The default 4 mm travel lead is kp x 4/74.19 = 5.4 Nm ~= 54 N at
+  // kp=100, so a 5 N grasp also arrives at 54 N (measured on the fake bench).
+  // This leg hands each of a frame's three force-producing terms its share of
+  // the setpoint's budget instead (see force_approach_terms), so the press
+  // cannot exceed it. Same law and same number as the Python SDK's approach.
+  //
+  // The budget converts straight from force_n x UnitConversion::kNToNm times
+  // this margin. The gripper's rated force is not policed here: that is the
+  // caller's setpoint's own business, and the hold streams the setpoint's
+  // force anyway.
+  double press_safety = 0.9;       // budget margin: the press lands under the setpoint
+
   // ── travel-leg stall protection (~7 N) ────────────────────────────────
   // In the travel leg a press move's lead cap is still max_lead_mm, so a jaw
   // hard-blocked halfway keeps pushing at kp x cap ~= 7.6 Nm. The position
@@ -269,6 +285,44 @@ TargetSpec limit_target(const GripperConfig& config, Toward toward,
 TargetSpec press_target(const GripperConfig& config, Toward toward,
                         double overshoot);
 
+// ── the force-carrying approach's terms ──────────────────────────────────
+
+/// One approach frame's budgeted terms: how fast to command, what damping to
+/// send, and how far the command may lead the measurement.
+struct ApproachTerms {
+  double speed_rad_s = 0.0;       // commanded speed
+  double kd = 0.0;                // the frame's damping gain
+  double lead_ceiling_rad = 0.0;  // the lead cap the frame runs with
+};
+
+/// Split a force-carrying approach frame's torque budget across the three terms
+/// that can produce force (Python's actions.force_approach_terms — same law,
+/// same numbers).
+///
+/// The frame is a position frame, so a drive pressing it against a workpiece
+/// produces `kp x lead + kd x speed`, all of it outside the setpoint's control.
+/// This divides `budget_nm` among those three so their sum cannot exceed it:
+///
+///  * one frame's own travel (`kp x speed x frame_interval`) is a floor on the
+///    command's lead over the measurement, so it is served first — by slowing
+///    the approach down, which is the only place a setpoint still decides the
+///    approach SPEED, and even then as this frame's arithmetic, not a policy;
+///  * the damping (`kd x speed`) is served next, never above the caller's kd;
+///  * the lead takes what is left, with one frame's travel as its floor so the
+///    ramp keeps the step it needs — that floor's torque is exactly the first
+///    item, so it cannot break the budget.
+///
+/// The order is deliberate: damping before lead, so a budget that runs out cuts
+/// the lead first. The other way round would zero the damping at the low-speed
+/// end (where `kd x speed` is only a newton or two), leaving a position-only
+/// frame whose force collapses the moment the workpiece yields.
+///
+/// A budget of 0 or less (no force asked for) returns the caller's values
+/// unchanged, so an ordinary move is untouched.
+ApproachTerms force_approach_terms(double kp, double kd, double speed_rad_s,
+                                   double frame_interval, double budget_nm,
+                                   double lead_ceiling_rad);
+
 // ── the engine ───────────────────────────────────────────────────────────
 
 /// The action engine. One instance per call; LiteGrip constructs it and
@@ -340,8 +394,14 @@ class MotionEngine {
   /// The one ramp engine: absolute schedule from the reading taken before the
   /// move, per-frame lead caps, window-displacement stall criterion, press and
   /// non-press success criteria (verbatim port of actions._move_to_limit).
+  ///
+  /// `force_n` is how much force this leg is CARRYING, or nullopt for an
+  /// ordinary move. Given one, the setpoint's torque budget is divided across
+  /// the frame's speed, damping and lead (force_approach_terms), so hitting a
+  /// workpiece presses no harder than it — which is what grasp's closing leg
+  /// passes.
   MoveResult move_to_limit(Toward toward, double speed_mm_s, bool press,
-                           const char* source,
+                           std::optional<double> force_n, const char* source,
                            const MoveProgressCallback& progress);
 
   struct HoldOutcome {
