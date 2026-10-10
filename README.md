@@ -85,7 +85,12 @@ SDK today.
 `open` / `close` / `grasp` / `set_force` / `move_at_speed(_rad)` /
 `enter_zero_gravity` / `exit_zero_gravity` run the same frame-by-frame engine
 as the online Python SDK (`MotionConfig` carries the tuned defaults; a
-`MoveResult` / `GraspResult` reports `ok` / `reached` / `stalled`). `open()`
+`MoveResult` / `GraspResult` reports `ok` / `reached` / `stalled`, plus
+`MoveResult::protection_tripped`). A press move whose jaw is blocked out in the
+travel leg lets go — 0.2 s of `kp=kd=tau=0` frames, so the gripper can be pushed
+by hand instead of holding on — once the jaw is moving well below the commanded
+speed and the torque is over `MotionConfig::stop_torque_nm` (0.7 Nm) on three
+consecutive samples. Such a move is never `ok`. `open()`
 and `close()` no longer take gains or a duration — they take an optional speed
 and press onto the mechanical stop, and their truthiness still means "pressed
 onto the stop". The old `close(force_n=...)` is gone with them: use

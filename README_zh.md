@@ -130,7 +130,11 @@ gripper.config().mount();            // "reverse" —— 读回来的，不是�
 `open` / `close` / `grasp` / `set_force` / `move_at_speed(_rad)` /
 `enter_zero_gravity` / `exit_zero_gravity` 与线上 Python SDK 跑同一套逐帧
 引擎（`MotionConfig` 携带同一组调好的默认值；`MoveResult` / `GraspResult`
-报告 `ok` / `reached` / `stalled`）。`open()` / `close()` 不再接受增益和时长
+报告 `ok` / `reached` / `stalled`，`MoveResult` 还有 `protection_tripped`）。
+顶限位的移动若在**行进段**被硬挡，一旦实测速度明显跟不上指令、且力矩连续三次
+采样超过 `MotionConfig::stop_torque_nm`（0.7 Nm），就会失力 —— 连发 0.2 s 的
+`kp=kd=tau=0` 帧，夹爪能被手掰动，而不是继续压着；这样的移动永远不是 `ok`。
+`open()` / `close()` 不再接受增益和时长
 —— 现在只接受一个可选速度，并且会**顶到机械止点**结束运动，它们的真值语义
 仍然是「顶到止点」。原来的 `close(force_n=...)` 一并取消：夹取请用
 `grasp(force_n, hold_s)`。
