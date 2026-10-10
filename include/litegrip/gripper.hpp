@@ -124,7 +124,9 @@ class LiteGrip : private MotionIo {
   /// Returns a MoveResult whose bool is `ok` = pressed onto the stop (stalled
   /// and parked within MotionConfig::stop_tol of the limit), so the old
   /// `if (gripper.open())` idiom keeps working. Blocked halfway is also a
-  /// stall, but far from the stop, and is falsy.
+  /// stall, but far from the stop, and is falsy — including when the
+  /// travel-leg torque protection ends the move (`protection_tripped`), which
+  /// leaves the gripper limp for MotionConfig::stop_release_s.
   ///
   /// Breaking change: the old open(kp, kd, duration) / close(kp, kd, force_n,
   /// duration) signatures are gone. close() takes no force at all — the

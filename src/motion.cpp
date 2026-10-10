@@ -399,6 +399,10 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
   std::vector<double> hist;
   hist.push_back(before.position_rad);
   bool stalled = false;
+  bool protection_tripped = false;
+  int over_torque = 0;  // consecutive samples over the stop_torque_nm threshold
+  double prev_sample_pos = before.position_rad;
+  double last_sample_pos = before.position_rad;
   double last_cmd = before.position_rad;
   int last_i = 0;
 
@@ -434,6 +438,12 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
     if (i % sample_every != 0 && i != total_steps) {
       continue;
     }
+    // This sample's measured speed, for the torque protection's "is the jaw
+    // keeping up" corroboration.
+    const double rate_rad_s =
+        std::fabs(pos - prev_sample_pos) / config_.sample_interval;
+    prev_sample_pos = pos;
+    last_sample_pos = pos;
     hist.push_back(pos);
     const int n = static_cast<int>(hist.size());
     std::optional<double> win_delta;
@@ -461,6 +471,38 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
       stalled = true;
       break;
     }
+
+    // Travel-leg stall-torque protection, complementary to the position window
+    // above: a jaw hard-blocked mid-travel whose structure keeps slowly
+    // yielding has a large enough net displacement to slip past that window,
+    // but it is still pushing. The lead cap is the travel one only out in the
+    // travel leg — inside the press zone the gripper is meant to be pressing
+    // and a torque threshold would fire on every move.
+    if (press && lead_cap_rad == travel_cap_rad && speed_rad_s > 0.0) {
+      const bool slow = rate_rad_s < config_.stop_speed_ratio * speed_rad_s;
+      if (std::fabs(st.torque_nm) >= config_.stop_torque_nm && slow) {
+        ++over_torque;
+      } else {
+        over_torque = 0;
+      }
+      if (over_torque >= config_.stop_torque_cycles) {
+        protection_tripped = true;
+        stalled = true;
+        break;
+      }
+    }
+  }
+
+  if (protection_tripped) {
+    // Let go the moment it fires: kp=kd=tau=0 frames so the gripper can be
+    // pushed by hand instead of holding on to whatever it hit. q is the
+    // reading taken at the trip — with zero gain it produces no force, it only
+    // hands the driver a command that is not a stale target.
+    const int release_frames =
+        std::max(1, frame_count_round(config_.stop_release_s / interval));
+    for (int k = 0; k < release_frames; ++k) {
+      emit(last_sample_pos, 0.0, 0.0, 0.0, 0.0, source);
+    }
   }
 
   const GripperState st = io_.get_state(true);
@@ -468,15 +510,16 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
   // Success differs by target, Python verbatim: pressing onto the empty stop
   // succeeds by STALLING near that stop; the grasp approach succeeds by
   // REACHING a target inside the limit without stalling.
-  const bool ok = press
-                      ? (stalled &&
-                         std::fabs(st.position_rad - limit) <= config_.stop_tol)
-                      : (reached && !stalled);
+  const bool ok = !protection_tripped &&
+                  (press ? (stalled && std::fabs(st.position_rad - limit) <=
+                                            config_.stop_tol)
+                         : (reached && !stalled));
 
   MoveResult result;
   result.ok = ok;
   result.reached = reached;
   result.stalled = stalled;
+  result.protection_tripped = protection_tripped;
   result.state = st;
   result.target_rad = target;
   result.limit_rad = limit;

@@ -309,6 +309,9 @@ void test_close_from_inside_red() {
   check(res.ok, "S1: ok (pressed onto the stop)");
   check(!res.reached, "S1: reached=false (target is past the stop)");
   check(res.stalled, "S1: stalled");
+  // A jaw that keeps up never trips the torque protection, however hard it
+  // ends up pressing onto the stop [py: protected=False].
+  check(!res.protection_tripped, "S1: clean press is not a protected stall");
   check(res.steps == 370, "S1: steps (py: 370)");
   check(io.frames.size() == 370, "S1: frame count (py: 370)");
   check_near(res.target_rad, 0.18520684999999998, 1e-12, "S1: target");
@@ -403,10 +406,37 @@ void test_blocked_mid_travel_is_not_success() {
   const MoveResult res = engine.close();
   check(!res.ok, "S4: blocked far from the stop is NOT ok");
   check(res.stalled, "S4: stalled");
-  check(res.steps == 50, "S4: steps (py: 50)");
+  // Blocked in the travel leg: the torque protection ends the move at the
+  // third consecutive over-threshold sample (i = 30) instead of pushing at
+  // kp x max_lead until the position window notices [py: protected=True].
+  check(res.protection_tripped, "S4: the travel-leg protection tripped");
+  check(res.steps == 30, "S4: steps (py: 30)");
   check_near(res.final_cmd_rad, -0.9360843779485106, 1e-12,
              "S4: final cmd = pos + max_lead (4 mm)");
+  // Then stop_release_s of limp frames at the reading that tripped, so the jaw
+  // is pushable by hand rather than still pressing onto the block.
+  check(io.frames.size() == 70, "S4: frames = 30 + 40 release (py: 70)");
+  for (std::size_t i = 30; i < io.frames.size(); ++i) {
+    const Frame& f = io.frames[i];
+    check(f.kp == 0.0 && f.kd == 0.0 && f.dq == 0.0 && f.tau_ff == 0.0,
+          "S4: release frame carries no gain and no torque");
+    check_near(f.q, -0.99, 1e-12, "S4: release frame holds the tripped reading");
+  }
   check_near(io.frames.back().pos_after, -0.99, 1e-12, "S4: pinned at block");
+}
+
+void test_protection_follows_the_release_setting() {
+  // The limp tail is stop_release_s / frame_interval frames, not a constant.
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, /*block_rad=*/ -0.99, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionConfig m = instant_config();
+  m.stop_release_s = 0.05;  // 10 frames at 200 Hz
+  MotionEngine engine(io, guard, m);
+
+  const MoveResult res = engine.close();
+  check(res.protection_tripped, "protection: tripped with a shorter release");
+  check(io.frames.size() == 40, "protection: 30 ramp + 10 release frames");
 }
 
 void test_stiction_does_not_false_stall() {
@@ -442,6 +472,13 @@ void test_press_reach_tolerance() {
     check(!res.ok, "S6b: 0.03 rad off the stop is NOT ok");
     check(res.steps == 360, "S6b: steps (py: 360)");
     check_near(res.final_cmd_rad, 0.08376923385901064, 1e-12, "S6b: final cmd");
+    // Inside the press zone the lead has narrowed to stop_lead_mm and the
+    // gripper is SUPPOSED to be pushing onto something: the torque protection
+    // stays out of that leg, so this blocked move runs to the end like before
+    // and appends no release tail [py: protected=False, 360 frames].
+    check(!res.protection_tripped,
+          "S6b: pressing near the stop is not a protected stall");
+    check(io.frames.size() == 360, "S6b: no release tail was appended");
   }
 }
 
@@ -821,6 +858,7 @@ int main() {
   test_open_from_inside_red();
   test_grasp_onto_object();
   test_blocked_mid_travel_is_not_success();
+  test_protection_follows_the_release_setting();
   test_stiction_does_not_false_stall();
   test_press_reach_tolerance();
   test_move_at_speed_mm();

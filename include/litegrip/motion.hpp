@@ -107,6 +107,22 @@ struct MotionConfig {
   // ── torque / command caps ─────────────────────────────────────────────
   double max_lead_mm = 4.0;        // travel-phase lead cap, mm (~= kp x cap)
 
+  // ── travel-leg stall protection (~7 N) ────────────────────────────────
+  // In the travel leg a press move's lead cap is still max_lead_mm, so a jaw
+  // hard-blocked halfway keeps pushing at kp x cap ~= 7.6 Nm. The position
+  // window alone misses a hard stop that keeps slowly yielding (the net
+  // displacement over the window stays large enough), so this channel watches
+  // torque instead: measured speed well below commanded AND |tau| at or above
+  // the threshold on stop_torque_cycles samples in a row -> stalled, and the
+  // gripper is let go limp. Travel leg only — once the lead has narrowed to
+  // stop_lead_mm the gripper is supposed to be pushing, and a torque threshold
+  // there would fire on every open()/close(). Mirrors
+  // actions.MotionConfig.stop_torque_nm and neighbours.
+  double stop_torque_nm = 0.7;     // trigger threshold, Nm (~7 N)
+  int stop_torque_cycles = 3;      // consecutive over-threshold samples
+  double stop_speed_ratio = 0.5;   // "not keeping up" = under this fraction of the commanded speed
+  double stop_release_s = 0.2;     // limp (kp=kd=tau=0) tail after the trip, s
+
   // ── force hold ────────────────────────────────────────────────────────
   double force_n = 20.0;           // default grip force, N (~= 2.0 Nm)
   double hold_interval = 0.2;      // hold slice length, s
@@ -177,10 +193,18 @@ using MoveProgressCallback = std::function<void(const MoveProgress&)>;
 ///    mid-travel is also a stall, but far from the calibrated stop — ok=false.
 ///  * grasp()'s closing leg: success = reached the no-load target and did NOT
 ///    stall, i.e. reached && !stalled.
+///  * a move ended by the travel-leg stall-torque protection is never `ok`:
+///    the gripper was blocked and then let go limp, which is not a press.
 struct MoveResult {
   bool ok = false;
   bool reached = false;
   bool stalled = false;
+  /// The travel-leg stall-torque protection ended this move (see
+  /// MotionConfig::stop_torque_nm) and stop_release_s of kp=kd=tau=0 frames
+  /// followed, leaving the gripper pushable by hand. Implies `stalled` and
+  /// rules out `ok`. Mirrors actions.MoveResult.protected, renamed because
+  /// `protected` is a C++ keyword.
+  bool protection_tripped = false;
   GripperState state;
   double target_rad = 0.0;     // where the ramp aimed
   double limit_rad = 0.0;      // this end's calibrated limit
