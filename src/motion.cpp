@@ -585,7 +585,8 @@ MotionEngine::HoldOutcome MotionEngine::hold_force(
 
   while (!bounded || now_s() < deadline) {
     for (int f = 0; f < frames_per_slice; ++f) {
-      emit(pos, 0.0, tau_nm, config_.hold_kp, config_.hold_kd, "grasp-hold");
+      // kp=kd=0: a pure torque source, so the force does not follow the jaws.
+      emit(pos, 0.0, tau_nm, 0.0, 0.0, "grasp-hold");
     }
     ++outcome.cycles;
     st = io_.get_state(true);
@@ -636,9 +637,8 @@ bool MotionEngine::set_force(double force_n, double duration_s) {
   // frame_interval — keep the same literal so the frame counts match.
   const int frames = std::max(1, frame_count_trunc(duration_s / 0.005));
   for (int i = 0; i < frames; ++i) {
-    // 150.0 / 2.0 are Python's hardcoded values here, not hold_kp/hold_kd —
-    // kept verbatim so the two SDKs send the same frames.
-    emit(q, 0.0, tau_nm, 150.0, 2.0, "set_force");
+    // kp=kd=0: a pure torque source, so the force does not follow the jaws.
+    emit(q, 0.0, tau_nm, 0.0, 0.0, "set_force");
   }
   return true;
 }

@@ -125,6 +125,17 @@ onto the stop". The old `close(force_n=...)` is gone with them: use
 N value is **NOT force-calibrated** in this SDK; do not build force-limited
 behaviour on it.
 
+### Holding a force
+
+A hold frame (`grasp`'s hold and every `set_force` frame) is a **pure torque
+source**: `kp = kd = 0`, feed-forward torque only. A position or velocity gain
+makes the force follow the jaws instead of the setpoint — a workpiece yielding
+under the load, or the closed side's ~0.010 rad stick-slip quantum moving one
+notch, moves the measured position, and `kp x (q - measured)` is subtracted
+from the setpoint. The reading then says "it gripped at the setpoint, then
+decayed to something lower". `MotionConfig::hold_kp` / `hold_kd` are
+**deprecated**: setting them changes nothing.
+
 ## Testing
 
 ```bash

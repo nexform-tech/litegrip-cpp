@@ -124,10 +124,19 @@ struct MotionConfig {
   double stop_release_s = 0.2;     // limp (kp=kd=tau=0) tail after the trip, s
 
   // ── force hold ────────────────────────────────────────────────────────
+  // A hold frame is a PURE TORQUE SOURCE: kp=kd=0, feed-forward torque only.
+  // A force control wants a force, and a position or velocity gain makes the
+  // force follow the jaws instead: a workpiece yielding under the setpoint (or
+  // the closed side's ~0.010 rad stick-slip quantum moving one notch) moves the
+  // measured position, and `kp x (q - measured)` is subtracted from the
+  // setpoint. The reading then says "it gripped at the setpoint, then decayed
+  // to something lower". Derivation and cost in hold_force().
   double force_n = 20.0;           // default grip force, N (~= 2.0 Nm)
   double hold_interval = 0.2;      // hold slice length, s
-  double hold_kp = 150.0;          // hold stiffness (matches set_force)
-  double hold_kd = 2.0;
+  // [Deprecated] A hold no longer uses gains (see above). Kept so an older
+  // config still compiles; setting them has no effect.
+  double hold_kp = 150.0;          // deprecated: hold stiffness
+  double hold_kd = 2.0;            // deprecated: hold damping
 
   // ── enable (used by the actions layer) ────────────────────────────────
   int enable_retries = 3;
@@ -268,7 +277,8 @@ class MotionEngine {
                    MoveProgressCallback progress = {});
 
   /// Close onto the workpiece (stopping inside the limit, not pressing onto
-  /// the stop) then keep pushing with force_n for hold_s (0 = until a fault).
+  /// the stop) then hold force_n for hold_s (0 = until a fault). The hold
+  /// frames are gainless (kp=kd=0) — see MotionConfig's force-hold block.
   ///
   /// ⚠ The N value is NOT force-calibrated (kForceCalibrationVerified is
   /// false): force_n is applied as torque = close_sign * force_n * 0.1 Nm,
@@ -277,8 +287,8 @@ class MotionEngine {
   GraspResult grasp(std::optional<double> force_n = std::nullopt,
                     double hold_s = 0.0, MoveProgressCallback progress = {});
 
-  /// Apply force_n at the current position for duration_s.
-  /// Same force-not-calibrated caveat as grasp().
+  /// Apply force_n at the current position for duration_s. Same gainless
+  /// frames and same force-not-calibrated caveat as grasp().
   bool set_force(double force_n, double duration_s = 0.3);
 
   /// Constant-speed move to an absolute opening (mm, 0 = closed) / angle.
