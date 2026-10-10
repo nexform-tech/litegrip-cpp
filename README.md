@@ -125,6 +125,32 @@ onto the stop". The old `close(force_n=...)` is gone with them: use
 N value is **NOT force-calibrated** in this SDK; do not build force-limited
 behaviour on it.
 
+### Holding a force
+
+A hold frame (`grasp`'s hold and every `set_force` frame) is a **pure torque
+source**: `kp = kd = 0`, feed-forward torque only. A position or velocity gain
+makes the force follow the jaws instead of the setpoint — a workpiece yielding
+under the load, or the closed side's ~0.010 rad stick-slip quantum moving one
+notch, moves the measured position, and `kp x (q - measured)` is subtracted
+from the setpoint. The reading then says "it gripped at the setpoint, then
+decayed to something lower". `MotionConfig::hold_kp` / `hold_kd` are
+**deprecated**: setting them changes nothing.
+
+The torque **ramps** to the setpoint at `MotionConfig::force_ramp_n_s`
+(default 20 N/s). It starts from the torque in flight, so the handover is
+continuous, and takes one step per frame, landing exactly on the setpoint. The
+old behaviour — one frame from the closing leg's press to the full setpoint —
+is an impulse through the mechanism, and the fingers bounce off what they just
+touched. A torque already past the setpoint starts at the setpoint: that step
+goes down, so it is not an impulse.
+
+`set_force`'s `duration` is the hold **after** the climb, not a budget that
+includes it, so the call's wall clock is `climb + duration` and a short
+`duration` still reaches the full force. At 20 N/s handing over from the ~10 N
+press of a close to a 20 N setpoint takes half a second: `set_force(20.0)` is
+about 1.3 s of streaming, where it used to be 0.3 s. `duration = 0` means "ramp
+to the setpoint and return".
+
 ## Testing
 
 ```bash
