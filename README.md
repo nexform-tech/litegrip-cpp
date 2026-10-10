@@ -65,13 +65,37 @@ loaded; before that `mount()` reports nothing rather than guessing.
 ## Calibration
 
 Three routines measure the travel, and none of them touches the disk: `calibrate()`
-(self-probing, the default), `calibrate_guided()` (an operator confirms each limit)
-and `calibrate_manual()` (hand-pushed while the motor is in zero-torque mode). All
-of them drive the jaws onto the mechanical stops, which lie outside the software red
-lines — make sure the travel is clear. `zero()` is the convenience pair,
-`calibrate()` then `save_calibration()`; `save_calibration()` writes the current
-config to this channel's own file, the one the automatic load reads first, so the
-result is picked up next run without being told.
+(self-probing, the default), `calibrate_guided()` (self-probing too, opening leg
+first) and `calibrate_manual()` (hand-pushed while the motor is in zero-torque
+mode). All of them drive the jaws onto the mechanical stops, which lie outside the
+software red lines — make sure the travel is clear. `zero()` is the convenience
+pair, `calibrate()` then `save_calibration()`; `save_calibration()` writes the
+current config to this channel's own file, the one the automatic load reads first,
+so the result is picked up next run without being told.
+
+**The direction is not discovered, only preserved.** A stall says something stopped
+the jaws; both ends are hard stops, so the reading does not say which one was hit.
+The probes take it from `GripperConfig::close_sign()`, so a reverse-mounted unit must
+have loaded a template (or a calibration) first, and `calibrate_manual()` assigns its
+two extremes by that same rule rather than by which is numerically larger.
+
+Two guards keep a probe from pressing the structure apart (`probe.hpp`, both covered
+by `test/test_probe.cpp`):
+
+- **The command is re-derived from the measured position every step**, never
+  accumulated, so the lead never exceeds one `step_rad` and the pressing torque is
+  capped at `kp x step_rad`. The accumulated form — `target += sign * step_rad` —
+  grows the lead by a step per cycle once the jaws are held, and `kp x lead` with
+  it. That is the 2026-09-29 accident in the Python SDK.
+- **`tau_limit` (2 Nm) ends the probe** the moment `|tau|` reaches it. That is a
+  second, independent channel: a hard stop whose structure keeps slowly yielding
+  moves the reading every step, so the "position stopped changing" test never fills
+  its counter, and only the ceiling stops it. Pass `std::nullopt` to disable it — a
+  probe that needs more than the ceiling to move then stops there and reports it.
+
+⚠ `calibrate_guided()` does **not** read the keyboard in this SDK: it stops on the
+stall criterion or the torque ceiling only. The Python SDK's version also returns as
+soon as the operator presses Enter; there is no equivalent here yet.
 
 A calibration file may also carry a **work stroke**, `work_stroke_mm`: how far
 `open()` may travel, counted from the closed zero, with 0 meaning no limit. This SDK

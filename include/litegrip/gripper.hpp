@@ -194,9 +194,22 @@ class LiteGrip : private MotionIo {
 
   /// Automatic calibration: back off, step toward close until stall, back off,
   /// step toward open until stall, then derive the conversion factor.
+  ///
+  /// The direction is NOT discovered — a stall only says something stopped the
+  /// jaws, and both ends are hard stops. It comes from the config's close_sign,
+  /// so a reverse-mounted unit must have loaded a template (or a calibration)
+  /// first, and the result preserves that declaration.
+  ///
+  /// Two independent guards keep the probe from pressing the structure apart
+  /// (see probe.hpp): the command lead is re-derived from the measured position
+  /// every step, capping the pressing torque at `kp x step_rad`, and `tau_limit`
+  /// ends the probe as soon as |tau| reaches it. Pass std::nullopt to disable
+  /// the ceiling; a probe that needs more torque than the ceiling to move then
+  /// stops there and reports it.
   CalibrationData calibrate(double kp = 60.0, double kd = 2.0,
                             double step_rad = 0.1, double stall_delta = 0.0003,
-                            int stall_cycles = 8, int max_iter = 30);
+                            int stall_cycles = 8, int max_iter = 30,
+                            std::optional<double> tau_limit = 2.0);
 
   /// Calibrate and persist in one call: calibrate() at its defaults, then
   /// save_calibration() to this channel's own file, so the result is picked up
@@ -211,13 +224,24 @@ class LiteGrip : private MotionIo {
   /// flash or the disk.
   CalibrationData zero();
 
-  /// Guided two-step calibration with the operator confirming each limit.
+  /// Guided two-step calibration: open first, then close, with the same probe
+  /// guards as calibrate() (probe.hpp) and the same direction rule.
+  ///
+  /// ⚠ This SDK does NOT read the keyboard: the probe stops on the stall
+  /// criterion or the torque ceiling only. The Python SDK's calibrate_guided()
+  /// additionally returns as soon as the operator presses Enter
+  /// (sys.stdin.isatty()); there is no equivalent here yet.
   CalibrationData calibrate_guided(double kp = 60.0, double kd = 2.0,
                                    double step_rad = 0.08,
                                    double stall_delta = 0.0004,
-                                   int stall_cycles = 6, int max_iter = 40);
+                                   int stall_cycles = 6, int max_iter = 40,
+                                   std::optional<double> tau_limit = 2.0);
 
   /// Calibrate by hand-moving the gripper while it is in zero-torque mode.
+  ///
+  /// Which of the two extremes the hand reaches is the closed limit follows the
+  /// mount's declared direction (close_sign), not which reading is numerically
+  /// larger — so this is the routine to use on a reverse-mounted unit.
   CalibrationData calibrate_manual(double duration = 30.0,
                                    double settle_time = 2.0,
                                    double sample_interval = 0.01);
