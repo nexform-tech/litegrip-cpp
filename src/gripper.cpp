@@ -33,9 +33,30 @@
 #include "litegrip/calibration.hpp"
 #include "litegrip/constants.hpp"
 #include "litegrip/exceptions.hpp"
+#include "litegrip/probe.hpp"
 
 namespace litegrip {
 namespace {
+
+/// The calibration probes' seam, over the live bus (probe.hpp). The probes
+/// themselves live in src/probe.cpp, where a fake plant can drive them.
+class BusProbe : public ProbeIo {
+ public:
+  explicit BusProbe(GripperBus& bus) : bus_(bus) {}
+
+  void update_state(double timeout_s) override { bus_.update_state(timeout_s); }
+
+  void stream(double q_target, double kp, double kd,
+              double duration_s) override {
+    bus_.control_mit_stream(q_target, kp, kd, duration_s, 0.0, 0.0, 0.005);
+  }
+
+  double position_rad() const override { return bus_.get_position(); }
+  double torque_nm() const override { return bus_.get_torque(); }
+
+ private:
+  GripperBus& bus_;
+};
 
 double monotonic_now() noexcept {
   return std::chrono::duration<double>(
@@ -396,69 +417,39 @@ bool LiteGrip::move_to(double target_rad, std::optional<double> kp,
 
 CalibrationData LiteGrip::calibrate(double kp, double kd, double step_rad,
                                     double stall_delta, int stall_cycles,
-                                    int max_iter) {
+                                    int max_iter, std::optional<double> tau_limit) {
   check_connected();
   check_enabled();
 
   auto scope = safety_->maintenance_scope("calibrate");
+  BusProbe io(*bus_);
 
   bus_->update_state(0.1);
   const double initial = bus_->get_position();
-  std::printf("[litegrip] calibrate: initial position %.4f rad\n", initial);
+  // The direction is NOT discovered here: a stall only says something stopped
+  // the jaws, never which end was hit — both ends are hard stops. It comes from
+  // close_sign (load a template or a calibration first for a reverse mount) and
+  // this routine preserves it.
+  const double s = config_.close_sign();
+  std::printf(
+      "[litegrip] calibrate: initial position %.4f rad (%s mount, close_sign "
+      "%+.0f)\n",
+      initial, s > 0.0 ? "normal" : "reverse", s);
 
-  const auto find_limit = [&](bool closing) -> double {
-    const double sign = closing ? 1.0 : -1.0;
-    bus_->update_state(0.05);
-    double current = bus_->get_position();
-    double target = current;
-    int stall = 0;
+  const ProbeConfig probe{kp, kd, step_rad, stall_delta, stall_cycles, max_iter,
+                          tau_limit};
+  const ProbeCalibration measured =
+      probe_calibrate(io, probe, s, config_.max_stroke_mm);
 
-    for (int i = 0; i < max_iter; ++i) {
-      target += sign * step_rad;
-      bus_->control_mit_stream(target, kp, kd, 0.3, 0.0, 0.0, 0.005);
-      bus_->update_state(0.1);
-
-      const double measured = bus_->get_position();
-      const double delta = std::fabs(measured - current);
-      std::printf("[litegrip]   [%d] target=%+.3f pos=%.4f d=%.5f stall=%d\n", i,
-                  target, measured, delta, stall);
-
-      if (delta < stall_delta) {
-        if (++stall >= stall_cycles) {
-          std::printf("[litegrip]   reached %s limit: %.6f rad\n",
-                      closing ? "closed" : "open", measured);
-          return measured;
-        }
-      } else {
-        stall = 0;
-      }
-      current = measured;
-    }
-    std::printf("[litegrip]   safety stop at the iteration cap: %.4f rad\n",
-                current);
-    return current;
-  };
-
-  // Back off first, so probing does not start against a stop.
-  bus_->control_mit_stream(initial + 0.2, 80.0, kd, 0.5);
-  bus_->update_state(0.1);
-
-  const double closed = find_limit(true);
-  bus_->control_mit_stream(closed + 0.3, 80.0, kd, 0.5);
-  bus_->update_state(0.1);
-  const double opened = find_limit(false);
-
-  const double travel = closed - opened;  // closed is numerically larger
-  if (travel <= 0.0) {
+  if (!(measured.travel_rad > 0.0)) {
     throw CommError("calibration failed: the travel range is not positive");
   }
-  const double rad_to_mm = config_.max_stroke_mm / travel;
 
   CalibrationData result;
-  result.zero_position = closed;
-  result.max_position = opened;
-  result.travel_range = travel;
-  result.rad_to_mm = rad_to_mm;
+  result.zero_position = measured.closed_rad;
+  result.max_position = measured.opened_rad;
+  result.travel_range = measured.travel_rad;
+  result.rad_to_mm = measured.rad_to_mm;
   result.motor_type = motor_type_name(GripperParams::kMotorType);
   result.can_id = config_.can_id;
   result.mst_id = mst_id_.value_or(0);
@@ -491,52 +482,33 @@ CalibrationData LiteGrip::zero() {
 CalibrationData LiteGrip::calibrate_guided(double kp, double kd,
                                            double step_rad,
                                            double stall_delta, int stall_cycles,
-                                           int max_iter) {
+                                           int max_iter,
+                                           std::optional<double> tau_limit) {
   check_connected();
   check_enabled();
 
   auto scope = safety_->maintenance_scope("calibrate_guided");
+  BusProbe io(*bus_);
 
-  const auto step_to_limit = [&](bool closing, const char* label) -> double {
-    std::printf("[litegrip] probing the %s limit; press Enter to confirm\n",
-                label);
-    bus_->update_state(0.05);
-    double current = bus_->get_position();
-    int stall = 0;
+  // Same direction rule as calibrate(): taken from the config, never guessed.
+  const double s = config_.close_sign();
+  std::printf("[litegrip] calibrate_guided: %s mount (close_sign %+.0f)\n",
+              s > 0.0 ? "normal" : "reverse", s);
 
-    for (int i = 0; i < max_iter; ++i) {
-      const double target = current + (closing ? 1.0 : -1.0) * step_rad;
-      bus_->control_mit_stream(target, kp, kd, 0.3, 0.0, 0.0, 0.005);
-      bus_->update_state(0.1);
+  const ProbeConfig probe{kp, kd, step_rad, stall_delta, stall_cycles, max_iter,
+                          tau_limit};
 
-      const double measured = bus_->get_position();
-      const double delta = std::fabs(measured - current);
-      std::printf("[litegrip]   [%d] pos=%.4f d=%.5f stall=%d\n", i, measured,
-                  delta, stall);
+  std::printf("[litegrip] probing the open limit\n");
+  const double opened = probe_to_limit(io, -s, probe, "open");
 
-      if (delta < stall_delta) {
-        if (++stall >= stall_cycles) {
-          std::printf("[litegrip]   detected the %s limit: %.6f rad\n", label,
-                      measured);
-          return measured;
-        }
-      } else {
-        stall = 0;
-      }
-      current = measured;
-    }
-    std::printf("[litegrip]   safety stop at the iteration cap: %.4f rad\n",
-                current);
-    return current;
-  };
-
-  const double opened = step_to_limit(false, "open");
   std::printf("[litegrip] backing off\n");
-  bus_->control_mit_stream(opened - 0.15, 80.0, kd, 0.5, 0.0, 0.0, 0.005);
-  sleep_s(0.1);
-  const double closed = step_to_limit(true, "closed");
+  guarded_move_to(io, opened + s * 0.15, probe, "back-off");
 
-  const double travel = closed - opened;
+  std::printf("[litegrip] probing the closed limit\n");
+  const double closed = probe_to_limit(io, s, probe, "closed");
+
+  // Which of the two is numerically larger depends on the mount.
+  const double travel = std::fabs(closed - opened);
   if (travel <= 0.0) {
     throw CommError("calibration failed: the travel range is not positive");
   }
@@ -565,13 +537,18 @@ CalibrationData LiteGrip::calibrate_manual(double duration, double settle_time,
   // Zero-torque streaming so the jaws can be moved by hand.
   auto scope = safety_->zero_gravity_scope("calibrate_manual");
 
+  // Which of the two extremes the hand reaches is "closed" follows the mount's
+  // declared direction, not which reading is numerically larger: a normal mount
+  // closes at the larger rad, a reverse mount at the smaller one.
+  const double s = config_.close_sign();
+
   std::printf(
       "[litegrip] hand-push calibration: the gripper is limp. Push the jaws "
       "fully closed, then fully open, a few times. Recording for %.0f s.\n",
       duration);
 
-  double open_rad = std::numeric_limits<double>::infinity();
-  double close_rad = -std::numeric_limits<double>::infinity();
+  double lo_rad = std::numeric_limits<double>::infinity();
+  double hi_rad = -std::numeric_limits<double>::infinity();
   int samples = 0;
 
   const auto sample = [&]() {
@@ -582,8 +559,8 @@ CalibrationData LiteGrip::calibrate_manual(double duration, double settle_time,
     // Ignore readings that cannot be real feedback.
     if (std::fabs(position) < 50.0) {
       ++samples;
-      open_rad = std::min(open_rad, position);
-      close_rad = std::max(close_rad, position);
+      lo_rad = std::min(lo_rad, position);
+      hi_rad = std::max(hi_rad, position);
     }
   };
 
@@ -604,19 +581,22 @@ CalibrationData LiteGrip::calibrate_manual(double duration, double settle_time,
   bus_->control_mit_stream(bus_->get_position(), config_.kp, config_.kd, 0.05);
   sleep_s(0.1);
 
-  if (!std::isfinite(open_rad) || open_rad >= close_rad) {
+  if (!std::isfinite(lo_rad) || !(hi_rad > lo_rad)) {
     throw CommError(
         "calibration failed: no usable position range was captured — check "
         "that the motor is enabled and producing feedback");
   }
 
-  const double travel = close_rad - open_rad;
-  const double rad_to_mm = travel > 0.0 ? config_.max_stroke_mm / travel
-                                        : UnitConversion::kRadToMm;
+  // The two extremes are NOT relabelled by size: the mount's declared
+  // direction decides which one is the closed limit.
+  const double closed = s > 0.0 ? hi_rad : lo_rad;
+  const double opened = s > 0.0 ? lo_rad : hi_rad;
+  const double travel = hi_rad - lo_rad;
+  const double rad_to_mm = config_.max_stroke_mm / travel;
 
   CalibrationData result;
-  result.zero_position = close_rad;
-  result.max_position = open_rad;
+  result.zero_position = closed;
+  result.max_position = opened;
   result.travel_range = travel;
   result.rad_to_mm = rad_to_mm;
   result.motor_type = motor_type_name(GripperParams::kMotorType);
