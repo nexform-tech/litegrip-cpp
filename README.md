@@ -151,8 +151,9 @@ behaviour on it.
 `grasp`'s closing leg carries the setpoint's force, but it is still a set of
 **position** frames: what it presses with on contact is the drive's own
 `kp x lead + kd x dq`, which has nothing to do with the force being asked for.
-The default 4 mm travel lead is `kp x 4/74.19` = 5.4 Nm ≈ 54 N at `kp = 100`, so
-before this change a 5 N grasp arrived at the same 54 N as a 40 N one.
+The default 4 mm travel lead presses `kp x max_lead_mm / rad_to_mm` = 5.30 Nm ≈
+53 N at the config defaults (`kp = 100`, `rad_to_mm = 75.44`), so before this
+change a 5 N grasp arrived at the same 53 N as a 40 N one.
 
 Every frame of that leg now draws what it can produce force with from one
 budget, `force_n x UnitConversion::kNToNm x MotionConfig::press_safety` (0.9, so
@@ -164,7 +165,8 @@ frame with nothing but a position term.
 
 **Do not** read this as a force limit. The N is still not force-calibrated (see
 above), and `close()`, which carries no setpoint, still presses
-`kp x max_lead_mm` onto whatever it meets — about 54 N at the defaults.
+`kp x max_lead_mm / rad_to_mm` onto whatever it meets — about 53 N at the config
+defaults (`kp = 100`, `rad_to_mm = 75.44`).
 
 Three things change for a consumer:
 
