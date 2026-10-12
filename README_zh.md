@@ -37,20 +37,60 @@ ctest --test-dir build --output-on-failure
 
 `ctest` 不需要硬件、不需要 CAN 接口、也不需要 root（见 [测试](#测试)）。
 
+### 安装
+
+```bash
+cmake --install build --prefix "$HOME/.local"
+```
+
+安装会把库、头文件、随包标定数据和 CMake / pkg-config 文件写进这个前缀 ——
+你的工程能用上 SDK 靠的就是这一步。默认前缀是 `/usr/local`，需要 `sudo`。
+
 ### 在你的工程里使用
 
-作为 CMake 包：
+一个完整的工程，作为 CMake 包：
 
 ```cmake
+cmake_minimum_required(VERSION 3.16)
+project(my_app CXX)
+
 find_package(litegrip_cpp REQUIRED)
+
+add_executable(my_app main.cpp)
 target_link_libraries(my_app PRIVATE litegrip_cpp::litegrip_cpp)
 ```
 
-已安装时也可以当 pkg-config 模块用：
+```bash
+cmake -S . -B build -DCMAKE_PREFIX_PATH="$HOME/.local"
+cmake --build build
+```
+
+**不要把 `~/.local` 写进 `CMAKE_PREFIX_PATH`**：CMake 不展开 `~`，它会去找一个
+名字就叫 `~` 的目录，然后报 "Could not find a package configuration file"。
+用 `$HOME` 或绝对路径。
+
+也可以当 pkg-config 模块用，前提是已经安装：
 
 ```bash
-pkg-config --cflags --libs litegrip_cpp
+g++ -std=c++17 $(pkg-config --cflags litegrip_cpp) main.cpp \
+    $(pkg-config --libs litegrip_cpp) -o my_app
 ```
+
+前缀不是标准位置时，先设
+`PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig"`。构建目录里留下的
+`litegrip_cpp.pc` 是**未安装**的那一份 —— 它的路径是相对最终落地位置写的，
+把 `PKG_CONFIG_PATH` 指向 `build/` 只会得到一堆不存在的路径。用安装好的那份。
+
+**还要让程序找得到标定数据。** SDK 会先到运行中的程序旁边找随包文件（见
+[随包文件在哪里找](#随包文件在哪里找)），所以自己所在目录不在那个前缀里的程序
+—— 也就是常态，比如在自己工程的 `build/` 里 —— 需要这个覆盖：
+
+```bash
+LITEGRIP_DATA_DIR="$HOME/.local/share/litegrip_cpp" ./my_app
+```
+
+不设的话搜索会一无所获，`load_calibration()` 打印它试过的路径并返回 `false`
+（见 [长期可用](#长期可用)）。
 
 ## 2. 起 CAN
 
@@ -237,7 +277,9 @@ SDK 从不猜方向：标定或模板载入之前，每个运动入口都抛 `Co
 int main() {
   litegrip::GripperConfig cfg;             // can0, can_id 0x08, DM4310
   auto gripper = litegrip::LiteGrip::connect_raii(cfg);
-  gripper.load_calibration();              // 本通道的文件，取不到则用出厂标定
+  // 本通道的文件，取不到则用出厂标定。找不到时它返回 false（并打印试过的路径），
+  // 不是抛异常，所以要检查：没有标定的话，第一次运动才会抛。
+  if (!gripper.load_calibration()) return 1;
   if (!gripper.init()) return 1;           // 使能并保持当前位置
 
   const litegrip::MoveResult open = gripper.open();
@@ -252,9 +294,14 @@ int main() {
 }
 ```
 
-它张开到一端、闭合到另一端，打印每次运动停在哪里、用了多大力矩，只有两次都
-成功才退出 0。空载时两次都会报 `stalled`，那是预期中的成功（见
-[读结果](#读结果)）。若夹爪朝反方向动，见第 3 步。
+它张开到张侧的工作点、闭合到闭侧的机械止挡，打印每次运动停在哪里、用了多大力
+矩，只有两次都成功才退出 0。在随包的出厂标定下这两次报的东西不一样，但都是成
+功 —— 见 [工作行程](#工作行程)：
+
+- `close` 压到止挡上：`stalled=1` 且 `reached=0`，就是 [读结果](#读结果) 里解释的那个组合。
+- `open` 只是一次到 80 mm 工作点的普通定位运动，会正常到达：`reached=1`、`stalled=0`。
+
+若夹爪朝反方向动，见第 3 步。
 
 ⚠ 本仓库**没有可运行的行程测试**：`examples/` 里只有 `version_info.cpp`，会开
 CAN、会驱动电机的示例还没写。上面这段程序就是全部测试，而且把它编译起来本身
@@ -268,7 +315,9 @@ CAN、会驱动电机的示例还没写。上面这段程序就是全部测试�
 int main() {
   litegrip::GripperConfig cfg;          // can0, can_id 0x08, DM4310
   auto gripper = litegrip::LiteGrip::connect_raii(cfg);
-  gripper.load_calibration();           // 本通道的文件，取不到则用出厂标定
+  if (!gripper.load_calibration()) {    // 本通道的文件，取不到则用出厂标定
+    return 1;                           // 返回 false 而不是抛异常：什么都没找到
+  }
   gripper.init();                       // 使能并保持当前位置
 
   gripper.open();                                          // 到张开侧工作点或止点
@@ -367,7 +416,9 @@ SDK 中 N 值**未经力标定**，不要拿它做力受限的行为。见 [力�
 多少力矩由驱动器自己算，是 `kp × 领先 + kd × 指令速度`，与设定的力无关。默认那条
 4 mm 行进段上限在配置默认值下（`kp = 100`、`rad_to_mm = 75.44`）等于
 `kp × max_lead_mm / rad_to_mm` = 5.30 Nm ≈ 53 N，所以改动之前 5 N 的夹取和 40 N
-的夹取是拿同样的 53 N 撞上去的。
+的夹取是拿同样的 53 N 撞上去的。这里的 `75.44` 是 `UnitConversion::kRadToMm`，
+是**未标定**配置带的那个比例（`kSpanMm / 1.14`）；标定过的夹爪用自己文件里的比
+例 —— 随包出厂标定是 61.0123 —— 同样的行进段在它上面压得更重，6.56 Nm ≈ 66 N。
 
 这一段现在让一帧能出力的每一项都从同一个预算里取：
 `force_n × UnitConversion::kNToNm × MotionConfig::press_safety`（0.9，于是压出的
@@ -497,6 +548,7 @@ SDK 中 N 值**未经力标定**，不要拿它做力受限的行为。见 [力�
 | --- | --- |
 | `ConnectError: CAN interface 'can0' not found` | 接口没起，或适配器没加载。跑第 2 步；用 `ip link show can0` 查。 |
 | `CommandError: not calibrated: pos_closed_rad / pos_open_rad are still the placeholder defaults ...` | 没有载入标定也没有载入模板，哪一端是闭合侧无从判断。按第 4 步跑 `load_calibration()`、`load_template(...)` 或 `zero()`。 |
+| `load_calibration()` 打印 "no calibration found" 并返回 `false` | 它试的三个文件都读不到：本通道自己的、旧的单文件、随包的出厂文件。最后一个把 `$LITEGRIP_DATA_DIR` 指向放着 `calibration/` 的目录即可 —— [安装](#安装)之后是 `$HOME/.local/share/litegrip_cpp`。 |
 | `GripperConfig::mount()` 返回 `nullopt` | 同一件事，只是还没走到报错：标定或模板载入之前不报方向。 |
 | `CommandError: ... is not a finite number ...`，或 `LimitViolation: speed ... exceeds the commanded-velocity ceiling` | 目标值/速率是 NaN、inf，或速度超过上限。刻意在入口拒绝 —— 一帧都没发。 |
 | 夹爪朝反方向动 | 安装方向问题。见第 3 步：正装什么都不用声明，反装调 `load_template("reverse")`。 |
