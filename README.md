@@ -41,20 +41,65 @@ ctest --test-dir build --output-on-failure
 `ctest` needs no hardware, no CAN interface and no root (see
 [Testing](#testing)).
 
+### Install it
+
+```bash
+cmake --install build --prefix "$HOME/.local"
+```
+
+Installing writes the library, the headers, the packaged calibration data and
+the CMake / pkg-config files under that prefix, which is what makes the SDK
+usable from a project of your own. The default prefix is `/usr/local` and needs
+`sudo`.
+
 ### Consume it from your project
 
-As a CMake package:
+A whole project, as a CMake package:
 
 ```cmake
+cmake_minimum_required(VERSION 3.16)
+project(my_app CXX)
+
 find_package(litegrip_cpp REQUIRED)
+
+add_executable(my_app main.cpp)
 target_link_libraries(my_app PRIVATE litegrip_cpp::litegrip_cpp)
 ```
 
-Or as a pkg-config module, when the SDK is installed:
+```bash
+cmake -S . -B build -DCMAKE_PREFIX_PATH="$HOME/.local"
+cmake --build build
+```
+
+**Do not** put `~/.local` in `CMAKE_PREFIX_PATH`: CMake does not expand `~`, so
+it looks for a directory literally named `~` and fails with "Could not find a
+package configuration file". Use `$HOME` or an absolute path.
+
+Or with `pkg-config`, once installed:
 
 ```bash
-pkg-config --cflags --libs litegrip_cpp
+g++ -std=c++17 $(pkg-config --cflags litegrip_cpp) main.cpp \
+    $(pkg-config --libs litegrip_cpp) -o my_app
 ```
+
+Set `PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig"` first unless the prefix is a
+standard one. The `litegrip_cpp.pc` the build leaves in `build/` is the
+uninstalled copy — its paths are relative to where the file ends up, so
+pointing `PKG_CONFIG_PATH` at `build/` reports paths that do not exist. Use the
+installed one.
+
+**Point the program at the calibration data.** The SDK looks for the packaged
+files beside the running program first (see [Where the packaged files are
+found](#where-the-packaged-files-are-found)), so a program whose own directory
+is not under that prefix — the usual case, a program built in your project's
+`build/` — needs the override:
+
+```bash
+LITEGRIP_DATA_DIR="$HOME/.local/share/litegrip_cpp" ./my_app
+```
+
+Without it the search finds nothing, and `load_calibration()` prints what it
+tried and returns `false` (see [Keep it working](#keep-it-working)).
 
 ## 2. Bring up CAN
 
@@ -276,7 +321,10 @@ calibration change or repair:
 int main() {
   litegrip::GripperConfig cfg;             // can0, can_id 0x08, DM4310
   auto gripper = litegrip::LiteGrip::connect_raii(cfg);
-  gripper.load_calibration();              // this channel's file, else the factory one
+  // This channel's file, else the factory one. It RETURNS false when none was
+  // found — having printed what it tried — rather than throwing, so check it:
+  // without a calibration the first move throws instead.
+  if (!gripper.load_calibration()) return 1;
   if (!gripper.init()) return 1;           // enable and hold the current position
 
   const litegrip::MoveResult open = gripper.open();
@@ -291,11 +339,15 @@ int main() {
 }
 ```
 
-It opens to one limit, closes to the other, prints where each move ended and how
-hard it pushed, and exits 0 only if both succeeded. On an empty gripper both
-moves report `stalled` — that is the expected success (see
-[Reading the results](#reading-the-results)). If the jaws move the wrong way,
-see step 3.
+It opens to the open-side work point, closes onto the closed-side stop, prints
+where each move ended and how hard it pushed, and exits 0 only if both
+succeeded. On the shipped factory calibration the two moves report different
+things, and both are success — see [The work stroke](#the-work-stroke):
+
+- `close` presses onto the stop: `stalled=1`, `reached=0` (see [Reading the results](#reading-the-results)).
+- `open` is an ordinary positioning move to the 80 mm work point, so it arrives: `reached=1`, `stalled=0`.
+
+If the jaws move the wrong way, see step 3.
 
 ⚠ This repository ships **no runnable stroke test**: `examples/` holds only
 `version_info.cpp`, and the examples that open CAN and drive the motor are still
@@ -310,7 +362,9 @@ it is also what proves your project can link the SDK.
 int main() {
   litegrip::GripperConfig cfg;          // can0, can_id 0x08, DM4310
   auto gripper = litegrip::LiteGrip::connect_raii(cfg);
-  gripper.load_calibration();           // this channel's file, else the packaged factory one
+  if (!gripper.load_calibration()) {    // this channel's file, else the packaged factory one
+    return 1;                           // false, not a throw: it found nothing to load
+  }
   gripper.init();                       // enable and hold current position
 
   gripper.open();                                          // to the open-side work point or stop
@@ -426,7 +480,11 @@ about 1.3 s of streaming, where it used to be 0.3 s. `duration_s = 0` means
 `kp x lead + kd x dq`, which has nothing to do with the force being asked for.
 The default 4 mm travel lead presses `kp x max_lead_mm / rad_to_mm` = 5.30 Nm ≈
 53 N at the config defaults (`kp = 100`, `rad_to_mm = 75.44`), so before this
-change a 5 N grasp arrived at the same 53 N as a 40 N one.
+change a 5 N grasp arrived at the same 53 N as a 40 N one. That `75.44` is
+`UnitConversion::kRadToMm`, the scale an *uncalibrated* config carries
+(`kSpanMm / 1.14`); a calibrated gripper uses the scale from its own file —
+61.0123 on the shipped factory calibration — and the same lead presses harder
+there, 6.56 Nm ≈ 66 N.
 
 Every frame of that leg now draws what it can produce force with from one
 budget, `force_n x UnitConversion::kNToNm x MotionConfig::press_safety` (0.9, so
@@ -595,6 +653,7 @@ These are the safety argument and must not be relaxed:
 | --- | --- |
 | `ConnectError: CAN interface 'can0' not found` | The interface is down or the adapter is not loaded. Run step 2; check `ip link show can0`. |
 | `CommandError: not calibrated: pos_closed_rad / pos_open_rad are still the placeholder defaults ...` | No calibration or template is loaded, so which end is closed is a guess. Run `load_calibration()`, `load_template(...)`, or `zero()` from step 4. |
+| `load_calibration()` prints "no calibration found" and returns `false` | None of the three files it tried could be read: this channel's own, the legacy one, then the packaged factory file. For that last one, point `$LITEGRIP_DATA_DIR` at the directory holding `calibration/` — `$HOME/.local/share/litegrip_cpp` after [Install it](#install-it). |
 | `GripperConfig::mount()` returns `nullopt` | The same thing, before it becomes an error: direction is not reported until a calibration or a template is loaded. |
 | `CommandError: ... is not a finite number ...`, or `LimitViolation: speed ... exceeds the commanded-velocity ceiling` | A NaN / inf target or rate, or a speed above the ceiling. Refused at the entry, deliberately — nothing was sent. |
 | The jaws move the wrong way | The mount direction. See step 3 — normal-mount units declare nothing, reverse ones call `load_template("reverse")`. |
