@@ -128,6 +128,13 @@ class LiteGrip : private MotionIo {
   /// travel-leg torque protection ends the move (`protection_tripped`), which
   /// leaves the gripper limp for MotionConfig::stop_release_s.
   ///
+  /// One exception to the press: when GripperConfig::work_stroke_mm sits
+  /// strictly inside the measured travel, open() stops AT that point instead
+  /// of pressing the stop — an ordinary positioning move, so `ok` is `reached
+  /// and not stalled`. `limit_rad` still reports the open-side calibrated
+  /// limit, which the target stops short of. close() has no equivalent: force
+  /// control happens through grasp().
+  ///
   /// Breaking change: the old open(kp, kd, duration) / close(kp, kd, force_n,
   /// duration) signatures are gone. close() takes no force at all — the
   /// online Python SDK's close() doesn't either; use grasp() to close onto an

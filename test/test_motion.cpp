@@ -358,6 +358,50 @@ void test_targets() {
       [&] { press_target(zero, Toward::kClose, 0.05); }, "zero travel refuses");
 }
 
+// ── the work stroke's target (Python work_limit_target, dumped) ──────────
+
+void test_work_limit_target() {
+  const GripperConfig cfg = test_config();
+  const double travel_mm =
+      std::fabs(cfg.pos_open_rad - cfg.pos_closed_rad) * cfg.rad_to_mm;
+  const TargetSpec work = work_limit_target(cfg, 80.0);
+
+  // INSIDE the open limit by an explicit number of millimetres — not a travel
+  // fraction, and not past the stop the way press_target goes.
+  check_near(work.limit_rad, kPosOpenRad, 0.0, "work: limit is the open stop");
+  check_near(work.offset_rad, 80.0 / kRadToMm, 1e-12, "work: 80 mm in rad");
+  check_near(work.target_rad, kPosClosedRad - 80.0 / kRadToMm, 1e-12,
+             "work: target from the closed zero");
+  check(work.target_rad > kPosOpenRad, "work: the target is short of the stop");
+  check_near(work.travel_rad, std::fabs(kPosClosedRad - kPosOpenRad), 1e-12,
+             "work: travel reported");
+
+  // At or past the measured travel it clamps to the travel — "open as far as
+  // it goes" — instead of refusing a stroke this unit does not have.
+  const TargetSpec full = work_limit_target(cfg, travel_mm + 50.0);
+  check_near(full.offset_rad, work.travel_rad, 1e-12,
+             "work: clamped to the travel");
+  check_near(full.target_rad, kPosOpenRad, 1e-12,
+             "work: a full stroke is the open stop");
+
+  // Reverse mount: open is the numerically LARGER side, so the mirror runs the
+  // other way. close_sign() carries it.
+  const GripperConfig rev = test_config(/*reverse=*/true);
+  const TargetSpec r = work_limit_target(rev, 80.0);
+  check_near(r.limit_rad, kPosClosedRad, 0.0, "reverse work: open stop");
+  check_near(r.target_rad, kPosOpenRad + 80.0 / kRadToMm, 1e-12,
+             "reverse work: mirrored target");
+  check(r.target_rad < kPosClosedRad, "reverse work: short of the stop");
+
+  GripperConfig uncal;
+  check_throws<CommandError>([&] { work_limit_target(uncal, 80.0); },
+                             "work: uncalibrated refuses");
+  GripperConfig zero = test_config();
+  zero.pos_open_rad = zero.pos_closed_rad;
+  check_throws<CommandError>([&] { work_limit_target(zero, 80.0); },
+                             "work: zero travel refuses");
+}
+
 // ── open/close parity (Python dump S1/S2) ────────────────────────────────
 
 void test_close_from_inside_red() {
@@ -515,6 +559,85 @@ void test_every_frame_stays_inside_the_calibrated_travel() {
                "travel bound: reverse close ends AT the calibrated limit");
     check(res.ok && res.stalled, "travel bound: reverse close reports the stop");
   }
+}
+
+// ── open() with a work stroke ────────────────────────────────────────────
+//
+// Without one, open() presses onto the mechanical stop and reports a stall.
+// With one it is an ordinary positioning move to a point INSIDE the open
+// limit: the jaws arrive and stop, so `ok = reached and not stalled`, and the
+// opening end of the travel is left unused (the field convention: 85 mm of
+// travel, 80 mm of work, 5 mm held back).
+
+void test_open_stops_short_when_a_work_stroke_is_set() {
+  GripperConfig cfg = test_config();
+  cfg.work_stroke_mm = 80.0;
+  FakeIo io(cfg, /*start_rad=*/ kPosClosedRad, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  const MoveResult res = engine.open();
+  const double target = kPosClosedRad - 80.0 / kRadToMm;
+  check(res.ok, "work open: ok (a positioning move that arrived)");
+  check(res.reached, "work open: reached");
+  check(!res.stalled, "work open: nothing stalled — it stopped by itself");
+  check_near(res.target_rad, target, 1e-12, "work open: target");
+  check_near(
+      res.limit_rad, kPosOpenRad, 0.0,
+      "work open: limit still reports the open stop the target stops short of");
+  check_near(res.final_cmd_rad, target, 1e-9, "work open: final command");
+  check_near(io.frames.back().pos_after, target, 1e-6,
+             "work open: parked at the work point");
+  check(io.frames.back().pos_after > kPosOpenRad,
+        "work open: never touched the open stop");
+  check_frames_inside_travel(io, "work open");
+}
+
+void test_open_still_presses_the_stop_without_a_work_stroke() {
+  // 0 is "no limit", and a stroke at or past the travel means the same thing:
+  // both fall back to the press-onto-the-stop path.
+  const double travel_mm = std::fabs(kPosClosedRad - kPosOpenRad) * kRadToMm;
+  for (const double stroke : {0.0, travel_mm, travel_mm + 25.0}) {
+    GripperConfig cfg = test_config();
+    cfg.work_stroke_mm = stroke;
+    FakeIo io(cfg, /*start_rad=*/ kPosClosedRad, std::nullopt, 0.0,
+              /*stops=*/true);
+    SafetyGuard guard = make_guard();
+    MotionEngine engine(io, guard, instant_config());
+
+    const MoveResult res = engine.open();
+    check(res.ok && res.stalled && !res.reached,
+          "no work stroke: presses onto the stop");
+    check_near(io.frames.back().q, kPosOpenRad, 0.0,
+               "no work stroke: command reaches the open limit");
+    check_near(io.frames.back().pos_after, kPosOpenRad, 1e-12,
+               "no work stroke: parked on the stop");
+    check_near(res.target_rad,
+               press_target(cfg, Toward::kOpen,
+                            instant_config().press_overshoot)
+                   .target_rad,
+               1e-12, "no work stroke: the press target");
+  }
+}
+
+void test_a_work_stroke_reaches_the_work_point_on_a_reverse_mount() {
+  GripperConfig cfg = test_config(/*reverse=*/true);
+  cfg.work_stroke_mm = 80.0;
+  FakeIo io(cfg, /*start_rad=*/ cfg.pos_closed_rad, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  const MoveResult res = engine.open();
+  const double target = cfg.pos_closed_rad + 80.0 / kRadToMm;
+  check(res.ok && res.reached && !res.stalled, "reverse work open: arrived");
+  check_near(res.target_rad, target, 1e-12, "reverse work open: target");
+  check_near(res.limit_rad, cfg.pos_open_rad, 0.0,
+             "reverse work open: limit is the open stop (the larger number)");
+  check_near(io.frames.back().pos_after, target, 1e-6,
+             "reverse work open: parked at the work point");
+  check_frames_inside_travel(io, "reverse work open");
 }
 
 void test_an_uncalibrated_config_is_refused_before_any_frame() {
@@ -2037,8 +2160,12 @@ void test_litegrip_forwarding() {
 
 int main() {
   test_targets();
+  test_work_limit_target();
   test_close_from_inside_red();
   test_open_from_inside_red();
+  test_open_stops_short_when_a_work_stroke_is_set();
+  test_open_still_presses_the_stop_without_a_work_stroke();
+  test_a_work_stroke_reaches_the_work_point_on_a_reverse_mount();
   test_clamp_to_travel();
   test_every_frame_stays_inside_the_calibrated_travel();
   test_an_uncalibrated_config_is_refused_before_any_frame();

@@ -166,6 +166,27 @@ TargetSpec press_target(const GripperConfig& config, Toward toward,
   return make_target(config, toward, overshoot, /*press=*/true);
 }
 
+TargetSpec work_limit_target(const GripperConfig& config, double work_stroke_mm) {
+  check_calibrated(config);
+  const double travel =
+      std::fabs(config.pos_open_rad - config.pos_closed_rad);
+  const double travel_mm = travel * config.rad_to_mm;
+  // Clamped, not refused: a work stroke at or past the travel means "open as far
+  // as it goes", which is a legitimate ask even for a stroke larger than this
+  // unit has.
+  const double stroke_mm = std::max(0.0, std::min(work_stroke_mm, travel_mm));
+  const double work_rad = stroke_mm / config.rad_to_mm;
+
+  TargetSpec spec;
+  // From the closed zero, toward the open end — which is the direction
+  // close_sign() points away from.
+  spec.target_rad = config.pos_closed_rad - config.close_sign() * work_rad;
+  spec.limit_rad = config.pos_open_rad;
+  spec.offset_rad = work_rad;
+  spec.travel_rad = travel;
+  return spec;
+}
+
 /// Split a force-carrying approach frame's torque budget across the three terms
 /// that can produce force. The header carries the derivation and the reason the
 /// damping is served before the lead.
@@ -431,16 +452,28 @@ void MotionEngine::recover_to_interior(const char* source) {
 // ── the ramp (Python actions._move_to_limit) ─────────────────────────────
 
 MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
-                                       bool press, std::optional<double> force_n,
+                                       bool press,
+                                       std::optional<double> target_rad,
+                                       std::optional<double> force_n,
                                        const char* source,
                                        const MoveProgressCallback& progress) {
   check_entry(source);
   const GripperConfig& gcfg = io_.config();
 
-  // Target first: an uncalibrated config must fail BEFORE anything moves.
+  // Target first: an uncalibrated config must fail BEFORE anything moves. An
+  // explicit target makes this an ordinary positioning move — there is no stop
+  // to press onto — and the limit is only carried for reporting.
+  if (target_rad.has_value()) {
+    press = false;
+  }
   const TargetSpec spec =
-      press ? press_target(gcfg, toward, config_.press_overshoot)
-            : limit_target(gcfg, toward, config_.margin);
+      target_rad.has_value()
+          ? TargetSpec{*target_rad,
+                       toward == Toward::kClose ? gcfg.pos_closed_rad
+                                                : gcfg.pos_open_rad,
+                       0.0, 0.0}
+          : (press ? press_target(gcfg, toward, config_.press_overshoot)
+                   : limit_target(gcfg, toward, config_.margin));
   const double target = spec.target_rad;
   const double limit = spec.limit_rad;
 
@@ -643,15 +676,28 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
 MoveResult MotionEngine::open(std::optional<double> speed_mm_s,
                               MoveProgressCallback progress) {
   const double speed = speed_mm_s.value_or(config_.speed_mm_s);
-  return move_to_limit(Toward::kOpen, speed, /*press=*/true, std::nullopt, "open",
-                       progress);
+  const GripperConfig& gcfg = io_.config();
+  // A configured work stroke that sits INSIDE the travel means "open only this
+  // far and leave the mechanical stop alone", so the move is an ordinary
+  // positioning one. The bounds are deliberately strict: a stroke of zero says
+  // nothing was asked for, and one at or past the travel asks for the whole
+  // stroke, which is the press-onto-the-stop path this replaces.
+  const double travel_mm =
+      std::fabs(gcfg.pos_open_rad - gcfg.pos_closed_rad) * gcfg.rad_to_mm;
+  if (0.0 < gcfg.work_stroke_mm && gcfg.work_stroke_mm < travel_mm) {
+    const TargetSpec spec = work_limit_target(gcfg, gcfg.work_stroke_mm);
+    return move_to_limit(Toward::kOpen, speed, /*press=*/false, spec.target_rad,
+                         std::nullopt, "open", progress);
+  }
+  return move_to_limit(Toward::kOpen, speed, /*press=*/true, std::nullopt,
+                       std::nullopt, "open", progress);
 }
 
 MoveResult MotionEngine::close(std::optional<double> speed_mm_s,
                                MoveProgressCallback progress) {
   const double speed = speed_mm_s.value_or(config_.speed_mm_s);
   return move_to_limit(Toward::kClose, speed, /*press=*/true, std::nullopt,
-                       "close", progress);
+                       std::nullopt, "close", progress);
 }
 
 // ── grasp / force hold ───────────────────────────────────────────────────
@@ -672,8 +718,8 @@ GraspResult MotionEngine::grasp(std::optional<double> force_n, double hold_s,
   // setpoint's force, so the torque it meets the workpiece with is bounded by
   // the same setpoint it will hold (force_approach_terms).
   const MoveResult move = move_to_limit(Toward::kClose, config_.grasp_speed_mm_s,
-                                        /*press=*/false, force, "grasp",
-                                        progress);
+                                        /*press=*/false, std::nullopt, force,
+                                        "grasp", progress);
   const HoldOutcome hold = hold_force(force, hold_s, progress);
 
   GraspResult result;
