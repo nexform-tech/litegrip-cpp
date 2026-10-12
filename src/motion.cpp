@@ -83,19 +83,30 @@ int frame_count_trunc(double ratio) {
   return static_cast<int>(ratio);
 }
 
+/// Refuse a target or a rate that is not a finite number, before any arithmetic
+/// gets to answer it with something real.
+///
+/// A NaN does not stay a NaN on the way down, and what it turns into is not
+/// obvious: every comparison is FALSE against it, so it slips past the
+/// "nothing to do" shortcuts; a NaN target then comes out of the min/max clamp
+/// as one of the calibrated limits — a real position that was never asked for,
+/// driven to as if the caller had asked for it — while a NaN rate becomes a NaN
+/// dq that only send_frame() refuses, i.e. mid-move, once the ramp has already
+/// started. Neither is a refusal at the entry, which is what Python does at
+/// these same sites (gripper.py goto_rad / move_at_speed / _move_at_speed_rad)
+/// and for the same reason.
+void check_finite(const char* source, const char* name, double value) {
+  if (!std::isfinite(value)) {
+    throw CommandError(std::string(source) + ": " + name +
+                       " is not a finite number (" + std::to_string(value) +
+                       ") — command not sent");
+  }
+}
+
 TargetSpec make_target(const GripperConfig& config, Toward toward, double amount,
                        bool press) {
-  if (!config.calibrated) {
-    throw CommandError(
-        "not calibrated: pos_closed_rad / pos_open_rad are still the "
-        "placeholder defaults, so which end is which is a guess — run "
-        "load_calibration() or a calibration routine first");
-  }
+  check_calibrated(config);
   const double travel = std::fabs(config.pos_closed_rad - config.pos_open_rad);
-  if (!(travel > 1e-6)) {
-    throw CommandError(
-        "zero travel: pos_closed_rad == pos_open_rad — recalibrate");
-  }
   const double limit = toward == Toward::kClose ? config.pos_closed_rad
                                                 : config.pos_open_rad;
   const bool closing = toward == Toward::kClose;
@@ -113,6 +124,33 @@ TargetSpec make_target(const GripperConfig& config, Toward toward, double amount
 }
 
 }  // namespace
+
+// ── the calibrated travel (rationale in motion.hpp) ──────────────────────
+
+void check_calibrated(const GripperConfig& config) {
+  if (!config.calibrated) {
+    throw CommandError(
+        "not calibrated: pos_closed_rad / pos_open_rad are still the "
+        "placeholder defaults, so which end is which is a guess — run "
+        "load_calibration() or a calibration routine first");
+  }
+  if (!(std::fabs(config.pos_closed_rad - config.pos_open_rad) > 1e-6)) {
+    throw CommandError(
+        "zero travel: pos_closed_rad == pos_open_rad — recalibrate");
+  }
+}
+
+double clamp_to_travel(const GripperConfig& config, double q) {
+  if (!config.calibrated) {
+    // No real travel to clamp into: the placeholder limits describe a
+    // different unit's geometry, and a clamp built from them would move the
+    // command somewhere no one asked for. See the header.
+    return q;
+  }
+  const double lo = std::min(config.pos_closed_rad, config.pos_open_rad);
+  const double hi = std::max(config.pos_closed_rad, config.pos_open_rad);
+  return std::max(lo, std::min(hi, q));
+}
 
 TargetSpec limit_target(const GripperConfig& config, Toward toward,
                         double margin) {
@@ -241,10 +279,13 @@ void MotionEngine::send_frame(double q, std::optional<double> kp,
   }
 }
 
-void MotionEngine::emit(double q, double dq, double tau, std::optional<double> kp,
-                        std::optional<double> kd, const char* source) {
-  send_frame(q, kp, kd, dq, tau, source);
+double MotionEngine::emit(double q, double dq, double tau,
+                          std::optional<double> kp, std::optional<double> kd,
+                          const char* source) {
+  const double sent = clamp_to_travel(io_.config(), q);
+  send_frame(sent, kp, kd, dq, tau, source);
   sleep_s(config_.frame_interval);
+  return sent;
 }
 
 // ── the recovery drive-in ─────────────────────────────────────────────────
@@ -488,8 +529,10 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
     const double lead = (q_sched - pos) * sign;
     const double cmd = lead > lead_cap_rad ? pos + sign * lead_cap_rad : q_sched;
 
-    last_cmd = cmd;
-    emit(cmd, dq, 0.0, std::nullopt, kd_frame, source);
+    // emit() returns what actually went out (clamped into the calibrated
+    // travel), so the reported final command is the sent one, not the
+    // computed one.
+    last_cmd = emit(cmd, dq, 0.0, std::nullopt, kd_frame, source);
     last_i = i;
 
     if (i % sample_every != 0 && i != total_steps) {
@@ -515,7 +558,7 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
       snapshot.phase = MovePhase::kMove;
       snapshot.i = i;
       snapshot.total_steps = total_steps;
-      snapshot.cmd_rad = cmd;
+      snapshot.cmd_rad = last_cmd;
       snapshot.pos_rad = pos;
       snapshot.delta_rad = hist[n - 1] - hist[n - 2];
       snapshot.win_delta_rad = win_delta;
@@ -760,6 +803,14 @@ bool MotionEngine::move_at_speed(double target_mm, double speed_mm_s,
                                  std::optional<double> kp,
                                  std::optional<double> kd) {
   check_entry("move_at_speed");
+  // The target is expressed in mm from the calibrated closed end, so without a
+  // calibration there is no frame to express it in. Refuse before anything
+  // moves: a refusal after a frame has gone out is not a refusal.
+  check_calibrated(io_.config());
+  // Before the "nothing to do" shortcuts below, not after: both compare FALSE
+  // against a NaN, so it would slip past them and reach the ramp arithmetic.
+  check_finite("move_at_speed", "target_mm", target_mm);
+  check_finite("move_at_speed", "speed_mm_s", speed_mm_s);
   // MOVE entry: establish legality before considering the requested
   // displacement — a no-op move must not leave the gripper outside the red
   // lines for the next caller to deal with.
@@ -793,6 +844,12 @@ bool MotionEngine::move_at_speed_rad(double target_rad, double speed_rad_s,
                                      std::optional<double> kp,
                                      std::optional<double> kd) {
   check_entry("move_at_speed_rad");
+  // The target is clamped into [pos_open_rad, pos_closed_rad] below, which is
+  // the calibrated travel only when there is a calibration; the placeholder
+  // limits describe another unit's geometry.
+  check_calibrated(io_.config());
+  check_finite("move_at_speed_rad", "target_rad", target_rad);
+  check_finite("move_at_speed_rad", "speed_rad_s", speed_rad_s);
   recover_to_interior("move_at_speed_rad");
 
   const GripperState st = io_.get_state(true);

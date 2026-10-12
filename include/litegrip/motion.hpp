@@ -262,6 +262,41 @@ struct GraspResult {
   explicit operator bool() const noexcept { return ok; }
 };
 
+// ── the calibrated travel ────────────────────────────────────────────────
+
+/// Throw CommandError when the config carries no real calibration: either
+/// `calibrated` is false, so the placeholder limits are still in place and
+/// which end is which is a guess, or the two limits coincide and there is no
+/// travel to move within.
+///
+/// Every motion entry that derives its target from the calibrated travel
+/// refuses here, before anything moves — a refusal after a frame has gone out
+/// is not a refusal. Mirrors the Python SDK's actions._check_calibrated and the
+/// same gate in its gripper.py.
+void check_calibrated(const GripperConfig& config);
+
+/// Clamp a command into this unit's calibrated travel, i.e. into
+/// [min(pos_closed_rad, pos_open_rad), max(pos_closed_rad, pos_open_rad)].
+///
+/// This is the engine's LAST position bound. press_target deliberately aims
+/// PAST the calibrated limit, so open()/close() still press onto the stop; what
+/// this keeps inside is the frame that actually goes out. Without it a command
+/// past the limit drives the jaws that way until something stops them, and when
+/// the real stop is not where the calibration says — a stale calibration, a
+/// damaged or missing stop — nothing does. Mirrors the Python SDK's
+/// actions.clamp_to_travel, which is what its engine applies to every frame.
+///
+/// The ordering of the two ends comes from the mount (close_sign), so min/max
+/// is used rather than assuming one: normal and reverse mounts share this.
+///
+/// ⚠ Deliberate difference from Python, which clamps unconditionally because
+/// every path through its engine has already required a calibration: here an
+/// UNCALIBRATED config is returned UNCHANGED. The placeholder limits
+/// (pos_closed_rad 1.14 / pos_open_rad 0.0) describe no real travel, so
+/// clamping into them is worse than not clamping — the ruling
+/// recover_to_interior() and the force hold's guard follow too.
+double clamp_to_travel(const GripperConfig& config, double q);
+
 // ── target positions ─────────────────────────────────────────────────────
 
 /// Which calibrated end a target aims at.
@@ -283,6 +318,11 @@ TargetSpec limit_target(const GripperConfig& config, Toward toward,
 /// Calibrated limit pushed `overshoot` (travel fraction) PAST — open()/close()
 /// press onto the physical stop, so the endpoint does not depend on the
 /// calibration's accuracy. Same refusals as limit_target().
+///
+/// ⚠ The MOVE aims here, the FRAMES do not go here: emit() clamps every
+/// position into the calibrated travel, so on a unit whose stop really is at
+/// the calibrated limit the command saturates at the limit and the jaws arrive
+/// there without leaning on it. See clamp_to_travel above.
 TargetSpec press_target(const GripperConfig& config, Toward toward,
                         double overshoot);
 
@@ -388,9 +428,18 @@ class MotionEngine {
                   std::optional<double> kd, double dq, double tau,
                   const char* source);
 
-  /// send_frame + sleep(frame_interval) — the move-loop cadence.
-  void emit(double q, double dq, double tau, std::optional<double> kp,
-            std::optional<double> kd, const char* source);
+  /// The move-loop cadence: clamp_to_travel, send_frame, sleep(frame_interval).
+  ///
+  /// Every frame this engine emits on the ramp/hold paths goes through here, so
+  /// "a command never leaves the calibrated travel" is an ENGINE-level
+  /// invariant rather than a property of one piece of arithmetic — which is
+  /// what it takes, because open()/close() aim past the limit on purpose.
+  ///
+  /// Returns the q that was actually sent (the clamped one), so callers report
+  /// `MoveResult::final_cmd_rad` / `MoveProgress::cmd_rad` from what went out
+  /// rather than from what they computed — Python's _emit does the same.
+  double emit(double q, double dq, double tau, std::optional<double> kp,
+              std::optional<double> kd, const char* source);
 
   /// The one ramp engine: absolute schedule from the reading taken before the
   /// move, per-frame lead caps, window-displacement stall criterion, press and

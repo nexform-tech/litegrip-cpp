@@ -377,6 +377,22 @@ bool LiteGrip::goto_rad(double position_rad, std::optional<double> kp,
   check_connected();
   check_enabled();
 
+  // The clamp below is not a safety net while pos_closed_rad / pos_open_rad are
+  // still the placeholder defaults: it is arithmetic on numbers that describe
+  // no real travel, and it produces a real target. On the defaults
+  // goto_mm(40.0) lands at +0.61 rad, past this unit's closed stop at
+  // +0.05 rad, so the jaws are driven into it and press there. Every other
+  // motion already refuses through check_calibrated; this was the way around
+  // it. (Python gripper.py goto_rad has the same gate for the same reason.)
+  check_calibrated(config_);
+  // Finiteness BEFORE that clamp, deliberately: min/max compare FALSE against a
+  // NaN, so the clamp answers it with one of the calibrated limits — a real
+  // position that was never asked for, driven to as if the caller had asked.
+  if (!std::isfinite(position_rad)) {
+    throw CommandError("goto_rad: target position is not a finite number (" +
+                       std::to_string(position_rad) + ") — command not sent");
+  }
+
   const double effective_kp = kp.has_value() ? *kp : config_.kp;
   const double effective_kd = kd.has_value() ? *kd : config_.kd;
 
