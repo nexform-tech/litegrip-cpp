@@ -11,6 +11,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <vector>
 
 #include "litegrip/exceptions.hpp"
@@ -29,32 +30,27 @@ const char* env_or_null(const char* name) {
   return (value != nullptr && value[0] != '\0') ? value : nullptr;
 }
 
-/// Candidate locations for a packaged data file, strongest first.
+/// Directory the running program was started from, or "" when it cannot be
+/// read.
 ///
-/// No machine-dependent path is baked into the source: the installed location
-/// is discovered at run time, with an explicit override for deployments that
-/// move the data elsewhere.
-std::vector<std::string> data_file_candidates(const std::string& relative) {
-  std::vector<std::string> candidates;
-  if (const char* data_dir = env_or_null("LITEGRIP_DATA_DIR")) {
-    candidates.push_back(std::string(data_dir) + "/calibration/" + relative);
+/// Deliberately not the process working directory. The packaged data travels
+/// with the program it was installed alongside — `<prefix>/bin/grip` finds
+/// `<prefix>/share/litegrip_cpp/calibration/` — exactly as the Python SDK's
+/// `__file__` does, so an installed SDK finds its own baseline from any working
+/// directory. A statically linked program has no other self-location: this is
+/// the whole of `/proc/self/exe`'s job here. Linux-only, like the rest of the
+/// SocketCAN layer.
+std::string program_directory() {
+  char buffer[4096];
+  const ssize_t length =
+      ::readlink("/proc/self/exe", buffer, sizeof buffer - 1);
+  if (length <= 0) {
+    return {};
   }
-  candidates.emplace_back("calibration/" + relative);
-  candidates.emplace_back("../calibration/" + relative);
-  candidates.emplace_back(relative);
-  return candidates;
-}
-
-std::string resolve_data_file(const std::string& relative) {
-  const std::vector<std::string> candidates = data_file_candidates(relative);
-  for (const std::string& candidate : candidates) {
-    if (file_exists(candidate)) {
-      return candidate;
-    }
-  }
-  // Nothing found: return the primary candidate so the caller's error message
-  // names a path someone can actually act on.
-  return candidates.front();
+  buffer[length] = '\0';
+  const std::string path(buffer, static_cast<std::size_t>(length));
+  const std::size_t slash = path.find_last_of('/');
+  return slash == std::string::npos ? std::string{} : path.substr(0, slash);
 }
 
 /// The packaged mount templates, in declaration order (normal first).
@@ -74,6 +70,46 @@ constexpr CalibrationTemplate kCalibrationTemplates[] = {
 };
 
 }  // namespace
+
+std::vector<std::string> calibration_data_candidates(
+    const std::string& relative, const std::string& program_dir) {
+  std::vector<std::string> candidates;
+  // 1. An explicit override wins outright.
+  if (const char* data_dir = env_or_null(kDataDirEnvVar)) {
+    candidates.push_back(std::string(data_dir) + "/calibration/" + relative);
+  }
+  // 2. Next to the running program, so an installed SDK finds its own baseline
+  //    from any working directory: <prefix>/bin/<program> beside
+  //    <prefix>/share/litegrip_cpp/calibration/. Also the build tree, where a
+  //    program under build/ sits a level below the source calibration/.
+  if (!program_dir.empty()) {
+    candidates.push_back(program_dir + "/../share/litegrip_cpp/calibration/" +
+                         relative);
+    candidates.push_back(program_dir + "/../calibration/" + relative);
+    candidates.push_back(program_dir + "/calibration/" + relative);
+  }
+  // 3. The working directory, last: these are the only candidates that depend
+  //    on where the caller happens to stand, and a stray `calibration/` in a
+  //    random directory must not outrank the data the program shipped with.
+  candidates.emplace_back("calibration/" + relative);
+  candidates.emplace_back("../calibration/" + relative);
+  candidates.emplace_back(relative);
+  return candidates;
+}
+
+std::string resolve_calibration_data_file(const std::string& relative,
+                                          const std::string& program_dir) {
+  const std::vector<std::string> candidates =
+      calibration_data_candidates(relative, program_dir);
+  for (const std::string& candidate : candidates) {
+    if (file_exists(candidate)) {
+      return candidate;
+    }
+  }
+  // Nothing found: return the strongest candidate so the caller's error message
+  // names a path someone can actually act on.
+  return candidates.front();
+}
 
 std::string default_calibration_path() {
   if (const char* override_path = env_or_null(kCalibEnvVar)) {
@@ -103,9 +139,10 @@ std::string factory_calibration_path() {
   if (const char* explicit_path = env_or_null("LITEGRIP_FACTORY_CALIB")) {
     return explicit_path;
   }
-  // Otherwise the installed location is discovered at run time — no
-  // machine-dependent path is baked into the source.
-  return resolve_data_file("factory_calibration.json");
+  // Otherwise the installed location is derived from where this program sits —
+  // no machine-dependent path is baked into the source.
+  return resolve_calibration_data_file("factory_calibration.json",
+                                       program_directory());
 }
 
 std::vector<std::string> list_calibration_templates() {
@@ -119,7 +156,7 @@ std::vector<std::string> list_calibration_templates() {
 std::string calibration_template_path(const std::string& name) {
   for (const CalibrationTemplate& entry : kCalibrationTemplates) {
     if (name == entry.name) {
-      return resolve_data_file(entry.file);
+      return resolve_calibration_data_file(entry.file, program_directory());
     }
   }
 
