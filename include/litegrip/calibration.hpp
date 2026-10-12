@@ -29,6 +29,14 @@ namespace litegrip {
 /// Environment variable overriding the user calibration path.
 inline constexpr const char* kCalibEnvVar = "LITEGRIP_CALIB";
 
+/// Environment variable naming the directory that holds the packaged data
+/// (`<dir>/calibration/<file>`), searched before anything else.
+///
+/// `litegrip_cpp_DATA_DIR` in the CMake package config reports the installed
+/// location. Use one of the two when the run-time search cannot find the
+/// baseline — a deployment that moves the data, for instance.
+inline constexpr const char* kDataDirEnvVar = "LITEGRIP_DATA_DIR";
+
 /// Legacy user calibration path: $LITEGRIP_CALIB, else
 /// ~/.litegrip/litegrip_calibration.json.
 ///
@@ -48,6 +56,23 @@ std::string default_calibration_path();
 std::string default_calibration_path(const std::string& channel);
 
 /// Path of the packaged factory calibration (read-only fallback).
+///
+/// $LITEGRIP_FACTORY_CALIB wins outright. Otherwise the file is searched for in
+/// this order, first hit first:
+///
+///   1. `$LITEGRIP_DATA_DIR/calibration/`
+///   2. next to the running program: `<dir>/../share/litegrip_cpp/calibration/`,
+///      then `<dir>/../calibration/`, then `<dir>/calibration/`, where `<dir>`
+///      is the program's own directory, read from `/proc/self/exe`
+///   3. the process working directory: `calibration/`, `../calibration/`, `.`
+///
+/// Nothing machine-dependent is compiled in: entry 2 is what lets an installed
+/// SDK (`<prefix>/bin/grip` beside `<prefix>/share/litegrip_cpp/calibration/`)
+/// find its own baseline from any working directory. Entry 3 is last because it
+/// is the only one that depends on where the caller happens to stand.
+///
+/// When no candidate exists the strongest is returned anyway, so the caller's
+/// error message can name a path to act on. Mirrors gripper._FACTORY_CALIB.
 std::string factory_calibration_path();
 
 /// Names of the packaged mount templates, in declaration order.
@@ -58,12 +83,29 @@ std::string factory_calibration_path();
 /// would silently rewrite what the caller set. Mirrors gripper.list_templates().
 std::vector<std::string> list_calibration_templates();
 
+/// The locations searched for a packaged data file, strongest first, for a
+/// program running from `program_dir` (pass an empty string for a program whose
+/// own directory cannot be read).
+///
+/// Exposed for diagnosis: when a baseline is not found, this is how a caller
+/// prints what was tried instead of guessing. The order is the one documented
+/// on factory_calibration_path().
+std::vector<std::string> calibration_data_candidates(
+    const std::string& relative, const std::string& program_dir);
+
+/// The packaged data file `relative`, resolved for a program running from
+/// `program_dir`: the first candidate that exists, or the strongest candidate
+/// when none does (so the caller's error message names a path to act on).
+std::string resolve_calibration_data_file(const std::string& relative,
+                                          const std::string& program_dir);
+
 /// Path of a packaged mount template.
 ///
-/// Throws CommandError for an unknown name — never falls back to the factory
-/// file. The factory file is a *normal* mount, so answering a request for
-/// "reverse" with "normal" is precisely the failure the template name exists to
-/// prevent. Mirrors gripper._resolve_template().
+/// Found by the same search as factory_calibration_path(). Throws CommandError
+/// for an unknown name — never falls back to the factory file. The factory file
+/// is a *normal* mount, so answering a request for "reverse" with "normal" is
+/// precisely the failure the template name exists to prevent. Mirrors
+/// gripper._resolve_template().
 std::string calibration_template_path(const std::string& name);
 
 /// Calibration file contents, decoded.

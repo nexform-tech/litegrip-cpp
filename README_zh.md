@@ -204,6 +204,28 @@ Python SDK 那份还会在操作员按回车时提前返回，这里暂无对应
 SDK 从不猜方向：标定或模板载入之前，每个运动入口都抛 `CommandError`（见
 [排错](#排错)）。
 
+### 随包文件在哪里找
+
+出厂标定和安装模板都是**随包**文件。SDK 先到**运行中的程序旁边**找，所以装好
+之后的 SDK 不管从哪个工作目录运行，都能找到自己的基线：
+
+```text
+1. $LITEGRIP_DATA_DIR/calibration/                     显式覆盖
+2. <程序目录>/../share/litegrip_cpp/calibration/        <prefix>/bin/<程序>
+3. <程序目录>/../calibration/ 与 <程序目录>/calibration/  构建目录
+4. calibration/、../calibration/、.                    工作目录
+```
+
+工作目录那几条放在**最后**是故意的：它们是唯一取决于"你恰好在哪运行"的候选，
+所以某个无关目录里碰巧存在的 `calibration/` 不会盖过程序自带的那份数据。源码里
+没有编译进任何与机器相关的路径 —— 第 2 条是运行时从 `/proc/self/exe` 读出来的。
+
+**不要**依赖工作目录去找这些文件。万一运行时找不到（比如部署时把数据挪到了别
+处），把 `LITEGRIP_DATA_DIR` 指向放着 `calibration/` 的目录，或者给
+`load_calibration()` 传一个显式路径。CMake 包把安装位置报成
+`litegrip_cpp_DATA_DIR`。什么都找不到时 `load_calibration()` **返回 `false`**，
+并先把它试过的路径打出来 —— 记得检查返回值。
+
 ## 5. 确认夹爪能动
 
 把这样一个程序对着刚接好的机器跑一遍，标定换过或修过之后再跑一遍：

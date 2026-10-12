@@ -238,6 +238,32 @@ or a `zero()` of its own. Set `LITEGRIP_CALIB` to pin one explicit path instead.
 The SDK never guesses a direction: until a calibration or a template is loaded,
 every motion entry throws `CommandError` (see [Troubleshooting](#troubleshooting)).
 
+### Where the packaged files are found
+
+The factory calibration and the mount templates are *packaged* files. The SDK
+looks for them beside the running program first, so an installed SDK finds its
+own baseline from any working directory:
+
+```text
+1. $LITEGRIP_DATA_DIR/calibration/                     the explicit override
+2. <program dir>/../share/litegrip_cpp/calibration/    <prefix>/bin/<program>
+3. <program dir>/../calibration/ and <program dir>/calibration/   a build tree
+4. calibration/, ../calibration/, .                    the working directory
+```
+
+The working-directory entries are last on purpose: they are the only ones that
+depend on where you happened to run from, so a stray `calibration/` in an
+unrelated directory cannot outrank the data the program shipped with. Nothing
+machine-dependent is compiled in — entry 2 is read from `/proc/self/exe` at run
+time.
+
+**Do not** rely on the working directory to find these files. If the run-time
+search cannot find them — a deployment that moves the data elsewhere — set
+`LITEGRIP_DATA_DIR` to the directory holding `calibration/`, or pass an explicit
+path to `load_calibration()`. `litegrip_cpp_DATA_DIR` in the CMake package
+reports the installed location. `load_calibration()` **returns `false`** when
+nothing was found, having printed what it tried; check it.
+
 ## 5. Check the gripper works
 
 Point a program like this at a freshly wired unit, and again after any

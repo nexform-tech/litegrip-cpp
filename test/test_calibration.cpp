@@ -230,6 +230,121 @@ int main() {
     ::unsetenv("LITEGRIP_DATA_DIR");
   }
 
+  // ── where a packaged data file is looked for ──────────────────────────
+  {
+    // The installed layout is a property of the installation, so finding it
+    // must not depend on the working directory: <prefix>/bin/<program> sits
+    // beside <prefix>/share/litegrip_cpp/calibration/. Mirrors the Python SDK,
+    // which resolves its data relative to __file__. A program run from
+    // somewhere else entirely used to find nothing here.
+    //
+    // The whole block runs from a directory holding no calibration/ tree, so
+    // the answer cannot depend on where the test itself was started.
+    const std::string empty = std::string(kFixtureDir) + "/no_data";
+    ::mkdir(empty.c_str(), 0755);
+    char here[4096];
+    const bool have_cwd = ::getcwd(here, sizeof here) != nullptr;
+    check(have_cwd, "the working directory is readable");
+    const bool moved = have_cwd && ::chdir(empty.c_str()) == 0;
+    check(moved, "the data-free working directory is enterable");
+
+    const std::string prefix = std::string(kFixtureDir) + "/prefix";
+    const std::string bin_dir = prefix + "/bin";
+    const std::string data_dir = prefix + "/share/litegrip_cpp/calibration";
+    ::mkdir(prefix.c_str(), 0755);
+    ::mkdir((prefix + "/share").c_str(), 0755);
+    ::mkdir((prefix + "/share/litegrip_cpp").c_str(), 0755);
+    ::mkdir(bin_dir.c_str(), 0755);
+    ::mkdir(data_dir.c_str(), 0755);
+
+    // Written with the SDK's own writer, so a hit cannot be mistaken for a
+    // fixture that merely happens to parse. rad_to_mm is the marker.
+    litegrip::GripperConfig installed;
+    installed.pos_closed_rad = 0.5;
+    installed.pos_open_rad = -0.9;
+    installed.rad_to_mm = 123.0;
+    litegrip::write_calibration_file(data_dir + "/factory_calibration.json",
+                                     installed, 8, 24, "DM4310");
+
+    ::unsetenv("LITEGRIP_DATA_DIR");
+    const std::string resolved = litegrip::resolve_calibration_data_file(
+        "factory_calibration.json", bin_dir);
+    check(resolved ==
+              bin_dir +
+                  "/../share/litegrip_cpp/calibration/factory_calibration.json",
+          "a program in <prefix>/bin finds <prefix>/share/.../calibration/");
+    const auto parsed = litegrip::read_calibration_file(resolved);
+    check(parsed.has_value(), "the file found this way parses");
+    if (parsed.has_value()) {
+      check_near(parsed->rad_to_mm, 123.0, 1e-12,
+                 "and it is the file that was placed there");
+    }
+
+    // The order is documented on factory_calibration_path(), so pin it: the
+    // data that shipped beside the program outranks a same-named file in
+    // whatever directory the program was run from, and an override outranks
+    // both.
+    const std::vector<std::string> candidates =
+        litegrip::calibration_data_candidates("factory_calibration.json",
+                                              bin_dir);
+    const std::vector<std::string> documented = {
+        bin_dir + "/../share/litegrip_cpp/calibration/factory_calibration.json",
+        bin_dir + "/../calibration/factory_calibration.json",
+        bin_dir + "/calibration/factory_calibration.json",
+        "calibration/factory_calibration.json",
+        "../calibration/factory_calibration.json",
+        "factory_calibration.json",
+    };
+    check(candidates == documented, "the search order is the documented one");
+
+    ::setenv("LITEGRIP_DATA_DIR", "/elsewhere", 1);
+    const std::vector<std::string> overridden =
+        litegrip::calibration_data_candidates("factory_calibration.json",
+                                              bin_dir);
+    check(overridden.size() == documented.size() + 1 &&
+              overridden.front() ==
+                  "/elsewhere/calibration/factory_calibration.json",
+          "LITEGRIP_DATA_DIR is searched before the program's own directory");
+    ::unsetenv("LITEGRIP_DATA_DIR");
+
+    // A program whose own directory cannot be read still gets the rest of the
+    // search rather than an empty list.
+    const std::vector<std::string> no_program =
+        litegrip::calibration_data_candidates("factory_calibration.json", "");
+    const std::vector<std::string> working_directory_only = {
+        "calibration/factory_calibration.json",
+        "../calibration/factory_calibration.json",
+        "factory_calibration.json",
+    };
+    check(no_program == working_directory_only,
+          "an unknown program directory falls back to the working directory");
+
+    // And the library really does use the *running* program's directory, not
+    // just this helper: with no override set and a working directory holding no
+    // calibration/ tree, the answer must be the candidate built from
+    // /proc/self/exe — were the program directory ignored it would be the
+    // working-directory candidate, the accidental case that used to decide it.
+    ::unsetenv("LITEGRIP_FACTORY_CALIB");
+    char exe[4096];
+    const ssize_t length = ::readlink("/proc/self/exe", exe, sizeof exe - 1);
+    check(length > 0, "/proc/self/exe is readable");
+    if (length > 0 && moved) {
+      exe[length] = '\0';
+      const std::string self(exe, static_cast<std::size_t>(length));
+      const std::string exe_dir = self.substr(0, self.find_last_of('/'));
+      check(litegrip::factory_calibration_path() ==
+                exe_dir +
+                    "/../share/litegrip_cpp/calibration/factory_calibration.json",
+            "the library searches from the running program's directory, not "
+            "from the working directory, which holds nothing");
+    }
+
+    if (have_cwd) {
+      const bool restored = ::chdir(here) == 0;
+      check(restored, "the working directory is restored");
+    }
+  }
+
   // ── the calibrated flag ───────────────────────────────────────────────
   {
     // The shipped factory file predates the flag; absence leaves no opinion,

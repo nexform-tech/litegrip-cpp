@@ -775,9 +775,9 @@ bool LiteGrip::load_calibration(std::optional<std::string> path) {
   if (!calibration.has_value()) {
     std::fprintf(stderr,
                  "[litegrip] no calibration found (tried: %s); run a "
-                 "calibration first, or load a mount template (normal / "
-                 "reverse)\n",
-                 join_paths(sources).c_str());
+                 "calibration first, load a mount template (normal / reverse), "
+                 "or point %s at the directory holding calibration/\n",
+                 join_paths(sources).c_str(), kDataDirEnvVar);
     return false;
   }
 
