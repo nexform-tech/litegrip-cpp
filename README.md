@@ -347,6 +347,16 @@ things, and both are success — see [The work stroke](#the-work-stroke):
 - `close` presses onto the stop: `stalled=1`, `reached=0` (see [Reading the results](#reading-the-results)).
 - `open` is an ordinary positioning move to the 80 mm work point, so it arrives: `reached=1`, `stalled=0`.
 
+It also prints these four lines on **stderr** — they are expected, not a fault,
+see [Why a cycle reports it is recovering](#why-a-cycle-reports-it-is-recovering):
+
+```text
+[litegrip] entering a safety mode: open: recovering from outside the red lines
+[litegrip] entering a safety mode: open (stop inside the limit)
+[litegrip] entering a safety mode: close: recovering from outside the red lines
+[litegrip] entering a safety mode: close (press onto the stop)
+```
+
 If the jaws move the wrong way, see step 3.
 
 ⚠ This repository ships **no runnable stroke test**: `examples/` holds only
@@ -621,6 +631,42 @@ Three consequences for a consumer:
   config, before the first frame. So does a non-finite target or rate. A
   refusal after a frame has gone out is not a refusal.
 
+### Why a cycle reports it is recovering
+
+A move prints one line per safety mode it **enters**, on stderr, naming the move
+and the mode. A steady open/close cycle prints four, and all four are expected:
+
+```text
+[litegrip] entering a safety mode: open: recovering from outside the red lines
+[litegrip] entering a safety mode: open (stop inside the limit)
+[litegrip] entering a safety mode: close: recovering from outside the red lines
+[litegrip] entering a safety mode: close (press onto the stop)
+```
+
+`recovering from outside the red lines` is the recovery crawl arriving — the
+scope `MotionEngine::recover_to_interior` pushes before it drives inward; the
+other line names the mode the move itself runs under. It is not a fault report:
+both rest positions of a cycle sit **outside** the shipped red lines, so the next
+move starts illegal and walks the jaw back inside before it does anything else.
+
+| Rest position | Measured on the reference unit | Shipped red line | Past it by |
+| --- | --- | --- | --- |
+| `open` at the 80 mm work point | 79.5 mm (-1.2509 rad) | -1.24 rad | 0.7 mm |
+| `close` pressed onto the stop | -0.2 mm (+0.0553 rad) | -0.01 rad | 4.0 mm |
+
+Both are the design, not an accident of these numbers. `close()` aims past the
+closed red line on purpose, onto the mechanical stop; and the factory
+calibration's `work_stroke_mm = 80.0` is beyond the open red line, which sits at
+78.8 mm on that same calibration. The crawl is bounded and inward only, at
+`tau = 0`, and it returns immediately when the jaw is already inside — so a unit
+whose rest positions *are* inside the red lines prints no such line at all.
+
+The red lines above are the ones `safety_limits_350.json` ships as the default
+baseline, and that file marks its own numbers `NOT VERIFIED ON THIS UNIT` — they
+are the reference unit's hand-push bound. Widen or tighten the red lines and
+which moves report a recovery changes with them; the numbers in the table are
+the reference unit's, measured there, not a promise about yours.
+
 ## Safety invariants
 
 These are the safety argument and must not be relaxed:
@@ -657,6 +703,7 @@ These are the safety argument and must not be relaxed:
 | `GripperConfig::mount()` returns `nullopt` | The same thing, before it becomes an error: direction is not reported until a calibration or a template is loaded. |
 | `CommandError: ... is not a finite number ...`, or `LimitViolation: speed ... exceeds the commanded-velocity ceiling` | A NaN / inf target or rate, or a speed above the ceiling. Refused at the entry, deliberately — nothing was sent. |
 | The jaws move the wrong way | The mount direction. See step 3 — normal-mount units declare nothing, reverse ones call `load_template("reverse")`. |
+| `[litegrip] entering a safety mode: ... recovering from outside the red lines`, every move | Expected on the shipped files, not a fault. Both rest positions of an open/close cycle lie outside the red lines, so each move crawls back inside first — see [Why a cycle reports it is recovering](#why-a-cycle-reports-it-is-recovering). |
 | `open()` or `close()` returns `ok = false` with the jaw far from the stop | Something blocked the travel. `protection_tripped` set means the travel-leg torque protection ended the move and let go on purpose. |
 | `set_force()` returns `false`, or `GraspResult::travel_guard` is set | The runaway watch tripped: the measured position walked past the closed-side calibrated limit. See [The runaway watch](#the-runaway-watch). |
 | `open()` stops short of the full travel | A work stroke is configured — that is what it is for. See [The work stroke](#the-work-stroke). |

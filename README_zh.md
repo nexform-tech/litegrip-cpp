@@ -301,6 +301,15 @@ int main() {
 - `close` 压到止挡上：`stalled=1` 且 `reached=0`，就是 [读结果](#读结果) 里解释的那个组合。
 - `open` 只是一次到 80 mm 工作点的普通定位运动，会正常到达：`reached=1`、`stalled=0`。
 
+它还会在 **stderr** 上打下面这四行 —— 这是预期行为而非故障，见 [每轮都报回收是正常的](#每轮都报回收是正常的)：
+
+```text
+[litegrip] entering a safety mode: open: recovering from outside the red lines
+[litegrip] entering a safety mode: open (stop inside the limit)
+[litegrip] entering a safety mode: close: recovering from outside the red lines
+[litegrip] entering a safety mode: close (press onto the stop)
+```
+
 若夹爪朝反方向动，见第 3 步。
 
 ⚠ 本仓库**没有可运行的行程测试**：`examples/` 里只有 `version_info.cpp`，会开
@@ -524,6 +533,38 @@ SDK 中 N 值**未经力标定**，不要拿它做力受限的行为。见 [力�
   `goto_mm()` / `goto_rad()` 在**未标定**配置上抛 `CommandError`，且发生在第一帧
   之前；目标值或速率不是有限数时同样如此。发出过一帧之后的拒绝不叫拒绝。
 
+### 每轮都报回收是正常的
+
+每次运动会在 stderr 上为它**进入**的每个安全模式打一行，写明是哪次运动、哪个
+模式。一个稳定的开/闭循环会打四行，四行都是预期行为：
+
+```text
+[litegrip] entering a safety mode: open: recovering from outside the red lines
+[litegrip] entering a safety mode: open (stop inside the limit)
+[litegrip] entering a safety mode: close: recovering from outside the red lines
+[litegrip] entering a safety mode: close (press onto the stop)
+```
+
+`recovering from outside the red lines` 是上面那条「回收驶入」进场时压入的 scope
+（`MotionEngine::recover_to_interior` 压入之后才朝内驱动），另一行是这次运动本身
+所处的模式。它不是故障报告：循环的两个停驻位置都在随包红线**之外**，所以下一次
+运动开局就是违规状态，必须先爬回红线内，才做别的。
+
+| 停驻位置 | 参考机实测 | 随包红线 | 越出 |
+| --- | --- | --- | --- |
+| `open` 停在 80 mm 工作点 | 79.5 mm（-1.2509 rad） | -1.24 rad | 0.7 mm |
+| `close` 压到止挡 | -0.2 mm（+0.0553 rad） | -0.01 rad | 4.0 mm |
+
+两处都是设计使然，不是这几个数碰巧凑出来的。`close()` 的目标本来就在闭侧红线之外 ——
+它要压到机械止挡上；而出厂标定配的 `work_stroke_mm = 80.0` 也在张侧红线之外，
+同一份标定下红线落在 78.8 mm。回收本身只朝内、按回收上限、`tau = 0`，有上界；
+位置本来就在红线内时立即返回 —— 所以停驻位置**在**红线内的机器，根本不会打这
+一行。
+
+上表里的红线取自随包的默认基线 `safety_limits_350.json`，该文件自己给这些数盖
+着 `NOT VERIFIED ON THIS UNIT` 的戳 —— 它们是参考机的手推上界。红线放宽或收紧，
+哪些运动报回收也就跟着变；表里的数字是参考机上的实测，不是对你那台的承诺。
+
 ## 安全不变量
 
 这些是安全论证本身，**不得放宽**：
@@ -552,6 +593,7 @@ SDK 中 N 值**未经力标定**，不要拿它做力受限的行为。见 [力�
 | `GripperConfig::mount()` 返回 `nullopt` | 同一件事，只是还没走到报错：标定或模板载入之前不报方向。 |
 | `CommandError: ... is not a finite number ...`，或 `LimitViolation: speed ... exceeds the commanded-velocity ceiling` | 目标值/速率是 NaN、inf，或速度超过上限。刻意在入口拒绝 —— 一帧都没发。 |
 | 夹爪朝反方向动 | 安装方向问题。见第 3 步：正装什么都不用声明，反装调 `load_template("reverse")`。 |
+| 每次运动都打 `[litegrip] entering a safety mode: ... recovering from outside the red lines` | 随包文件下这是预期行为，不是故障。开/闭循环的两个停驻位置都在红线之外，所以每次运动先把爪子爬回红线内 —— 见 [每轮都报回收是正常的](#每轮都报回收是正常的)。 |
 | `open()` 或 `close()` 返回 `ok = false`，而夹爪离止点很远 | 有东西挡住了行程。`protection_tripped` 置位说明是行进段力矩保护有意失力的。 |
 | `set_force()` 返回 `false`，或 `GraspResult::travel_guard` 置位 | 越位护栏触发：实测位置越过了闭合侧标定限位。见 [越位护栏](#越位护栏)。 |
 | `open()` 没走满行程 | 配置了工作行程 —— 那正是它的用途。见 [工作行程](#工作行程)。 |
