@@ -147,11 +147,16 @@ class LiteGrip : private MotionIo {
   /// feed-forward of close_sign * force_n * 0.1 Nm, exactly like the Python
   /// SDK — the two SDKs agree, but not because the newtons are physical. Do
   /// not build force-limited behaviour on this number.
+  ///
+  /// The hold is bounded by MotionConfig::hold_runaway_rad: a measured position
+  /// that walks that far past the closed-side calibrated limit ends the hold
+  /// with GraspResult::travel_guard set and ok false.
   GraspResult grasp(std::optional<double> force_n = std::nullopt,
                     double hold_s = 0.0, MoveProgressCallback progress = {});
 
   /// Apply force_n at the current position for duration_s (torque
-  /// feed-forward; same not-force-calibrated caveat as grasp()).
+  /// feed-forward; same not-force-calibrated caveat as grasp()). Returns false
+  /// when the same MotionConfig::hold_runaway_rad guard trips.
   bool set_force(double force_n, double duration_s = 0.3);
 
   /// Constant-speed move to an absolute opening in mm (0 = closed), with a

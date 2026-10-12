@@ -75,8 +75,9 @@ int main() {
 5. **下发的指令不越标定行程** —— 动作引擎在斜坡与保力路径上发出的每一个位置都钳进
    `[min(pos_closed_rad, pos_open_rad), max(pos_closed_rad, pos_open_rad)]`
    （`clamp_to_travel`，在 `emit()` 内）。没标定的配置没有行程可钳，入口直接拒绝。
-   唯一在它之外的路径是「回收驶入」：它要处理的正是实测位置已经不合法的夹爪，自带
-   只朝内、有上界的驱动。
+   有两条路径在它之外：「回收驶入」要处理的正是实测位置已经不合法的夹爪，自带只朝
+   内、有上界的驱动；保力段的纯力矩帧没有指令可钳，由越位护栏从另一侧管住
+   （[越位护栏](#越位护栏)）。
 
 ### 命令路径的接线
 
@@ -198,7 +199,8 @@ Python SDK 那份还会在操作员按回车时提前返回，这里暂无对应
 `open` / `close` / `grasp` / `set_force` / `move_at_speed(_rad)` /
 `enter_zero_gravity` / `exit_zero_gravity` 与线上 Python SDK 跑同一套逐帧
 引擎（`MotionConfig` 携带同一组调好的默认值；`MoveResult` / `GraspResult`
-报告 `ok` / `reached` / `stalled`，`MoveResult` 还有 `protection_tripped`）。
+报告 `ok` / `reached` / `stalled`，`MoveResult` 还有 `protection_tripped`，
+`GraspResult` 还有 `travel_guard`）。
 顶限位的移动若在**行进段**被硬挡，一旦实测速度明显跟不上指令、且力矩连续三次
 采样超过 `MotionConfig::stop_torque_nm`（0.7 Nm），就会失力 —— 连发 0.2 s 的
 `kp=kd=tau=0` 帧，夹爪能被手掰动，而不是继续压着；这样的移动永远不是 `ok`。
@@ -260,6 +262,24 @@ SDK 中 N 值**未经力标定**，不要拿它做力受限的行为。
 墙钟是 `climb + duration`，短 `duration` 也照样到得了满力。20 N/s 下从闭合压出的
 约 10 N 交接到 20 N 设定值要半秒：`set_force(20.0)` 约 1.3 s，过去是 0.3 s。
 `duration = 0` 表示「爬到设定值就返回」。
+
+### 越位护栏
+
+保力帧没有位置误差，所以任何位置约束都作用不到它：`clamp_to_travel` 钳的是**指令**，
+而纯力矩源根本没有指令可钳。于是恒定力矩会把夹爪一路推着闭合，直到有什么挡住它；
+而没有东西挡的时候 —— 标定过期、止点损坏或缺失 —— 它会一路走到底。纯力矩源唯一
+可用的手段就是撤掉力矩，所以护栏是**判据不是夹子**：实测位置越过闭合侧标定限位达
+`MotionConfig::hold_runaway_rad`（0.05 rad，按出厂 `rad_to_mm = 61.0123` 约
+3.05 mm）时，`grasp` 和 `set_force` 连发 `MotionConfig::stop_release_s` 的零力矩帧
+后返回 —— `GraspResult::travel_guard` 置位、`ok` 为假，或 `set_force` 返回 `false`。
+**进入**保力段时就已经在护栏之外的，一帧力矩都不发。
+
+只判闭合侧，因为前馈力矩朝那边压；越过张开限位会被同一份力矩推回来。
+
+这是**失控探测，不是精度约束**。顶到工件时夹爪停在工件上；空载时停在机械止点上，
+而机械止点就在标定限位处 —— 标定本来就是从这两个止点探出来的。只有确实夹着东西的
+夹爪被放开时，才该调大 `hold_runaway_rad`。未标定时护栏不启用：占位限位描述的不是
+任何真实行程，拿它当窗口比没有更糟 —— 与 `clamp_to_travel` 同一个口径。
 
 ## 测试
 
