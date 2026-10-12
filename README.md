@@ -27,14 +27,47 @@ Three paths deliberately bypass it, each documented at its definition:
   `move_at_speed` / zero-gravity) — it re-aims the target every frame, which
   the gate's one-target-per-call shape cannot express. It carries its own
   bounds: every frame's kp / kd / tau / dq is re-checked against the guard's
-  `TemporaryParams`, and a move that starts with the measured position outside
-  the red lines is first driven back inside — inward only, at the recovery
-  ceilings, `tau = 0` — by an engine-side recovery crawl that fails closed.
-  That crawl is the engine-side twin of `guard_recovery_frame()`, which cannot
-  do the job today because it admits only positions inside the packaged
-  mechanical envelope (the reference unit's unverified hand-push bound, which
-  no shipped calibration's stops lie inside); the open item is written up at
+  `TemporaryParams`, every frame's **position** is clamped into the calibrated
+  travel (`clamp_to_travel`, applied in the engine's single `emit()`), and a
+  move that starts with the measured position outside the red lines is first
+  driven back inside — inward only, at the recovery ceilings, `tau = 0` — by an
+  engine-side recovery crawl that fails closed. That crawl is the engine-side
+  twin of `guard_recovery_frame()`, which cannot do the job today because it
+  admits only positions inside the packaged mechanical envelope (the reference
+  unit's unverified hand-push bound, which no shipped calibration's stops lie
+  inside); the open item is written up at
   `MotionEngine::recover_to_interior`.
+
+The travel clamp is an **engine-level invariant, not a property of one piece of
+arithmetic**. `open()` and `close()` aim *past* the calibrated limit on purpose
+(`press_target`), so the jaws press onto the real stop and the move does not
+depend on how well the calibration matches it; the clamp is what keeps the
+*command* inside the travel all the same. Without it a command past the limit
+drives the jaws that way until something stops them, and when the real stop is
+not where the calibration says — a stale calibration, a damaged or missing stop
+— nothing does.
+
+Three consequences for a consumer:
+
+- `open()` / `close()` no longer press past the calibrated limit, and what that
+  changes depends on where the real stop is. At the limit — the expected case,
+  since the calibration is probed from those stops — the jaws still reach it,
+  but the lead term collapses as the command saturates, so they arrive without
+  leaning on the stop: the pressing torque at the end of the move falls to zero
+  instead of holding `kp x stop_lead_mm / rad_to_mm`. The move still reports the
+  stop, because `ok` and `stalled` come from where the jaw actually stopped.
+  Beyond the limit — a calibration that under-reports the travel, or stops that
+  have moved — the move now ends at the calibrated limit, up to
+  `press_overshoot` short of where it used to end (5% of travel, about 4.3 mm on
+  the factory calibration), and it ends there without pressing.
+- The full pressing torque `kp x max_lead_mm / rad_to_mm` (~53 N at the config
+  defaults) reaches only a jaw blocked at least `max_lead_mm` inside the limit.
+  Closer to the limit the lead shrinks with it, and the lead is what produces
+  the force.
+- `open()` / `close()` / `grasp()` / `move_at_speed()` / `move_at_speed_rad()`
+  / `goto_mm()` / `goto_rad()` throw `CommandError` on an **uncalibrated**
+  config, before the first frame. So does a non-finite target or rate. A
+  refusal after a frame has gone out is not a refusal.
 
 ## Mount direction
 
@@ -60,7 +93,8 @@ legacy single-file location is still read): every LiteGrip ships at CAN id
 0x08, so on a two-gripper machine the channel is the only identity key, and
 the automatic load skips a file that declares a different one.
 `GripperConfig::calibrated` is false until a calibration or a template is
-loaded; before that `mount()` reports nothing rather than guessing.
+loaded; before that `mount()` reports nothing rather than guessing, and every
+motion entry refuses (see [Safety wiring](#safety-wiring)).
 
 ## Calibration
 
@@ -137,8 +171,10 @@ by hand instead of holding on — once the jaw is moving well below the commande
 speed and the torque is over `MotionConfig::stop_torque_nm` (0.7 Nm) on three
 consecutive samples. Such a move is never `ok`. `open()`
 and `close()` no longer take gains or a duration — they take an optional speed
-and press onto the mechanical stop, and their truthiness still means "pressed
-onto the stop". The old `close(force_n=...)` is gone with them: use
+and aim past the calibrated limit onto the stop, and their truthiness still
+means "pressed onto the stop". The **command** is capped at the calibrated limit
+(see [Safety wiring](#safety-wiring)), so what they press with is the lead term
+alone. The old `close(force_n=...)` is gone with them: use
 `grasp(force_n, hold_s)` to close onto an object and squeeze.
 
 ⚠ `grasp()` / `set_force()` apply `force_n` as a torque feed-forward
@@ -165,8 +201,12 @@ frame with nothing but a position term.
 
 **Do not** read this as a force limit. The N is still not force-calibrated (see
 above), and `close()`, which carries no setpoint, still presses
-`kp x max_lead_mm / rad_to_mm` onto whatever it meets — about 53 N at the config
-defaults (`kp = 100`, `rad_to_mm = 75.44`).
+`kp x max_lead_mm / rad_to_mm` onto an object it meets in the travel leg —
+about 53 N at the config defaults (`kp = 100`, `rad_to_mm = 75.44`). That figure
+is now the ceiling of a range rather than a constant: the clamped command
+shortens the lead as the jaw approaches the calibrated limit, so an object
+within `max_lead_mm` of it is pressed less. See
+[Safety wiring](#safety-wiring).
 
 Three things change for a consumer:
 
@@ -288,6 +328,7 @@ pkg-config --cflags --libs litegrip_cpp
 int main() {
   litegrip::GripperConfig cfg;          // can0, can_id 0x08, DM4310
   auto gripper = litegrip::LiteGrip::connect_raii(cfg);
+  gripper.load_calibration();           // this channel's file, else the packaged factory one
   gripper.init();                       // enable and hold current position
   gripper.open();
   gripper.goto_mm(40.0);
@@ -302,8 +343,18 @@ These are the safety argument and must not be relaxed:
 
 1. **Tighten only** — limits may only be a sub-interval of the shipped baseline.
 2. **Reject, do not clamp** — an out-of-range command is refused with a reason,
-   never silently rewritten and sent.
+   never silently rewritten and sent. This is the guard's rule, and the action
+   engine is held to it as well: the clamp in 5 is not an exception, because
+   what it bounds is a target the engine *chose* to place past the limit.
 3. **Fail-closed** — limits unavailable ⇒ reject everything; a value that cannot
    be bounded ⇒ do not move that way.
 4. **Strict numeric boundary** — NaN / ±inf / non-numbers are rejected before any
-   comparison.
+   comparison. The engine's motion entries apply the same rule to their targets
+   and rates, at the entry rather than where the arithmetic happens to notice.
+5. **The command never leaves the calibrated travel** — every position the action
+   engine emits on its ramp and hold paths is clamped into
+   `[min(pos_closed_rad, pos_open_rad), max(pos_closed_rad, pos_open_rad)]`
+   (`clamp_to_travel`, in `emit()`). An uncalibrated config has no travel to
+   clamp into, so the entry refuses instead. The one path outside this is the
+   recovery crawl, which exists to move a gripper whose measured position is
+   already illegal and has its own bounded, inward-only drive.

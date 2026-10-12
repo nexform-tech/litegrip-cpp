@@ -18,8 +18,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -344,7 +346,11 @@ void test_close_from_inside_red() {
   check(io.frames.size() == 370, "S1: frame count (py: 370)");
   check_near(res.target_rad, 0.18520684999999998, 1e-12, "S1: target");
   check_near(res.limit_rad, kPosClosedRad, 0.0, "S1: limit");
-  check_near(res.final_cmd_rad, 0.11376923385901064, 1e-12, "S1: final cmd");
+  // The computed target is past the limit (press_target), but the frame that
+  // goes out is not: emit() clamps it into the calibrated travel, so the final
+  // command IS the calibrated close limit. [py: final_cmd_rad = 0.104334]
+  check_near(res.final_cmd_rad, kPosClosedRad, 0.0,
+             "S1: final cmd is the calibrated close limit");
 
   // Starting inside the red lines: no recovery frames — frame 0 is the ramp.
   check(io.frames[0].kp == 100.0 && io.frames[0].kd == 2.0,
@@ -354,7 +360,8 @@ void test_close_from_inside_red() {
   check_near(io.frames[0].pos_after, -0.995788507, 1e-8, "S1: frame 0 pos");
   check_near(io.frames[0].tau_nm, -0.084442769, 1e-8, "S1: frame 0 tau");
   const Frame& last = io.frames.back();
-  check_near(last.q, 0.113769234, 1e-8, "S1: last q (stop_lead cap)");
+  check_near(last.q, kPosClosedRad, 0.0,
+             "S1: last q (clamped at the calibrated limit) [py: 0.104334]");
   check(last.dq == 0.0, "S1: last dq = 0 (settle)");
   check_near(last.pos_after, kPosClosedRad, 1e-12, "S1: parked at the stop");
 }
@@ -371,12 +378,159 @@ void test_open_from_inside_red() {
   check(res.steps == 430, "S2: steps (py: 430)");
   check(io.frames.size() == 430, "S2: frame count (py: 430)");
   check_near(res.target_rad, -1.59399585, 1e-12, "S2: target");
-  check_near(res.final_cmd_rad, -1.5225582338590107, 1e-12, "S2: final cmd");
+  // Same story as S1 at the open end. [py: final_cmd_rad = -1.513123]
+  check_near(res.final_cmd_rad, kPosOpenRad, 0.0,
+             "S2: final cmd is the calibrated open limit");
   check_near(io.frames[0].q, -0.203367140, 1e-8, "S2: frame 0 q");
   check_near(io.frames[0].dq, -0.673945276, 1e-8, "S2: frame 0 dq");
   const Frame& last = io.frames.back();
-  check_near(last.q, -1.522558234, 1e-8, "S2: last q");
+  check_near(last.q, kPosOpenRad, 0.0, "S2: last q (clamped) [py: -1.513123]");
   check_near(last.pos_after, kPosOpenRad, 1e-12, "S2: parked at the stop");
+}
+
+// ── the calibrated travel is the engine's last position bound ────────────
+//
+// open()/close() aim PAST the calibrated limit on purpose (press_target): the
+// jaws are meant to press onto the real stop, so the move does not depend on
+// how well the calibration matches it. What must never leave the travel is the
+// frame that goes out — a command past the limit drives the jaws that way until
+// something stops them, and when the real stop is not where the calibration
+// says (a stale calibration, a damaged or missing stop) nothing does.
+//
+// Python applies clamp_to_travel inside _emit, i.e. to every frame the engine
+// emits, and its tests assert exactly this (`_outside(fake) == []`).
+
+void check_frames_inside_travel(const FakeIo& io, const std::string& what) {
+  const GripperConfig& cfg = io.config();
+  const double lo = std::min(cfg.pos_closed_rad, cfg.pos_open_rad);
+  const double hi = std::max(cfg.pos_closed_rad, cfg.pos_open_rad);
+  for (std::size_t i = 0; i < io.frames.size(); ++i) {
+    if (io.frames[i].q < lo || io.frames[i].q > hi) {
+      std::printf("FAIL %s: frame %zu q=%.12g outside [%.12g, %.12g]\n",
+                  what.c_str(), i, io.frames[i].q, lo, hi);
+      ++g_failures;
+      return;
+    }
+  }
+}
+
+void test_clamp_to_travel() {
+  const GripperConfig cfg = test_config();
+  check_near(clamp_to_travel(cfg, 0.5), kPosClosedRad, 0.0,
+             "clamp: above the closed limit");
+  check_near(clamp_to_travel(cfg, -2.0), kPosOpenRad, 0.0,
+             "clamp: below the open limit");
+  check_near(clamp_to_travel(cfg, -1.0), -1.0, 0.0,
+             "clamp: inside the travel is untouched");
+  check_near(clamp_to_travel(cfg, kPosClosedRad), kPosClosedRad, 0.0,
+             "clamp: the limit itself is inside (inclusive)");
+
+  // The reverse mount swaps which END is closed; min/max follows the two
+  // numbers rather than assuming an order.
+  const GripperConfig rev = test_config(/*reverse=*/true);
+  check_near(clamp_to_travel(rev, 0.5), kPosClosedRad, 0.0,
+             "reverse clamp: above");
+  check_near(clamp_to_travel(rev, -2.0), kPosOpenRad, 0.0,
+             "reverse clamp: below");
+  check_near(clamp_to_travel(rev, -1.0), -1.0, 0.0,
+             "reverse clamp: inside untouched");
+
+  // Uncalibrated: returned UNCHANGED. This is the deliberate difference from
+  // Python, whose clamp is unconditional because every path through its engine
+  // has already required a calibration. The placeholder limits
+  // (pos_closed_rad 1.14 / pos_open_rad 0.0) describe no real travel, so
+  // clamping into them would move the command somewhere nobody asked for.
+  GripperConfig uncal;
+  check(!uncal.calibrated, "the default config is uncalibrated");
+  check_near(clamp_to_travel(uncal, 9.0), 9.0, 0.0,
+             "uncalibrated clamp: unchanged");
+}
+
+void test_every_frame_stays_inside_the_calibrated_travel() {
+  {  // close: 370 frames, none of them past the calibrated closed limit
+    FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+              /*stops=*/true);
+    SafetyGuard guard = make_guard();
+    MotionEngine engine(io, guard, instant_config());
+    const MoveResult res = engine.close();
+    check_frames_inside_travel(io, "travel bound: close");
+    check_near(io.frames.back().q, kPosClosedRad, 0.0,
+               "travel bound: close ends AT the calibrated limit");
+    // The stop is still detected and still reported: capping the command must
+    // not erase the "something stopped it" signal.
+    check(res.ok && res.stalled, "travel bound: close still reports the stop");
+  }
+  {  // open: the other end, same rule
+    FakeIo io(test_config(), /*start_rad=*/ -0.2, std::nullopt, 0.0,
+              /*stops=*/true);
+    SafetyGuard guard = make_guard();
+    MotionEngine engine(io, guard, instant_config());
+    const MoveResult res = engine.open();
+    check_frames_inside_travel(io, "travel bound: open");
+    check_near(io.frames.back().q, kPosOpenRad, 0.0,
+               "travel bound: open ends AT the calibrated limit");
+    check(res.ok && res.stalled, "travel bound: open still reports the stop");
+  }
+  {  // Reverse mount: the two ends swap, the bound follows them.
+    FakeIo io(test_config(/*reverse=*/true), /*start_rad=*/ -1.0, std::nullopt,
+              0.0, /*stops=*/true);
+    SafetyGuard guard = make_guard();
+    MotionEngine engine(io, guard, instant_config());
+    const MoveResult res = engine.close();
+    check_frames_inside_travel(io, "travel bound: reverse close");
+    check_near(res.limit_rad, kPosOpenRad, 0.0,
+               "travel bound: reverse closed end is the smaller number");
+    check_near(io.frames.back().q, kPosOpenRad, 0.0,
+               "travel bound: reverse close ends AT the calibrated limit");
+    check(res.ok && res.stalled, "travel bound: reverse close reports the stop");
+  }
+}
+
+void test_an_uncalibrated_config_is_refused_before_any_frame() {
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+            /*stops=*/true);
+  io.config().calibrated = false;
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  // A refusal has to come before the first frame: one that arrives after a
+  // frame has gone out is not a refusal.
+  check_throws<CommandError>([&] { engine.move_at_speed(40.0, 50.0); },
+                             "uncalibrated move_at_speed refuses");
+  check(io.frames.empty(), "uncalibrated move_at_speed sent no frame");
+  check_throws<CommandError>([&] { engine.move_at_speed_rad(-1.4, 0.5); },
+                             "uncalibrated move_at_speed_rad refuses");
+  check(io.frames.empty(), "uncalibrated move_at_speed_rad sent no frame");
+  check_throws<CommandError>([&] { engine.close(); },
+                             "uncalibrated close refuses");
+  check(io.frames.empty(), "uncalibrated close sent no frame");
+  check_throws<CommandError>([&] { engine.open(); },
+                             "uncalibrated open refuses");
+  check(io.frames.empty(), "uncalibrated open sent no frame");
+}
+
+void test_a_non_finite_target_is_refused_before_any_frame() {
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+  const double nan = std::numeric_limits<double>::quiet_NaN();
+
+  // Every comparison on the way down is FALSE against a NaN, so it slips past
+  // the "nothing to do" shortcuts. A NaN target then comes out of the min/max
+  // clamp as one of the calibrated limits — a real position nobody asked for,
+  // driven to as if they had — and a NaN rate reaches send_frame() as a NaN dq,
+  // which refuses mid-move. Without the entry check below, neither is refused
+  // where Python refuses them.
+  check_throws<CommandError>([&] { engine.move_at_speed(nan, 50.0); },
+                             "NaN target_mm refuses");
+  check_throws<CommandError>([&] { engine.move_at_speed(40.0, nan); },
+                             "NaN speed_mm_s refuses");
+  check_throws<CommandError>([&] { engine.move_at_speed_rad(nan, 0.5); },
+                             "NaN target_rad refuses");
+  check_throws<CommandError>([&] { engine.move_at_speed_rad(-1.4, nan); },
+                             "NaN speed_rad_s refuses");
+  check(io.frames.empty(), "non-finite targets sent no frame");
 }
 
 // ── grasp parity (Python dump S3) ────────────────────────────────────────
@@ -735,8 +889,8 @@ void test_stiction_does_not_false_stall() {
   const MoveResult res = engine.close();
   check(res.ok, "S5: sticky reports do not fake a stall");
   check(res.steps == 370, "S5: steps (py: 370)");
-  check_near(res.final_cmd_rad, 0.11243523385901066, 1e-12,
-             "S5: final cmd built on the REPORTED position");
+  check_near(res.final_cmd_rad, kPosClosedRad, 0.0,
+             "S5: final cmd built on the REPORTED position [py: 0.104334]");
 }
 
 void test_press_reach_tolerance() {
@@ -1469,6 +1623,10 @@ int main() {
   test_targets();
   test_close_from_inside_red();
   test_open_from_inside_red();
+  test_clamp_to_travel();
+  test_every_frame_stays_inside_the_calibrated_travel();
+  test_an_uncalibrated_config_is_refused_before_any_frame();
+  test_a_non_finite_target_is_refused_before_any_frame();
   test_grasp_onto_object();
   test_force_approach_terms();
   test_the_approach_never_presses_past_the_setpoint();
