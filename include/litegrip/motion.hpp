@@ -377,6 +377,20 @@ TargetSpec limit_target(const GripperConfig& config, Toward toward,
 TargetSpec press_target(const GripperConfig& config, Toward toward,
                         double overshoot);
 
+/// The open side's WORK-STROKE target: the command position `work_stroke_mm`
+/// millimetres from the closed zero (GripperConfig::work_stroke_mm).
+///
+/// The opposite of press_target — it does NOT go past the limit onto the stop,
+/// it stops INSIDE it, leaving the opening end unused (the field convention:
+/// 85 mm of travel, 80 mm of work, 5 mm held back). What it holds back is an
+/// explicit number of millimetres rather than limit_target()'s travel fraction.
+///
+/// The direction comes from close_sign(), so a reverse mount works too, and the
+/// stroke is clamped to the mechanical travel: a work stroke at or beyond it is
+/// "open as far as it goes". `offset_rad` is the stroke actually applied.
+/// Throws CommandError when the config is uncalibrated or has zero travel.
+TargetSpec work_limit_target(const GripperConfig& config, double work_stroke_mm);
+
 // ── the force-carrying approach's terms ──────────────────────────────────
 
 /// One approach frame's budgeted terms: how fast to command, what damping to
@@ -511,7 +525,13 @@ class MotionEngine {
   /// the frame's speed, damping and lead (force_approach_terms), so hitting a
   /// workpiece presses no harder than it — which is what grasp's closing leg
   /// passes.
+  ///
+  /// `target_rad` is an explicit destination (work_limit_target's open-side
+  /// work point). Given one, the leg is an ORDINARY positioning move — `press`
+  /// is ignored — and `limit_rad` is that direction's calibrated limit, kept
+  /// for reporting.
   MoveResult move_to_limit(Toward toward, double speed_mm_s, bool press,
+                           std::optional<double> target_rad,
                            std::optional<double> force_n, const char* source,
                            const MoveProgressCallback& progress);
 

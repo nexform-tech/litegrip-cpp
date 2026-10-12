@@ -135,15 +135,14 @@ struct GripperConfig {
   double max_stroke_mm = GripperGeometry::kJawTravelMm;
 
   /// Work stroke (mm) — how far open() may travel, counted from the closed
-  /// zero. 0 = no limit, so open() presses onto the mechanical stop exactly as
-  /// it did before this field existed; a value at or above the measured travel
-  /// means the same thing. Mirrors models.GripperConfig.work_stroke_mm.
+  /// zero. A stroke strictly between 0 and the measured travel turns open()
+  /// into an ordinary positioning move to that point: the jaws arrive and
+  /// stop, and the opening end of the travel is left unused, so `ok` is
+  /// `reached and not stalled` rather than the press onto the stop's stall.
   ///
-  /// ⚠ This SDK loads, applies and saves the field but nothing acts on it yet:
-  /// it is here so a calibration file means the same thing to both SDKs, and
-  /// the motion engine will honour it in a later change. Reading a file with a
-  /// work stroke therefore does not yet limit open() in this SDK — do not
-  /// count on the opening end stopping short until that change lands.
+  /// 0 = no limit, and a value at or above the measured travel means the same
+  /// thing: open() presses onto the mechanical stop exactly as it does without
+  /// this field. Mirrors models.GripperConfig.work_stroke_mm.
   double work_stroke_mm = 0.0;
 
   // Unit conversion — update after calibration.

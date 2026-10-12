@@ -153,11 +153,14 @@ stall criterion or the torque ceiling only. The Python SDK's version also return
 soon as the operator presses Enter; there is no equivalent here yet.
 
 A calibration file may also carry a **work stroke**, `work_stroke_mm`: how far
-`open()` may travel, counted from the closed zero, with 0 meaning no limit. This SDK
-reads, applies and re-emits the field but does **not** act on it yet — it is carried
-so one calibration file means the same thing to both SDKs, and the motion engine will
-honour it in a later change. Do not count on the opening end stopping short in this
-SDK today.
+`open()` may travel, counted from the closed zero, with 0 meaning no limit. A
+stroke strictly between 0 and the measured travel makes `open()` an ordinary
+positioning move to that point: the jaws arrive and stop, leaving the opening
+end of the travel unused, so `ok` is `reached and not stalled`, and
+`MoveResult::limit_rad` still reports the open stop the target stops short of.
+A stroke of 0, or one at or past the travel, means "open as far as it goes" and
+`open()` presses onto the mechanical stop as it does without the field. The
+factory calibration ships 80 mm of work in 85 mm of travel — 5 mm held back.
 
 ## Actions
 
@@ -169,13 +172,14 @@ as the online Python SDK (`MotionConfig` carries the tuned defaults; a
 whose jaw is blocked out in the travel leg lets go — 0.2 s of `kp=kd=tau=0`
 frames, so the gripper can be pushed by hand instead of holding on — once the
 jaw is moving well below the commanded speed and the torque is over
-`MotionConfig::stop_torque_nm` (0.7 Nm) on three consecutive samples. Such a move
-is never `ok`. `open()`
-and `close()` no longer take gains or a duration — they take an optional speed
-and aim past the calibrated limit onto the stop, and their truthiness still
-means "pressed onto the stop". The **command** is capped at the calibrated limit
-(see [Safety wiring](#safety-wiring)), so what they press with is the lead term
-alone. The old `close(force_n=...)` is gone with them: use
+`MotionConfig::stop_torque_nm` (0.7 Nm) on three consecutive samples. Such a
+move is never `ok`. `open()` and `close()` no longer take gains or a duration —
+they take an optional speed and aim past the calibrated limit onto the stop, so
+their truthiness means "pressed onto the stop". A configured work stroke is the
+one exception: it stops `open()` at the work point instead, where `ok` means
+`reached` (see [Calibration](#calibration)). The **command** is capped at the
+calibrated limit (see [Safety wiring](#safety-wiring)), so what they press with
+is the lead term alone. The old `close(force_n=...)` is gone with them: use
 `grasp(force_n, hold_s)` to close onto an object and squeeze.
 
 ⚠ `grasp()` / `set_force()` apply `force_n` as a torque feed-forward

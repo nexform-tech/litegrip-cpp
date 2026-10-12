@@ -698,9 +698,8 @@ void LiteGrip::apply_calibration(const CalibrationFile& calibration,
   if (calibration.grasp_torque_threshold.has_value()) {
     config_.grasp_torque_threshold = *calibration.grasp_torque_threshold;
   }
-  // Carried so a file written here means the same thing to the Python SDK,
-  // which does act on it. Nothing in this SDK reads config_.work_stroke_mm yet
-  // — see GripperConfig::work_stroke_mm.
+  // Honoured by open(): a stroke inside the travel turns the opening move into
+  // a positioning move to that point. See GripperConfig::work_stroke_mm.
   if (calibration.work_stroke_mm.has_value()) {
     config_.work_stroke_mm = *calibration.work_stroke_mm;
   }
