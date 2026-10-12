@@ -34,6 +34,31 @@
 
 using namespace litegrip;
 
+namespace litegrip {
+
+/// The engine names this as a friend (see motion.hpp): grasp() always runs its
+/// closing leg first, which brings the jaws back inside the travel, so the
+/// guard's "already outside" branch and its uncalibrated branch are not
+/// reachable through the public API. The Python suite reaches
+/// actions._hold_force the same way. Test-only; not part of the header's
+/// public surface.
+struct MotionEngineTestAccess {
+  /// HoldOutcome, restated: the engine's own is private, and the friend
+  /// declaration reaches the function, not the type name.
+  struct Hold {
+    bool ok = false;
+    int cycles = 0;
+    bool guarded = false;
+  };
+
+  static Hold hold(MotionEngine& engine, double force_n, double hold_s) {
+    const MotionEngine::HoldOutcome o = engine.hold_force(force_n, hold_s, {});
+    return Hold{o.ok, o.cycles, o.guarded};
+  }
+};
+
+}  // namespace litegrip
+
 namespace {
 
 int g_failures = 0;
@@ -127,7 +152,7 @@ class FakeMotor {
   FakeMotor(double pos, std::optional<double> block_rad, double sticky_rad,
             int err, std::optional<double> limit_lo,
             std::optional<double> limit_hi, double yield_rad_s = 0.0,
-            double yield_tau_nm = 0.0)
+            double yield_tau_nm = 0.0, double creep_rad_s_per_nm = 0.0)
       : pos(pos),
         err(err),
         block_rad(block_rad),
@@ -136,6 +161,7 @@ class FakeMotor {
         limit_hi(limit_hi),
         yield_rad_s(yield_rad_s),
         yield_tau_nm(yield_tau_nm),
+        creep_rad_s_per_nm(creep_rad_s_per_nm),
         block_dir(block_rad.has_value()
                       ? (*block_rad > pos ? 1.0 : -1.0)
                       : 0.0) {}
@@ -159,6 +185,9 @@ class FakeMotor {
     // motor with zero stiffness is back-driven. At kp = kKpNominal this is
     // exactly the old expression.
     double v = dq + kGain * (kp / kKpNominal) * (q - pos);
+    // Creep under pure feed-forward torque (see the class comment). Zero by
+    // default, so it does not enter any other case's arithmetic.
+    v += creep_rad_s_per_nm * tau_ff;
     v = std::max(-kVmax, std::min(kVmax, v));
     double next = pos + v * dt;
     if (block_rad.has_value()) {
@@ -198,6 +227,7 @@ class FakeMotor {
   std::optional<double> limit_hi;
   double yield_rad_s = 0.0;
   double yield_tau_nm = 0.0;
+  double creep_rad_s_per_nm = 0.0;
   double block_dir = 0.0;
 };
 
@@ -206,12 +236,13 @@ class FakeIo : public MotionIo {
   explicit FakeIo(GripperConfig cfg, double start_rad = -1.0,
                   std::optional<double> block_rad = std::nullopt,
                   double sticky_rad = 0.0, bool stops = false,
-                  double yield_rad_s = 0.0, double yield_tau_nm = 0.0)
+                  double yield_rad_s = 0.0, double yield_tau_nm = 0.0,
+                  double creep_rad_s_per_nm = 0.0)
       : cfg_(std::move(cfg)),
         motor_(start_rad, block_rad, sticky_rad, /*err=*/1,
                stops ? std::optional<double>(kLimitLo) : std::nullopt,
                stops ? std::optional<double>(kLimitHi) : std::nullopt,
-               yield_rad_s, yield_tau_nm) {}
+               yield_rad_s, yield_tau_nm, creep_rad_s_per_nm) {}
 
   const GripperConfig& config() const noexcept override { return cfg_; }
   GripperConfig& config() noexcept { return cfg_; }
@@ -1340,6 +1371,391 @@ void test_advancing_once_per_frame_not_once_per_slice() {
         "ramp: ... not by a whole slice's worth");
 }
 
+// ── the force hold's position guard (Python #40, commit 549a27d) ─────────
+//
+// A hold frame is a PURE TORQUE SOURCE (kp = kd = 0). It carries no position
+// error, so clamp_to_travel — which bounds the COMMAND — has nothing to act on,
+// and a constant torque walks the jaws closed until something stops them. When
+// nothing does, they walk all the way: on 2026-10-10 grasp(5.0, 1.0) drove the
+// reference unit 104.9 mm past the closed stop at 0.3 Nm and broke the jaws.
+// The guard is therefore a PREDICATE, not a clamp: dropping the torque is the
+// only lever a pure torque source has.
+//
+// This section needs the fake to move under torque alone. The position term is
+// scaled by kp, so a kp = 0 frame never moves it — creep_rad_s_per_nm is what
+// makes the runaway path reachable at all. 0.05 rad/s per Nm at the 20 N =
+// 2.0 Nm setpoint is 0.1 rad/s: 0.02 rad per hold slice (hold_interval 0.2 s)
+// and 0.0005 rad per frame, which is the guard's granularity on each path.
+
+constexpr double kGuardForceN = 20.0;
+constexpr double kCreepRadSPerNm = 0.05;
+
+/// One hold slice's worth of creep at the setpoint, rad — the tolerance the
+/// slice-granular guard can overshoot its threshold by.
+double slice_travel_rad(const MotionConfig& m) {
+  return m.hold_interval * kCreepRadSPerNm * kGuardForceN * 0.1;
+}
+
+/// One frame's worth, rad — set_force judges every frame, not every slice.
+double frame_travel_rad(const MotionConfig& m) {
+  return m.frame_interval * kCreepRadSPerNm * kGuardForceN * 0.1;
+}
+
+int release_frame_count(const MotionConfig& m) {
+  return static_cast<int>(
+      std::nearbyint(m.stop_release_s / m.frame_interval));
+}
+
+/// The trailing run of limp frames (kp = kd = tau = 0) — the release tail.
+/// Taken from the end, so a zero crossing inside a hold ramp cannot pass for
+/// the start of it.
+std::vector<Frame> release_tail(const std::vector<Frame>& frames) {
+  std::size_t n = 0;
+  while (n < frames.size()) {
+    const Frame& f = frames[frames.size() - 1 - n];
+    if (!(f.kp == 0.0 && f.kd == 0.0 && f.tau_ff == 0.0)) break;
+    ++n;
+  }
+  return std::vector<Frame>(frames.end() - static_cast<std::ptrdiff_t>(n),
+                            frames.end());
+}
+
+bool all_limp(const std::vector<Frame>& frames) {
+  for (const Frame& f : frames) {
+    if (f.kp != 0.0 || f.kd != 0.0 || f.tau_ff != 0.0) return false;
+  }
+  return true;
+}
+
+// ── the predicate itself ─────────────────────────────────────────────────
+
+void test_closing_travel_excursion_rad() {
+  const GripperConfig cfg = test_config();
+
+  // Inside the travel — including exactly ON the closed limit — is zero.
+  for (double q : {kPosOpenRad, kPosOpenRad + 0.5, kPosClosedRad, 0.0}) {
+    check_near(closing_travel_excursion_rad(cfg, q), 0.0, 0.0,
+               "excursion: inside the travel is 0");
+  }
+  check_near(closing_travel_excursion_rad(cfg, kPosClosedRad + 0.03), 0.03,
+             1e-12, "excursion: past the closed limit is the distance");
+  // The open side is deliberately NOT an excursion: the same feed-forward
+  // torque pushes back that way, so reporting it would only fire the guard on
+  // ordinary operation.
+  check_near(closing_travel_excursion_rad(cfg, kPosOpenRad - 5.0), 0.0, 0.0,
+             "excursion: past the OPEN limit is not one");
+
+  // Reverse mount: closing means decreasing rad, so the closed-side limit is
+  // the numerically smaller one and the predicate mirrors.
+  const GripperConfig rev = test_config(/*reverse=*/true);
+  check(rev.close_sign() < 0.0, "excursion: the reverse config really is one");
+  check_near(closing_travel_excursion_rad(rev, kPosClosedRad), 0.0, 0.0,
+             "excursion: reverse, on the open end");
+  check_near(closing_travel_excursion_rad(rev, kPosOpenRad + 5.0), 0.0, 0.0,
+             "excursion: reverse, past the open limit");
+  check_near(closing_travel_excursion_rad(rev, kPosOpenRad - 0.03), 0.03,
+             1e-12, "excursion: reverse, past the closed limit");
+}
+
+// ── the hold's guard, through grasp() ────────────────────────────────────
+
+void test_a_hold_that_walks_out_of_the_travel_is_cut_short() {
+  // stops = false: the closed side is open-ended. That is the runaway.
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+            /*stops=*/false, 0.0, 0.0, kCreepRadSPerNm);
+  SafetyGuard guard = make_guard();
+  MotionConfig m = instant_config();
+  m.monotonic_fn = tick_clock(0.1);
+  MotionEngine engine(io, guard, m);
+
+  const GraspResult res = engine.grasp(kGuardForceN, 5.0);
+
+  check(!res.ok, "guard: the hold was cut short");
+  check(res.travel_guard, "guard: travel_guard reports it");
+
+  const double out_rad =
+      closing_travel_excursion_rad(io.config(), io.motor_.pos);
+  check(out_rad > 0.0, "guard: the jaws really walked out (else untested)");
+  check(out_rad <= m.hold_runaway_rad + slice_travel_rad(m) + 1e-9,
+        "guard: released next to the threshold, not at the far end");
+
+  // Releasing IS the action: what follows the last torque frame is exactly
+  // stop_release_s of limp frames, and there is a torque frame before them.
+  const std::vector<Frame> release = release_tail(io.frames);
+  check(!release.empty(), "guard: a release tail was sent");
+  check(static_cast<int>(release.size()) == release_frame_count(m),
+        "guard: the tail is stop_release_s of frames");
+  check(release.size() < io.frames.size(),
+        "guard: the tail is not the whole run");
+  check(all_limp(release), "guard: every release frame is limp");
+  check(io.frames[io.frames.size() - release.size() - 1].tau_ff != 0.0,
+        "guard: the frame before the tail still carried torque");
+}
+
+void test_the_guard_does_not_fire_when_the_stop_is_there() {
+  // The false-alarm side: with the mechanical stops installed (at the
+  // calibrated limits — that is where the calibration is probed from) the same
+  // torque walks the jaws onto the real stop and they go no further, so the
+  // excursion stays exactly 0 and the hold runs its full hold_s.
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+            /*stops=*/true, 0.0, 0.0, kCreepRadSPerNm);
+  SafetyGuard guard = make_guard();
+  MotionConfig m = instant_config();
+  m.monotonic_fn = tick_clock(0.1);
+  MotionEngine engine(io, guard, m);
+
+  const GraspResult res = engine.grasp(kGuardForceN, 2.0);
+
+  check(!res.travel_guard, "guard: a real stop is not a runaway");
+  check(res.ok, "guard: the hold ran to its deadline");
+  check_near(io.motor_.pos, kPosClosedRad, 1e-9, "guard: parked on the real stop");
+}
+
+void test_a_yielding_workpiece_does_not_trip_the_guard() {
+  // The workpiece gives way under the setpoint and the jaws follow it — that
+  // is a hold doing its job, not a runaway. It sits mid-travel, far from the
+  // closed-side limit, so the guard has nothing to report. No stops here
+  // either, so it is the workpiece alone that is holding the jaws back.
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, kObjectRad, 0.0,
+            /*stops=*/false, kYieldRadS, kYieldTauNm, kCreepRadSPerNm);
+  SafetyGuard guard = make_guard();
+  MotionConfig m = instant_config();
+  m.monotonic_fn = tick_clock(0.1);
+  MotionEngine engine(io, guard, m);
+
+  const GraspResult res = engine.grasp(kGuardForceN, 1.0);
+
+  check(!res.travel_guard, "guard: following a yielding workpiece is not runaway");
+  check(res.ok, "guard: the hold ran");
+  // It met the workpiece on the way in, so it neither reached the target nor
+  // stopped for a fault.
+  check(res.stalled, "guard: the closing leg stalled on the workpiece");
+  check(!res.reached, "guard: ... so it never reached the target");
+  check(closing_travel_excursion_rad(io.config(), io.motor_.pos) == 0.0,
+        "guard: mid-travel never counts as an excursion");
+}
+
+void test_the_guard_follows_the_mount_direction() {
+  // Reverse mount: closing means decreasing rad and the closed-side limit is
+  // the numerically smaller one. Start inside the red lines on the open side
+  // (the engine drives a gripper that starts outside them back in, which is a
+  // different path).
+  FakeIo io(test_config(/*reverse=*/true), /*start_rad=*/ -0.5, std::nullopt,
+            0.0, /*stops=*/false, 0.0, 0.0, kCreepRadSPerNm);
+  SafetyGuard guard = make_guard();
+  MotionConfig m = instant_config();
+  m.monotonic_fn = tick_clock(0.1);
+  MotionEngine engine(io, guard, m);
+  check(io.config().close_sign() < 0.0, "guard: reverse mount confirmed");
+
+  const GraspResult res = engine.grasp(kGuardForceN, 5.0);
+
+  check(res.travel_guard, "guard: the reverse mount trips too");
+  check(!res.ok, "guard: ... and the hold is cut short");
+  const double out_rad =
+      closing_travel_excursion_rad(io.config(), io.motor_.pos);
+  check(out_rad > 0.0, "guard: the jaws really walked out (else untested)");
+  check(out_rad <= m.hold_runaway_rad + slice_travel_rad(m) + 1e-9,
+        "guard: released next to the threshold");
+}
+
+// ── the guard judged before the first frame (grasp() cannot reach this) ──
+
+void test_a_hold_entered_outside_the_travel_pushes_nothing() {
+  // The jaws were pushed past the limit by hand, or the calibration was
+  // replaced and the reading now sits outside it. Holding force there could
+  // only drive them further out, so the guard is judged BEFORE the first
+  // frame: nothing is pushed, the release goes out, and the hold never starts.
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+            /*stops=*/false, 0.0, 0.0, kCreepRadSPerNm);
+  SafetyGuard guard = make_guard();
+  MotionConfig m = instant_config();
+  m.monotonic_fn = tick_clock(0.1);
+  MotionEngine engine(io, guard, m);
+  io.motor_.pos = kPosClosedRad + 2.0 * m.hold_runaway_rad;
+
+  // What this case exists to show: the guard really is already exceeded, so a
+  // hold that pushed anything would be pushing past it.
+  check(closing_travel_excursion_rad(io.config(), io.motor_.pos) >
+            m.hold_runaway_rad,
+        "guard: the start really is outside the guard");
+
+  const MotionEngineTestAccess::Hold hold =
+      MotionEngineTestAccess::hold(engine, kGuardForceN, 0.6);
+
+  check(!hold.ok, "guard: nothing was held");
+  check(hold.guarded, "guard: travel_guard reports it");
+  check(hold.cycles == 0, "guard: judged before the first frame, so no slice ran");
+  check(!io.frames.empty(), "guard: the release frames went out");
+  check(all_limp(io.frames), "guard: not one torque frame went out");
+}
+
+void test_an_uncalibrated_config_gets_no_hold_guard() {
+  // Uncalibrated, the placeholder limits describe no real travel, so the guard
+  // is off — the same call the ruling clamp_to_travel makes. grasp() cannot
+  // reach this (its closing leg requires a calibration first), but hold_force
+  // is the engine, and this is its behaviour on its own.
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+            /*stops=*/false, 0.0, 0.0, kCreepRadSPerNm);
+  SafetyGuard guard = make_guard();
+  MotionConfig m = instant_config();
+  m.monotonic_fn = tick_clock(0.1);
+  MotionEngine engine(io, guard, m);
+  io.config().calibrated = false;
+  io.motor_.pos = kPosClosedRad + 1.0;
+  check(closing_travel_excursion_rad(io.config(), io.motor_.pos) >
+            m.hold_runaway_rad,
+        "guard: the start would be outside the guard if it were on");
+
+  const MotionEngineTestAccess::Hold hold =
+      MotionEngineTestAccess::hold(engine, kGuardForceN, 0.4);
+
+  check(hold.ok, "guard: an uncalibrated hold still runs");
+  check(!hold.guarded, "guard: and is not guarded");
+}
+
+// ── the guard on set_force (its own frame loop, same predicate) ──────────
+
+void test_set_force_stops_when_the_jaw_runs_out_of_the_travel() {
+  // Starts inside the travel, just short of the closed limit: the climb covers
+  // part of the creep and the hold covers the rest, so the trip lands in the
+  // middle of that segment rather than on a boundary.
+  FakeIo io(test_config(), /*start_rad=*/ kPosClosedRad - 0.02, std::nullopt,
+            0.0, /*stops=*/false, 0.0, 0.0, kCreepRadSPerNm);
+  SafetyGuard guard = make_guard();
+  MotionConfig m = instant_config();
+  MotionEngine engine(io, guard, m);
+
+  check(!engine.set_force(kGuardForceN, 5.0),
+        "guard: set_force reports the cut-short hold");
+
+  const double out_rad =
+      closing_travel_excursion_rad(io.config(), io.motor_.pos);
+  check(out_rad > 0.0, "guard: the jaws really walked out");
+  // Judged every frame, so the granularity is one frame, not one slice.
+  check(out_rad <= m.hold_runaway_rad + frame_travel_rad(m) + 1e-9,
+        "guard: released next to the threshold");
+  check(frame_travel_rad(m) < slice_travel_rad(m),
+        "guard: the frame granularity is the tighter of the two");
+
+  const std::vector<Frame> release = release_tail(io.frames);
+  check(static_cast<int>(release.size()) == release_frame_count(m),
+        "guard: the tail is stop_release_s of frames");
+  check(all_limp(release), "guard: every release frame is limp");
+}
+
+void test_set_force_leaves_an_uncalibrated_config_alone() {
+  // set_force has never required a calibration, and the guard does not add a
+  // requirement: with no calibration it is off and the force goes out as
+  // before.
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+            /*stops=*/false, 0.0, 0.0, kCreepRadSPerNm);
+  SafetyGuard guard = make_guard();
+  MotionConfig m = instant_config();
+  MotionEngine engine(io, guard, m);
+  io.config().calibrated = false;
+  io.motor_.pos = kPosClosedRad + 1.0;
+  check(closing_travel_excursion_rad(io.config(), io.motor_.pos) >
+            m.hold_runaway_rad,
+        "guard: the start would be outside the guard if it were on");
+
+  check(engine.set_force(kGuardForceN, 0.2),
+        "guard: an uncalibrated set_force still succeeds");
+  check_near(io.frames.back().tau_ff, kGuardForceN * 0.1, 1e-9,
+             "guard: and streamed the full setpoint");
+}
+
+// ── non-finite setpoints and the climb loop (Python audit 2026-10-10) ────
+//
+// Every one of these was measured on the old code, which sent the NaN onward:
+// grasp() passed a NaN force into the closing leg's torque budget for the
+// whole leg, grasp()'s NaN hold_s made `bounded` false — an UNBOUNDED hold
+// rather than the short one it looks like — and set_force()'s climb loop
+// (`while probe != target_nm`) never terminated while sending no frame at all.
+// A refusal must come before the mechanism moves: a NaN is not a large or a
+// small boundary, it has no meaning.
+
+constexpr double kNaN = std::numeric_limits<double>::quiet_NaN();
+constexpr double kInf = std::numeric_limits<double>::infinity();
+
+void test_grasp_refuses_a_non_finite_force_or_hold() {
+  for (double bad : {kNaN, kInf, -kInf}) {
+    FakeIo io(test_config(), -1.0, std::nullopt, 0.0, /*stops=*/true);
+    SafetyGuard guard = make_guard();
+    MotionConfig m = instant_config();
+    m.monotonic_fn = tick_clock(0.1);
+    MotionEngine engine(io, guard, m);
+
+    check_throws<CommandError>([&] { engine.grasp(bad, 0.0); },
+                               "non-finite: grasp(force_n) refused");
+    check(io.frames.empty(), "non-finite: grasp(force_n) sent no frame");
+
+    check_throws<CommandError>([&] { engine.grasp(kGuardForceN, bad); },
+                               "non-finite: grasp(hold_s) refused");
+    check(io.frames.empty(), "non-finite: grasp(hold_s) sent no frame");
+  }
+
+  // force_n = nullopt takes MotionConfig::force_n, and the same rule applies
+  // to it.
+  FakeIo io(test_config(), -1.0, std::nullopt, 0.0, /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionConfig m = instant_config();
+  m.monotonic_fn = tick_clock(0.1);
+  m.force_n = kNaN;
+  MotionEngine engine(io, guard, m);
+  check_throws<CommandError>([&] { engine.grasp(std::nullopt, 0.0); },
+                             "non-finite: the MotionConfig setpoint is checked too");
+  check(io.frames.empty(), "non-finite: the config setpoint sent no frame");
+}
+
+void test_set_force_refuses_a_non_finite_force_or_duration() {
+  for (double bad : {kNaN, kInf, -kInf}) {
+    FakeIo io(test_config(), -1.0, std::nullopt, 0.0, /*stops=*/true);
+    SafetyGuard guard = make_guard();
+    MotionEngine engine(io, guard, instant_config());
+
+    check_throws<CommandError>([&] { engine.set_force(bad, 0.0); },
+                               "non-finite: set_force(force_n) refused");
+    check(io.frames.empty(), "non-finite: set_force(force_n) sent no frame");
+
+    check_throws<CommandError>([&] { engine.set_force(kGuardForceN, bad); },
+                               "non-finite: set_force(duration) refused");
+    check(io.frames.empty(), "non-finite: set_force(duration) sent no frame");
+  }
+}
+
+void test_the_force_climb_never_spins_when_a_step_is_absorbed() {
+  // A step small enough for the arithmetic to eat (`probe + step == probe`)
+  // never reaches the setpoint, and `while (probe != target_nm)` spins on it
+  // forever without sending a frame. Each step now verifies that the distance
+  // to the setpoint really shrank.
+  FakeIo io(test_config(), -1.0, std::nullopt, 0.0, /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionConfig m = instant_config();
+  m.force_ramp_n_s = 1e-15;
+  MotionEngine engine(io, guard, m);
+
+  check_throws<CommandError>([&] { engine.set_force(kGuardForceN, 0.0); },
+                             "non-finite: a swallowed step raises instead of spinning");
+  check(io.frames.empty(), "non-finite: the swallowed-step climb sent no frame");
+}
+
+void test_a_normal_climb_still_lands_on_the_setpoint() {
+  // The gate above must not have changed the normal climb: still one step per
+  // frame, landing exactly on the setpoint.
+  FakeIo io(test_config(), -1.0, std::nullopt, 0.0, /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  check(engine.set_force(kGuardForceN, 0.0), "non-finite: a normal climb passes");
+  check(!io.frames.empty(), "non-finite: a normal climb sends frames");
+  if (io.frames.empty()) return;
+  check_near(io.frames.front().tau_ff, kRampStepNm, 1e-9,
+             "non-finite: the first frame is one step off zero");
+  check_near(io.frames.back().tau_ff, kGuardForceN * 0.1, 1e-9,
+             "non-finite: the climb lands exactly on the setpoint");
+}
+
 // ── zero-gravity (Python dump S7) ────────────────────────────────────────
 //
 // The sustain loop is wall-clock driven in both SDKs (0.005 s per frame), so
@@ -1650,6 +2066,19 @@ int main() {
   test_it_lands_exactly_on_the_setpoint_and_stays();
   test_the_climb_is_linear_in_time();
   test_advancing_once_per_frame_not_once_per_slice();
+  test_closing_travel_excursion_rad();
+  test_a_hold_that_walks_out_of_the_travel_is_cut_short();
+  test_the_guard_does_not_fire_when_the_stop_is_there();
+  test_a_yielding_workpiece_does_not_trip_the_guard();
+  test_the_guard_follows_the_mount_direction();
+  test_a_hold_entered_outside_the_travel_pushes_nothing();
+  test_an_uncalibrated_config_gets_no_hold_guard();
+  test_set_force_stops_when_the_jaw_runs_out_of_the_travel();
+  test_set_force_leaves_an_uncalibrated_config_alone();
+  test_grasp_refuses_a_non_finite_force_or_hold();
+  test_set_force_refuses_a_non_finite_force_or_duration();
+  test_the_force_climb_never_spins_when_a_step_is_absorbed();
+  test_a_normal_climb_still_lands_on_the_setpoint();
   test_zero_gravity();
   test_ceilings_and_refusals();
   test_recovery_from_open_stop();

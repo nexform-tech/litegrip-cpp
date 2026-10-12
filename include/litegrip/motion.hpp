@@ -159,6 +159,26 @@ struct MotionConfig {
   // actions.MotionConfig.force_ramp_n_s.
   double force_ramp_n_s = 20.0;    // hold ramp rate, N/s
   double hold_interval = 0.2;      // hold slice length, s
+  // Runaway detection for the force hold, rad: once the measured position has
+  // run this far PAST the closed-side calibrated limit, the torque is dropped
+  // and the hold ends.
+  //
+  // A hold frame carries kp = kd = 0, so it has no position error and
+  // clamp_to_travel — which bounds the COMMAND — has nothing to act on: a
+  // constant torque walks the jaws closed until something stops them, and when
+  // there is nothing to stop them (a stale calibration, a damaged or missing
+  // stop) they walk all the way. On 2026-10-10 they did: grasp(5.0, 1.0) drove
+  // the reference unit 104.9 mm past the closed stop at 0.3 Nm and broke the
+  // jaws. A pure torque source has exactly one lever — drop the torque — so
+  // this guard is a PREDICATE, not a clamp (closing_travel_excursion_rad).
+  //
+  // This detects RUNAWAY; it does not give the hold an accuracy. A normal hold
+  // never reaches it — against an object the jaws stop on the object, and
+  // against nothing they stop on the real stop, which sits at (or near) the
+  // calibrated limit, since the calibration is probed from those stops. 0.05
+  // rad is the margin for a calibration that is slightly off, about 3.05 mm at
+  // the factory rad_to_mm = 61.0123. A real runaway is measured in millimetres.
+  double hold_runaway_rad = 0.05;
   // [Deprecated] A hold no longer uses gains (see above). Kept so an older
   // config still compiles; setting them has no effect.
   double hold_kp = 150.0;          // deprecated: hold stiffness
@@ -258,6 +278,13 @@ struct GraspResult {
   double target_rad = 0.0;
   double force_n = 0.0;  // the force actually used
   int cycles = 0;        // hold slices run
+  /// The hold's position guard tripped: the measured position walked more than
+  /// MotionConfig::hold_runaway_rad past the closed-side calibrated limit, so
+  /// the torque was dropped and the hold ended. Implies `ok == false`. The
+  /// symmetry of MoveResult::protection_tripped — that one guards the MOVE's
+  /// torque, this one the HOLD's excursion. A normal grasp never sets it: the
+  /// jaws stop on the workpiece, or on the real stop at the calibrated limit.
+  bool travel_guard = false;
 
   explicit operator bool() const noexcept { return ok; }
 };
@@ -296,6 +323,30 @@ void check_calibrated(const GripperConfig& config);
 /// clamping into them is worse than not clamping — the ruling
 /// recover_to_interior() and the force hold's guard follow too.
 double clamp_to_travel(const GripperConfig& config, double q);
+
+/// How far `q` has walked past the CLOSED-side calibrated limit, in rad (0.0
+/// while it is inside).
+///
+/// The force hold's guard is built on this. Those frames carry kp = kd = 0, so
+/// they have no position error and clamp_to_travel — which bounds the COMMAND —
+/// has nothing to act on: the only lever is dropping the torque, which is why
+/// that guard is a predicate rather than a clamp. The two guards bound two
+/// different things: clamp_to_travel caps the COMMAND, this one stops a
+/// RUNAWAY.
+///
+/// Only the closed side is judged. The frames carry `close_sign x force`, so
+/// the torque pushes toward closing, and running past the closed limit is the
+/// runaway — with no real stop there (a stale calibration, a missing stop)
+/// nothing ends it. Crossing the OPEN limit is pulled back by that same torque,
+/// so judging it would only false-trip pushing the jaws open by hand.
+///
+/// Reverse mounts are handled by close_sign(), so one expression covers both.
+///
+/// ⚠ Do not call this on an UNCALIBRATED config: the placeholder limits
+/// (pos_closed_rad 1.14 / pos_open_rad 0.0) describe no real travel, so the
+/// number it returns means nothing. Callers check GripperConfig::calibrated —
+/// the ruling clamp_to_travel and recover_to_interior() follow.
+double closing_travel_excursion_rad(const GripperConfig& config, double q);
 
 // ── target positions ─────────────────────────────────────────────────────
 
@@ -385,6 +436,12 @@ class MotionEngine {
   /// RAMPS to the setpoint from the torque in flight, at force_ramp_n_s, on
   /// gainless (kp=kd=0) frames — see MotionConfig's force-hold block.
   ///
+  /// The gainless hold is also what MotionConfig::hold_runaway_rad guards: once
+  /// the measured position has walked that far past the closed-side calibrated
+  /// limit, the torque is dropped, stop_release_s of limp frames go out, and the
+  /// hold ends — GraspResult::travel_guard is set and ok is false. A hold
+  /// ENTERED outside the guard pushes nothing at all.
+  ///
   /// ⚠ The N value is NOT force-calibrated (kForceCalibrationVerified is
   /// false): force_n is applied as torque = close_sign * force_n * 0.1 Nm,
   /// matching the Python SDK, so the two agree — not because the N is
@@ -397,6 +454,10 @@ class MotionEngine {
   /// call's wall clock is climb + duration and a short duration still reaches
   /// the full force; 0 means "ramp and return". Same gainless frames and same
   /// force-not-calibrated caveat as grasp().
+  ///
+  /// Returns false, and drops the torque, when the same
+  /// MotionConfig::hold_runaway_rad guard trips — this path streams the same
+  /// pure-torque frames and needs the same bound.
   bool set_force(double force_n, double duration_s = 0.3);
 
   /// Constant-speed move to an absolute opening (mm, 0 = closed) / angle.
@@ -458,11 +519,32 @@ class MotionEngine {
     bool ok = false;
     int cycles = 0;
     GripperState state;
+    /// The position guard tripped — see GraspResult::travel_guard. Mirrors
+    /// actions.HoldResult.guarded.
+    bool guarded = false;
   };
   /// Push force_n for hold_s: slices of frames_per_slice hold frames, then a
-  /// blocking state readback (verbatim port of actions._hold_force).
+  /// blocking state readback (verbatim port of actions._hold_force), with the
+  /// position guard judged before the first frame and again in every slice.
   HoldOutcome hold_force(double force_n, double hold_s,
                          const MoveProgressCallback& progress);
+
+  /// Grants the test suite the two hold_force behaviours that grasp() cannot
+  /// reach — the guard judged BEFORE the first frame (grasp always runs its
+  /// closing leg first, which brings the jaws back inside) and the guard
+  /// disabled on an uncalibrated config (grasp refuses such a config earlier).
+  /// The Python suite reaches actions._hold_force the same way. Not part of the
+  /// public surface.
+  friend struct MotionEngineTestAccess;
+
+  /// Drop the torque: stop_release_s of kp = kd = tau = 0 frames at `pos`.
+  ///
+  /// The two protective aborts share this — the travel-leg stall-torque
+  /// protection and the force hold's position guard — so they cannot drift
+  /// apart (Python's actions._release). A zero-gain frame produces no force
+  /// whatever `pos` is; it only hands the driver a command that is not a stale
+  /// target. Returns the number of frames sent.
+  int release(double pos, const char* source);
 
   /// The recovery channel, engine-side (see the header comment). No-op when
   /// the measured position is already inside the red lines; otherwise drives

@@ -165,11 +165,12 @@ SDK today.
 `enter_zero_gravity` / `exit_zero_gravity` run the same frame-by-frame engine
 as the online Python SDK (`MotionConfig` carries the tuned defaults; a
 `MoveResult` / `GraspResult` reports `ok` / `reached` / `stalled`, plus
-`MoveResult::protection_tripped`). A press move whose jaw is blocked out in the
-travel leg lets go — 0.2 s of `kp=kd=tau=0` frames, so the gripper can be pushed
-by hand instead of holding on — once the jaw is moving well below the commanded
-speed and the torque is over `MotionConfig::stop_torque_nm` (0.7 Nm) on three
-consecutive samples. Such a move is never `ok`. `open()`
+`MoveResult::protection_tripped` and `GraspResult::travel_guard`). A press move
+whose jaw is blocked out in the travel leg lets go — 0.2 s of `kp=kd=tau=0`
+frames, so the gripper can be pushed by hand instead of holding on — once the
+jaw is moving well below the commanded speed and the torque is over
+`MotionConfig::stop_torque_nm` (0.7 Nm) on three consecutive samples. Such a move
+is never `ok`. `open()`
 and `close()` no longer take gains or a duration — they take an optional speed
 and aim past the calibrated limit onto the stop, and their truthiness still
 means "pressed onto the stop". The **command** is capped at the calibrated limit
@@ -244,6 +245,31 @@ includes it, so the call's wall clock is `climb + duration` and a short
 press of a close to a 20 N setpoint takes half a second: `set_force(20.0)` is
 about 1.3 s of streaming, where it used to be 0.3 s. `duration = 0` means "ramp
 to the setpoint and return".
+
+### The runaway watch
+
+A hold frame carries no position error, so no position bound can act on it: what
+`clamp_to_travel` caps is a **command**, and a pure torque source does not carry
+one. A constant torque therefore walks the jaws closed until something stops
+them, and when nothing does — a stale calibration, a damaged or missing stop —
+they walk all the way. The hold's only lever is the torque itself, so this is a
+**predicate, not a clamp**: once the measured position is
+`MotionConfig::hold_runaway_rad` (0.05 rad, about 3.05 mm at the factory
+`rad_to_mm` of 61.0123) past the closed-side calibrated limit, `grasp` and
+`set_force` stream `MotionConfig::stop_release_s` of zero-torque frames and
+return — `GraspResult::travel_guard` set with `ok` false, or `false` from
+`set_force`. A hold **entered** outside the guard pushes nothing at all.
+
+Only the closing side is judged, because that is the side the feed-forward
+pushes; crossing the open limit is pulled back by the same torque.
+
+This is a **runaway detector, not an accuracy bound**. Against an object the
+jaws stop on the object; against nothing they stop on the mechanical stop, which
+sits at the calibrated limit, since that is where the calibration was probed.
+Raise `hold_runaway_rad` only if a jaw that is genuinely holding something is
+being released. The guard is off until the config is calibrated: the placeholder
+limits describe no real travel, so a window built from them is worse than none —
+the same call `clamp_to_travel` makes.
 
 ## Testing
 
@@ -355,6 +381,9 @@ These are the safety argument and must not be relaxed:
    engine emits on its ramp and hold paths is clamped into
    `[min(pos_closed_rad, pos_open_rad), max(pos_closed_rad, pos_open_rad)]`
    (`clamp_to_travel`, in `emit()`). An uncalibrated config has no travel to
-   clamp into, so the entry refuses instead. The one path outside this is the
+   clamp into, so the entry refuses instead. Two paths are outside it: the
    recovery crawl, which exists to move a gripper whose measured position is
-   already illegal and has its own bounded, inward-only drive.
+   already illegal and has its own bounded, inward-only drive, and the force
+   hold's pure-torque frames, which carry no command to clamp and are covered
+   from the other side by the runaway watch
+   ([The runaway watch](#the-runaway-watch)).
