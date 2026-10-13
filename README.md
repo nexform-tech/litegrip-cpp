@@ -224,7 +224,7 @@ trusting it, or call `refresh_status()` first.
 | `open(speed_mm_s=None, progress={})` → `MoveResult` | Ramps toward the calibrated open-side stop, pressing onto it. With `GripperConfig::work_stroke_mm` strictly inside the travel it stops at that opening instead, as an ordinary positioning move. |
 | `close(speed_mm_s=None, progress={})` → `MoveResult` | The same, toward the closed side. `work_stroke_mm` is an open-side number and does not change where a close ends. |
 | `home()` → `MoveResult` | Ramps to the calibrated closed position. Not a press: it stops *on* the zero instead of loading it. |
-| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | Closes until it stalls (i.e. grips), then ramps to and holds `force_n` N. `hold_s = 0` holds until a fault or the runaway watch. `force_n` empty uses `MotionConfig::force_n` (20 N). |
+| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | Closes onto the object — or onto the closed-side calibrated stop if there is nothing there — then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. The hold takes over only once the jaw is stopped: `stalled` (something is between the jaws) or `reached` (the jaws closed empty). `hold_s = 0` holds until a fault or the runaway watch. `force_n` empty uses `MotionConfig::force_n` (20 N). |
 | `set_force(force_n, duration_s=0.3)` → `bool` | Holds `force_n` where the jaws already are, for `duration_s` seconds. |
 | `goto_mm(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | Ramp to a position in millimetres (0 = closed). |
 | `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | The same in radians. `dq_target` and `tau_feedforward` must be 0 — see below. |
@@ -356,7 +356,20 @@ Both define `operator bool` returning `ok`, so `if (gripper.close())` works. Wha
   `ok = true` — stopping short of the empty-jaw target is the point of gripping.
   On an empty gripper it can return `reached = true` while the jaw sits about
   `0.010 rad` short of `target_rad`: the close-side stick-slip dead band, which
-  is why `reach_tol` defaults to `0.02`.
+  is why `reach_tol` defaults to `0.02`. `target_rad` is the closed-side
+  calibrated stop itself.
+
+A fourth combination is a failure, and new in this version:
+
+- **`grasp()` with `ok = false, reached = false, stalled = false`** means the
+  closing leg ended without reaching the stop and without stalling — the jaw is
+  still in free travel. The hold is *not* entered: its frames carry no position
+  term and no velocity term, so handing a moving jaw to them leaves the
+  feed-forward torque as the only thing acting on it, and the jaw accelerates
+  until the runaway watch releases it. The call releases in place instead and
+  reports `cycles = 0`. Nothing was gripped. If you see this, the closing leg is
+  being starved — a stale state read, or friction the mechanism's own budget
+  cannot overcome.
 
 Three flags explain a failure:
 

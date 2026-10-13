@@ -208,7 +208,7 @@ static LiteGrip connect_raii(GripperConfig config = GripperConfig{});
 | `open(speed_mm_s=None, progress={})` → `MoveResult` | 斜坡走向张开侧标定限位并压住它。`GripperConfig::work_stroke_mm` 严格落在行程之内时改为停在那 个开口，是一次普通定位。 |
 | `close(speed_mm_s=None, progress={})` → `MoveResult` | 同样，朝闭合侧。`work_stroke_mm` 是张开侧的数，不改变闭合停在哪里。 |
 | `home()` → `MoveResult` | 斜坡走到标定闭合位置。不是压紧：它停在零点**上**，而不是压住零点。 |
-| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | 闭合到堵转（也就是夹住），然后爬到并保持 `force_n` N。`hold_s = 0` 保到故障或越位护栏为止。`force_n` 留空用 `MotionConfig::force_n`（20 N）。 |
+| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | 闭合到工件上 —— 空载则闭合到闭合侧标定限位 —— 然后爬到并保持 `force_n` N。闭合段带着 `force_n` 作为力矩预算，所以撞上工件时压出的力不超过设定值。只有夹爪停下来后保力段才接手：`stalled`（两指之间有东西）或 `reached`（空载闭合到位）。`hold_s = 0` 保到故障或越位护栏为止。`force_n` 留空用 `MotionConfig::force_n`（20 N）。 |
 | `set_force(force_n, duration_s=0.3)` → `bool` | 在夹爪当前所在处保持 `force_n`，持续 `duration_s` 秒。 |
 | `goto_mm(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | 斜坡走到一个毫米目标（0 = 闭合）。 |
 | `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | 同样，单位是弧度。`dq_target` 与 `tau_feedforward` 必须是 0 —— 见下。 |
@@ -320,7 +320,16 @@ MotionConfig::press_safety`（0.9，于是压出的力矩落在设定值之下�
 - **夹到工件的 `grasp()`** 返回 `stalled = true, reached = false` 且 `ok = true`
   —— 停不到空载那个目标上，正是夹取的意义。空载时它可能返回 `reached = true`，
   而夹爪停在离 `target_rad` 约 `0.010 rad` 处：闭合侧粘滑死区，这也是
-  `reach_tol` 默认为 `0.02` 的原因。
+  `reach_tol` 默认为 `0.02` 的原因。`target_rad` 就是闭合侧标定限位本身。
+
+第四种组合是失败，本版本新增：
+
+- **`grasp()` 返回 `ok = false, reached = false, stalled = false`**，说明闭合段
+  结束时既没到位也没堵转 —— 夹爪还在自由行程里。此时**不进入**保力段：保力帧里
+  既没有位置项也没有速度项，把还在走的夹爪交过去，前馈力矩就成了唯一作用在它上面
+  的力，它会一路加速直到越位护栏撤力。调用改为原地撤力返回，`cycles = 0`。什么都
+  没夹住。看到这个结果说明闭合段被拖住了 —— 读数过期，或者机构自身预算顶不过的
+  摩擦。
 
 三个标志解释失败：
 
