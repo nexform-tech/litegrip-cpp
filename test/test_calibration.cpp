@@ -72,8 +72,27 @@ int main() {
             "canfd_mode");
       check(factory->motor_type.has_value() && *factory->motor_type == "DM4310",
             "motor_type");
-      check(factory->kp.has_value() && std::fabs(*factory->kp - 5.0) < 1e-12,
-            "kp");
+      // The factory file must not carry a stiffness of its own. Two documented
+      // entry points describe the same gripper: load_template("normal") states
+      // a direction and carries no gains, so it lands on GripperConfig's
+      // defaults (asserted in the mount-template block below), while
+      // load_calibration() on this file overwrites kp/kd. When the two
+      // disagree, the same stop is pressed by a different factor while the
+      // geometry still looks identical -- the one-field mismatch this pins.
+      // The file carried kp 5.0 against a default of 100.0, and the engine is
+      // dimensioned for 100: max_lead_mm, stop_lead_mm and stop_torque_nm are
+      // each quoted at that gain. At 5.0 the closing authority caps at 0.33 Nm
+      // -- under the shipped stop_torque_nm of 0.7 Nm, which no move at that
+      // gain could ever reach -- and the positioning moves stalled short on the
+      // bench. The Python SDK, which this port follows, reverted the same 5.0
+      // in its own calibration file.
+      const litegrip::GripperConfig defaults;
+      check(!factory->kp.has_value() ||
+                std::fabs(*factory->kp - defaults.kp) < 1e-12,
+            "the factory file's kp is GripperConfig's default, not its own");
+      check(!factory->kd.has_value() ||
+                std::fabs(*factory->kd - defaults.kd) < 1e-12,
+            "the factory file's kd is GripperConfig's default, not its own");
       check(factory->grasp_torque_threshold.has_value() &&
                 std::fabs(*factory->grasp_torque_threshold - 0.5) < 1e-12,
             "grasp_torque_threshold");
