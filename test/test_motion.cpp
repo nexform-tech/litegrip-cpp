@@ -2357,6 +2357,50 @@ void test_recovery_from_closed_stop() {
         "recovery: crawled below the red max");
 }
 
+void test_recovery_window_follows_stop_tol() {
+  // The window past a calibrated limit may not be narrower than the tolerance
+  // move_to_limit() calls a successful press (MotionConfig::stop_tol, 0.02 rad
+  // by default). 0.015 rad past kPosClosedRad is a park close() reports as
+  // ok = true, and the flat 0.01 rad window used to refuse it from the NEXT
+  // move with "inspect the mechanism" — a message about a mechanism that is
+  // exactly where it was left.
+  const double parked = kPosClosedRad + 0.015;
+  {
+    FakeIo io(test_config(), /*start_rad=*/ parked, std::nullopt, 0.0,
+              /*stops=*/true);
+    SafetyGuard guard = make_guard();
+    MotionEngine engine(io, guard, instant_config());
+    const MoveResult res = engine.open();
+    check(res.ok, "recovery: a park inside stop_tol still recovers");
+    check(!io.frames.empty() && io.frames.front().kp == 50.0,
+          "recovery: ... and it got there through the recovery crawl");
+  }
+  {  // The window is stop_tol wide, not unbounded: a press may not park 0.035
+     // rad past the limit and call itself ok, so that start is still refused.
+    FakeIo io(test_config(), /*start_rad=*/ kPosClosedRad + 0.035,
+              std::nullopt, 0.0, /*stops=*/true);
+    SafetyGuard guard = make_guard();
+    MotionEngine engine(io, guard, instant_config());
+    check_throws<SafetyFault>(
+        [&] { engine.open(); },
+        "recovery: 0.035 rad past the limit is still refused");
+    check(io.frames.empty(), "recovery: that refusal sends no frame");
+  }
+  {  // ...and the 0.01 floor survives a config that asks for less. It is a
+     // max(), not a replacement: the floor is what keeps a status frame
+     // quantized to the 0.0103 rad grid reading as "on its stop".
+    MotionConfig tight = instant_config();
+    tight.stop_tol = 0.002;
+    FakeIo io(test_config(), /*start_rad=*/ parked, std::nullopt, 0.0,
+              /*stops=*/true);
+    SafetyGuard guard = make_guard();
+    MotionEngine engine(io, guard, tight);
+    check_throws<SafetyFault>(
+        [&] { engine.open(); },
+        "recovery: a stop_tol below the floor does not narrow the window");
+  }
+}
+
 void test_the_shipped_calibration_spans_the_shipped_red_lines() {
   // The README's "why a cycle reports it is recovering" section is arithmetic
   // on two shipped files, so pin it here rather than quote it: the factory
@@ -2531,6 +2575,7 @@ int main() {
   test_ceilings_and_refusals();
   test_recovery_from_open_stop();
   test_recovery_from_closed_stop();
+  test_recovery_window_follows_stop_tol();
   test_the_shipped_calibration_spans_the_shipped_red_lines();
   test_recovery_jammed_is_fault();
   test_recovery_config_ceilings();
