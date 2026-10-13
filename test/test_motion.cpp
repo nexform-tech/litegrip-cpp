@@ -655,6 +655,10 @@ void test_an_uncalibrated_config_is_refused_before_any_frame() {
   check_throws<CommandError>([&] { engine.move_at_speed_rad(-1.4, 0.5); },
                              "uncalibrated move_at_speed_rad refuses");
   check(io.frames.empty(), "uncalibrated move_at_speed_rad sent no frame");
+  check_throws<CommandError>(
+      [&] { engine.ramp_to(-0.5, 0.0, 0.5, std::nullopt, std::nullopt, {}); },
+      "uncalibrated ramp_to refuses");
+  check(io.frames.empty(), "uncalibrated ramp_to sent no frame");
   check_throws<CommandError>([&] { engine.close(); },
                              "uncalibrated close refuses");
   check(io.frames.empty(), "uncalibrated close sent no frame");
@@ -684,6 +688,9 @@ void test_a_non_finite_target_is_refused_before_any_frame() {
                              "NaN target_rad refuses");
   check_throws<CommandError>([&] { engine.move_at_speed_rad(-1.4, nan); },
                              "NaN speed_rad_s refuses");
+  check_throws<CommandError>(
+      [&] { engine.ramp_to(nan, 0.0, 0.5, std::nullopt, std::nullopt, {}); },
+      "NaN ramp_to target refuses");
   check(io.frames.empty(), "non-finite targets sent no frame");
 }
 
@@ -1077,7 +1084,50 @@ void test_press_reach_tolerance() {
   }
 }
 
-// ── constant-speed moves (Python dump S8/S8b) ────────────────────────────
+// ── the positioning ramp: move_at_speed / ramp_to ────────────────────────
+//
+// The `// py:` numbers in this block were re-dumped through the MERGED Python
+// SDK (litegrip-python 97156f4, the commit that put this family on the engine
+// ramp) against the same tests/fake_can.py plant, so the marker means what it
+// means elsewhere in this file. The plant is the purely kinematic motor
+// described at the top: a frame's torque is kp x (q - pos), and at kp = 100
+// with rad_to_mm 74.19 a lead of 4 mm is 0.0539 rad, i.e. 5.4 Nm — inside the
+// +/-10 Nm frame range, which is the whole point of the cap.
+
+/// The travel-phase lead cap the engine uses for a non-press move at this
+/// speed: max_lead_mm, but never less than one frame of the commanded velocity
+/// (the travel_cap_rad / min_cap_rad pair in motion.cpp).
+double travel_cap_rad(const MotionConfig& m, const GripperConfig& g,
+                      double speed_rad_s) {
+  return std::max(m.max_lead_mm / g.rad_to_mm,
+                  speed_rad_s * m.frame_interval);
+}
+
+double max_lead_rad(const std::vector<Frame>& frames, double start_rad) {
+  double worst = 0.0;
+  double prev = start_rad;
+  for (const Frame& f : frames) {
+    worst = std::max(worst, std::fabs(f.q - prev));
+    prev = f.pos_after;
+  }
+  return worst;
+}
+
+double max_abs_tau(const std::vector<Frame>& frames) {
+  double worst = 0.0;
+  for (const Frame& f : frames) {
+    worst = std::max(worst, std::fabs(f.tau_nm));
+  }
+  return worst;
+}
+
+std::size_t count_release_frames(const std::vector<Frame>& frames) {
+  std::size_t n = 0;
+  for (const Frame& f : frames) {
+    if (f.kp == 0.0) ++n;
+  }
+  return n;
+}
 
 void test_move_at_speed_mm() {
   FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
@@ -1086,23 +1136,32 @@ void test_move_at_speed_mm() {
   MotionEngine engine(io, guard, instant_config());
 
   check_near(io.motor_.reported_pos(), -1.0, 0.0, "S8: start");
-  const bool ok = engine.move_at_speed(40.0, 30.0);
-  check(ok, "S8: ok");
-  check(io.frames.size() == 300, "S8: frames = 280 ramp+1 + 20 hold (py: 300)");
-  check_near(io.frames[0].q, -1.0, 1e-12, "S8: frame 0 q = start");
-  check_near(io.frames[0].dq, 0.404367165, 1e-8, "S8: frame 0 dq (+30mm/s)");
+  const MoveResult res = engine.move_at_speed(40.0, 30.0);
+  check(res.ok && res.reached && !res.stalled, "S8: arrived, not stalled");
+  check(!res.released, "S8: an arrival is not released");
+  // 41.92 mm at 30 mm/s = 1.3974 s = 279.5 frames -> 280 ramp + 60 settle.
+  check(io.frames.size() == 340, "S8: frames = 280 ramp + 60 settle (py: 340)");
+  check(res.steps == 340, "S8: steps (py: 340)");
+  check(count_nonzero_dq(io.frames) == 280, "S8: ramp frames carry dq");
+  check_near(io.frames[0].q, -0.9979815079304103, 1e-12,
+             "S8: frame 0 q (py)");
+  check_near(io.frames[0].dq, 0.4043671653861707, 1e-12, "S8: frame 0 dq");
   check(io.frames[0].kp == 100.0 && io.frames[0].kd == 2.0,
         "S8: config gains");
-  check_near(io.frames[0].pos_after, -0.997978164, 1e-8, "S8: frame 0 pos");
-  // The schedule runs i = 0..steps (steps = 279) with dq killed on the last
-  // ramp frame, then 20 hold frames — 279 frames carry the feed-forward.
-  check(count_nonzero_dq(io.frames) == 279, "S8: ramp frames with dq");
-  check_near(io.frames[279].q, -0.434822221, 1e-8, "S8: ramp end at target");
-  check(io.frames[279].dq == 0.0, "S8: dq killed on the final ramp frame");
-  check_near(io.frames.back().q, -0.434822221, 1e-8, "S8: hold tail at target");
+  check_near(io.frames[0].pos_after, -0.9974735411556718, 1e-12,
+             "S8: frame 0 pos (py)");
+  check(io.frames[280].dq == 0.0, "S8: dq killed on the final ramp frame");
+  check_near(io.frames.back().q, -0.4348222205148942, 1e-12,
+             "S8: settled at target");
   // The target mm round-trips through close_sign: 40 mm -> rad.
   check_near(io.frames.back().q, kPosClosedRad - 40.0 / kRadToMm, 1e-12,
              "S8: target rad from target_mm");
+  // The lead cap is what bounds the frame's torque.
+  const double cap_rad =
+      travel_cap_rad(instant_config(), test_config(), 30.0 / kRadToMm);
+  check(max_lead_rad(io.frames, -1.0) <= cap_rad + 1e-12,
+        "S8: no frame leads past max_lead_mm");
+  check(max_abs_tau(io.frames) < FakeMotor::kTauMax, "S8: torque in range");
 }
 
 void test_move_at_speed_rad() {
@@ -1111,29 +1170,285 @@ void test_move_at_speed_rad() {
   SafetyGuard guard = make_guard();
   MotionEngine engine(io, guard, instant_config());
 
-  const bool ok = engine.move_at_speed_rad(-0.5, 0.5);
-  check(ok, "S8b: ok");
-  check(io.frames.size() == 221, "S8b: frames = 200+1+20 (py: 221)");
-  check_near(io.frames[0].dq, 0.5, 0.0, "S8b: frame 0 dq");
-  check_near(io.frames[0].pos_after, -0.9975, 1e-12, "S8b: frame 0 pos");
+  const MoveResult res = engine.move_at_speed_rad(-0.5, 0.5);
+  check(res.ok && res.reached, "S8b: arrived");
+  // 0.5 rad at 0.5 rad/s = 1.0 s = 200 ramp frames + 60 settle.
+  check(io.frames.size() == 260, "S8b: frames = 200 ramp + 60 settle (py: 260)");
+  check_near(io.frames[0].q, -0.9975, 1e-12, "S8b: frame 0 q (py)");
+  check_near(io.frames[0].dq, 0.5, 1e-12, "S8b: frame 0 dq");
+  check_near(io.frames[0].pos_after, -0.996875, 1e-12, "S8b: frame 0 pos (py)");
   check(count_nonzero_dq(io.frames) == 200, "S8b: ramp frames with dq");
   check(io.frames[200].dq == 0.0, "S8b: dq killed on the final ramp frame");
   check_near(io.frames[200].q, -0.5, 1e-12, "S8b: ramp end at target");
 }
 
-void test_move_at_speed_noops() {
+void test_move_at_speed_shares_the_goto_ramp() {
+  // One law, two spellings of the speed: move_at_speed(40, 30) must produce
+  // the same frames as ramp_to(duration = distance / 30).
+  const double start = -1.0;
+  const double target_rad = kPosClosedRad - 40.0 / kRadToMm;
+  const double distance_mm = std::fabs(target_rad - start) * kRadToMm;
+
+  FakeIo by_speed(test_config(), start, std::nullopt, 0.0, /*stops=*/true);
+  SafetyGuard g1 = make_guard();
+  MotionEngine e1(by_speed, g1, instant_config());
+  const MoveResult r1 = e1.move_at_speed(40.0, 30.0);
+
+  FakeIo by_duration(test_config(), start, std::nullopt, 0.0, /*stops=*/true);
+  SafetyGuard g2 = make_guard();
+  MotionEngine e2(by_duration, g2, instant_config());
+  const MoveResult r2 =
+      e2.ramp_to(target_rad, 0.0, distance_mm / 30.0, std::nullopt,
+                 std::nullopt, {});
+
+  check(r1.ok && r2.ok, "same ramp: both arrive");
+  check(r1.steps == r2.steps, "same ramp: same step count");
+  check_near(r1.target_rad, r2.target_rad, 0.0, "same ramp: same target");
+  check(by_speed.frames.size() == by_duration.frames.size(),
+        "same ramp: same frame count");
+  bool identical = by_speed.frames.size() == by_duration.frames.size();
+  for (std::size_t i = 0; identical && i < by_speed.frames.size(); ++i) {
+    identical = by_speed.frames[i].q == by_duration.frames[i].q &&
+                by_speed.frames[i].dq == by_duration.frames[i].dq;
+  }
+  check(identical, "same ramp: frame-for-frame identical commands");
+}
+
+void test_move_at_speed_refuses_a_non_positive_speed() {
+  // The old code returned true here: "move at 0 mm/s" reported success
+  // without sending a frame.
   FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
             /*stops=*/true);
   SafetyGuard guard = make_guard();
   MotionEngine engine(io, guard, instant_config());
 
-  // Already there (< 0.01 mm) and speed <= 0 are "nothing to do" => true.
-  const double current_mm = io.get_state(true).position_mm;
-  check(engine.move_at_speed(current_mm, 30.0), "no-op: already there");
-  check(engine.move_at_speed(40.0, 0.0), "no-op: speed <= 0");
-  check(engine.move_at_speed_rad(-1.0, 0.5), "no-op rad: already there");
-  check(io.frames.empty(), "no-op moves send no frames");
+  check_throws<CommandError>([&] { engine.move_at_speed(40.0, 0.0); },
+                             "move_at_speed: speed 0 refused");
+  check_throws<CommandError>([&] { engine.move_at_speed(40.0, -30.0); },
+                             "move_at_speed: negative speed refused");
+  check_throws<CommandError>([&] { engine.move_at_speed_rad(0.0, 0.0); },
+                             "move_at_speed_rad: speed 0 refused");
+  check_throws<CommandError>(
+      [&] { engine.ramp_to(-0.5, 0.0, std::nullopt, std::nullopt,
+                           std::nullopt, {}); },
+      "ramp_to: no speed and no duration refused");
+  check(io.frames.empty(), "refused moves send no frames");
 }
+
+void test_a_goto_that_used_to_saturate() {
+  // The shape of the 2026-10-12 failure, stated as arithmetic. The old goto
+  // called a hard step, so its FIRST frame carried the whole 40 mm error as the
+  // position term: 100 Nm/rad x 0.539 rad = 53.9 Nm, five times the +/-10 Nm
+  // MIT frame range — the command was clipped and the drive ran away. The ramp
+  // cuts every frame to the lead cap instead.
+  //
+  // kp = 100 explicitly: this is the test fixture's kp, and the number the
+  // failure was stated with. The packaged C++ calibration carries kp = 5.0,
+  // where a 1.41 rad full-travel step is 7.05 Nm and does NOT saturate — the
+  // argument holds for a caller that passes kp = 100, which is what the Python
+  // SDK's default does and what this fixture does.
+  const double start = kPosOpenRad;
+  const double goal = kPosClosedRad - 40.0 / kRadToMm;
+  const double step_tau = 100.0 * std::fabs(goal - start);
+  const double cap_rad =
+      travel_cap_rad(instant_config(), test_config(), 30.0 / kRadToMm);
+  const double ramp_tau = 100.0 * cap_rad;
+
+  check(step_tau > FakeMotor::kTauMax, "a hard step saturates the frame range");
+  check(ramp_tau < FakeMotor::kTauMax, "the lead cap keeps the frame in range");
+  check(cap_rad > 0.0, "the cap is a real number");
+}
+
+void test_ramp_to_is_a_ramp_not_a_step() {
+  // Scenario C of the dump: goto(40.0, duration=0.5) from -1.0.
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  const MoveResult res =
+      engine.ramp_to(kPosClosedRad - 40.0 / kRadToMm, 0.0, 0.5, std::nullopt,
+                     std::nullopt, {});
+  const double start = -1.0;
+  const double travel_rad = std::fabs(res.target_rad - start);
+  // 41.92 mm in 0.5 s = 83.84 mm/s = 1.1304 rad/s; the cap is max(4 mm,
+  // 1.1304 x 0.005 rad) = 4 mm equivalent.
+  const double cap_rad =
+      travel_cap_rad(instant_config(), test_config(), 1.1303555589702117);
+
+  check(res.ok && res.reached && !res.stalled && !res.released,
+        "ramp_to: arrived, not stalled, not released");
+  check(res.steps == 160, "ramp_to: 100 ramp + 60 settle (py: 160)");
+  check(io.frames.size() == 160, "ramp_to: frames (py: 160)");
+  // The first frame is one ramp step, not the whole trip.
+  check(std::fabs(io.frames[0].q - start) < 0.02 * travel_rad,
+        "ramp_to: frame 0 is not the target");
+  check(std::fabs(res.target_rad - io.frames[0].q) > 0.98 * travel_rad,
+        "ramp_to: frame 0 leaves almost all the trip to go");
+  check_near(io.frames[0].q, -0.994348222205149, 1e-12, "ramp_to: frame 0 q (py)");
+  check_near(io.frames[0].dq, 1.1303555589702117, 1e-12, "ramp_to: frame 0 dq");
+  check_near(io.frames[0].pos_after, -0.9929352777564362, 1e-12,
+             "ramp_to: frame 0 pos (py)");
+  check(count_nonzero_dq(io.frames) == 100, "ramp_to: ramp frames carry dq");
+  check_near(io.frames.back().q, res.target_rad, 1e-12,
+             "ramp_to: settled on the target");
+  check_near(res.limit_rad, kPosClosedRad, 0.0,
+             "ramp_to: reports the nearer calibrated end");
+  check(cap_rad >= max_lead_rad(io.frames, start) - 1e-12,
+        "ramp_to: lead within max_lead_mm");
+  check(max_abs_tau(io.frames) < FakeMotor::kTauMax,
+        "ramp_to: torque within the frame range");
+}
+
+void test_ramp_to_blocked_halfway_releases() {
+  // Scenario D of the dump: blocked 0.03 rad ahead of the start. press=false,
+  // so the engine breaks out on the stall with its last command still leading
+  // by the cap — which is a standing torque unless the engine lets go.
+  //
+  // The start is INSIDE the package red lines [-1.24, -0.01] on purpose: an
+  // outside start makes the engine drive back inside first, and a blocked jaw
+  // turns that recovery into a fail-closed SafetyFault, so the scenario would
+  // never reach the ramp at all. See the header note about parity scenarios.
+  const double start = -1.20;  // inside the red lines [-1.24, -0.01]
+  const double block = start + 0.03;
+  FakeIo io(test_config(), start, block, 0.0, /*stops=*/false);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  // duration 1.0, not 0.5: 0.765 rad in 0.5 s is 1.53 rad/s, past the 1.5 rad/s
+  // commanded-velocity ceiling the engine re-checks once the distance is known
+  // (a C++-only refusal — the Python SDK has no such ceiling).
+  const MoveResult res =
+      engine.ramp_to(kPosClosedRad - 40.0 / kRadToMm, 0.0, 1.0, std::nullopt,
+                     std::nullopt, {});
+
+  check(!res.ok, "blocked: not ok");
+  check(!res.reached, "blocked: did not reach");
+  check(res.stalled, "blocked: stalled");
+  check(res.released, "blocked: the force was taken off");
+  check(!res.protection_tripped, "blocked: the travel-leg protection did not fire");
+  check(res.steps == 50, "blocked: steps (py: 50)");
+  check_near(res.final_cmd_rad, -1.1160843779485106, 1e-12,
+             "blocked: final command (py)");
+  check_near(io.motor_.pos, block, 1e-12, "blocked: parked on the obstacle");
+  // Parked on an obstacle, not on a calibrated stop.
+  check(std::fabs(io.motor_.pos - res.limit_rad) > 0.02,
+        "blocked: far from the calibrated limit");
+  // The release tail: stop_release_s / frame_interval = 40 zero-gain frames.
+  check(count_release_frames(io.frames) == 40, "blocked: 40 release frames");
+  check(io.frames.size() == 90, "blocked: 50 ramp + 40 release (py: 90)");
+  check_near(io.frames.back().q, block, 1e-12,
+             "blocked: release frames sit at the measured position");
+  for (const Frame& f : io.frames) {
+    if (f.kp != 0.0) continue;
+    if (f.kd != 0.0 || f.tau_ff != 0.0 || f.dq != 0.0) {
+      check(false, "blocked: a release frame carries a gain or a torque");
+      break;
+    }
+  }
+}
+
+void test_a_ramp_to_almost_nowhere_is_not_a_stall() {
+  // Scenario E of the dump: a 0.3 mm trip, well inside reach_tol. The frame
+  // count follows the DURATION, so the ramp runs its full length in place —
+  // and a jaw that is parked on purpose must not be read as stalled. On the
+  // bench this is close() followed immediately by home().
+  //
+  // Inside the red lines, like D: this one is the ordinary positioning case, so
+  // it must be startable by the engine without a recovery drive-in.
+  const double start = -1.20;  // inside the red lines [-1.24, -0.01]
+  FakeIo io(test_config(), /*start_rad=*/ start, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  const double here_mm =
+      test_config().opening_mm(start);  // the trip starts where the jaw is
+  const MoveResult res =
+      engine.ramp_to(test_config().rad_for_opening_mm(here_mm - 0.3), 0.0, 1.0,
+                     std::nullopt, std::nullopt, {});
+
+  check(res.reached, "0.3 mm: reached");
+  check(!res.stalled, "0.3 mm: a parked jaw is not a stall");
+  check(res.ok, "0.3 mm: ok");
+  check(!res.released, "0.3 mm: nothing to release");
+  check(res.steps == 260, "0.3 mm: 200 ramp + 60 settle (py: 260)");
+  check_near(io.motor_.pos, -1.1959563283454937, 1e-9,
+             "0.3 mm: parked at the target (py)");
+  check(travel_cap_rad(instant_config(), test_config(), 0.3 / kRadToMm) >=
+            max_lead_rad(io.frames, start) - 1e-12,
+        "0.3 mm: lead within max_lead_mm");
+}
+
+void test_ramp_to_gains_reach_the_frames() {
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  const MoveResult res =
+      engine.ramp_to(kPosClosedRad - 40.0 / kRadToMm, 0.0, 0.5, 50.0, 1.0, {});
+  check(res.ok, "gains: arrived");
+  for (const Frame& f : io.frames) {
+    if (f.kp != 50.0 || f.kd != 1.0) {
+      check(false, "gains: a frame did not carry the caller's gains");
+      break;
+    }
+  }
+  check_near(io.frames[0].pos_after, -0.9936417499807926, 1e-12,
+             "gains: frame 0 pos at kp=50 (py)");
+}
+
+void test_ramp_to_refuses_what_the_ramp_cannot_honour() {
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+  const double target = kPosClosedRad - 40.0 / kRadToMm;
+
+  check_throws<CommandError>(
+      [&] { engine.ramp_to(target, 0.0, 0.0, std::nullopt, std::nullopt, {}); },
+      "ramp_to: duration 0 refused");
+  check_throws<CommandError>(
+      [&] { engine.ramp_to(target, 0.0, -0.5, std::nullopt, std::nullopt, {}); },
+      "ramp_to: negative duration refused");
+  check_throws<CommandError>(
+      [&] {
+        engine.ramp_to(target, 0.0, std::numeric_limits<double>::quiet_NaN(),
+                       std::nullopt, std::nullopt, {});
+      },
+      "ramp_to: NaN duration refused");
+  check_throws<CommandError>(
+      [&] { engine.ramp_to(target, 30.0, 0.5, std::nullopt, std::nullopt, {}); },
+      "ramp_to: speed AND duration refused");
+  check_throws<CommandError>(
+      [&] {
+        engine.ramp_to(std::numeric_limits<double>::quiet_NaN(), 0.0, 0.5,
+                       std::nullopt, std::nullopt, {});
+      },
+      "ramp_to: non-finite target refused");
+  check(io.frames.empty(), "ramp_to refusals send no frames");
+}
+
+void test_move_at_speed_target_already_reached() {
+  // Scenario H of the dump: no "nothing to do" shortcut any more — a
+  // zero-distance trip is the degenerate one-frame ramp.
+  const double start = -1.20;  // inside the red lines, like D and E
+  FakeIo io(test_config(), /*start_rad=*/ start, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  const double here_mm = test_config().opening_mm(start);
+  const MoveResult res = engine.move_at_speed(here_mm, 80.0);
+
+  check(res.ok && res.reached && !res.stalled, "already there: reached, ok");
+  check(res.steps == 61, "already there: 1 ramp frame + 60 settle (py: 61)");
+  check(io.frames.size() == 61, "already there: frames (py: 61)");
+  check(count_nonzero_dq(io.frames) == 1, "already there: one frame carries dq");
+  check_near(io.motor_.pos, start, 1e-9, "already there: jaws did not move");
+}
+
 
 // ── set_force (Python dump S9) ───────────────────────────────────────────
 
@@ -2183,7 +2498,15 @@ int main() {
   test_press_reach_tolerance();
   test_move_at_speed_mm();
   test_move_at_speed_rad();
-  test_move_at_speed_noops();
+  test_move_at_speed_shares_the_goto_ramp();
+  test_move_at_speed_refuses_a_non_positive_speed();
+  test_a_goto_that_used_to_saturate();
+  test_ramp_to_is_a_ramp_not_a_step();
+  test_ramp_to_blocked_halfway_releases();
+  test_a_ramp_to_almost_nowhere_is_not_a_stall();
+  test_ramp_to_gains_reach_the_frames();
+  test_ramp_to_refuses_what_the_ramp_cannot_honour();
+  test_move_at_speed_target_already_reached();
   test_set_force();
   test_a_yielding_workpiece_does_not_erode_the_hold_force();
   test_the_hold_frame_carries_no_gains();

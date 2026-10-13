@@ -4,7 +4,7 @@
 // consumers use: connect, init (hold), open/close/goto, calibrate, read state.
 //
 // Capability scope: lifecycle, hold-based init, calibration, position motion,
-// the action engine (open/close/grasp/set_force/move_at_speed/zero-gravity —
+// the action engine (open/close/grasp/set_force/positioning ramps/zero-gravity —
 // motion.hpp), state and parameter access. Trajectory record/playback and
 // teleop are later stages.
 //
@@ -114,7 +114,12 @@ class LiteGrip : private MotionIo {
 
   /// Move to the closed (zero) position: this instance's calibrated closed
   /// limit, so a reverse-mounted gripper homes to the correct end.
-  bool home();
+  ///
+  /// An ordinary positioning ramp (see goto_rad), so `ok` is reached &&
+  /// !stalled. Not a press: close() aims past the calibrated limit to press the
+  /// real stop, home() aims at the calibrated closed position and stops on it,
+  /// so the zero can be approached without loading it.
+  MoveResult home();
 
   /// Full open / close — the action engine's ramp (motion.hpp): a velocity
   /// feed-forward per frame, a lead cap that narrows near the calibrated
@@ -166,17 +171,18 @@ class LiteGrip : private MotionIo {
   /// when the same MotionConfig::hold_runaway_rad guard trips.
   bool set_force(double force_n, double duration_s = 0.3);
 
-  /// Constant-speed move to an absolute opening in mm (0 = closed), with a
-  /// short hold at the target. True after a completed move and for the
-  /// "nothing to do" cases (already there / speed <= 0).
-  bool move_at_speed(double target_mm, double speed_mm_s = 30.0,
-                     std::optional<double> kp = std::nullopt,
-                     std::optional<double> kd = std::nullopt);
+  /// Positioning move to an absolute opening in mm (0 = closed) at a constant
+  /// speed. The same bounded ramp as goto_mm, so the same MoveResult reading
+  /// (`ok` = reached && !stalled) and the same 4 mm lead cap. A speed of zero
+  /// or less is refused; it used to report success without moving.
+  MoveResult move_at_speed(double target_mm, double speed_mm_s = 30.0,
+                           std::optional<double> kp = std::nullopt,
+                           std::optional<double> kd = std::nullopt);
 
-  /// Constant-speed move to an absolute angle in rad.
-  bool move_at_speed_rad(double target_rad, double speed_rad_s = 0.5,
-                         std::optional<double> kp = std::nullopt,
-                         std::optional<double> kd = std::nullopt);
+  /// The same in rad, at speed_rad_s.
+  MoveResult move_at_speed_rad(double target_rad, double speed_rad_s = 0.5,
+                               std::optional<double> kp = std::nullopt,
+                               std::optional<double> kd = std::nullopt);
 
   /// Zero-gravity mode: the motor stays enabled but exerts no torque and can
   /// be back-driven by hand. duration_s > 0 streams zero-torque frames for
@@ -191,18 +197,37 @@ class LiteGrip : private MotionIo {
   void exit_zero_gravity();
 
   /// Move to an absolute position in millimetres (0 = closed).
-  bool goto_mm(double position_mm, std::optional<double> kp = std::nullopt,
-               std::optional<double> kd = std::nullopt, double duration = 0.5);
+  ///
+  /// A bounded ramp, not a step: one frame per MotionConfig::frame_interval
+  /// whose command leads the measured position by at most
+  /// MotionConfig::max_lead_mm, so the frame's torque stays near
+  /// kp x max_lead_mm instead of saturating the +-10 Nm MIT range. `duration`
+  /// is the LENGTH OF THE RAMP — the speed is derived from the distance — so a
+  /// long trip at the default is fast; pass a longer duration for long moves.
+  /// The result is `ok` only when the jaws arrived and did not stall, and a
+  /// shortfall that the travel-leg protection did not end comes back with
+  /// MoveResult::released set, meaning the force was taken off.
+  MoveResult goto_mm(double position_mm, std::optional<double> kp = std::nullopt,
+                     std::optional<double> kd = std::nullopt,
+                     double duration = 0.5);
 
-  /// Move to an absolute position in radians (streams MIT frames).
-  bool goto_rad(double position_rad, std::optional<double> kp = std::nullopt,
-                std::optional<double> kd = std::nullopt, double dq_target = 0.0,
-                double tau_feedforward = 0.0, double duration = 0.5);
+  /// The same in radians. The target is clamped into the calibrated travel and
+  /// an uncalibrated config is refused, both before any frame is sent.
+  ///
+  /// `dq_target` and `tau_feedforward` must be 0 — the ramp derives the
+  /// velocity feed-forward from distance / duration and carries no feed-forward
+  /// torque, so a caller-supplied value is refused with CommandError rather
+  /// than silently ignored. `duration` must be positive and finite.
+  MoveResult goto_rad(double position_rad,
+                      std::optional<double> kp = std::nullopt,
+                      std::optional<double> kd = std::nullopt,
+                      double dq_target = 0.0, double tau_feedforward = 0.0,
+                      double duration = 0.5);
 
-  /// Sustained move to a target position (longer default duration).
-  bool move_to(double target_rad, std::optional<double> kp = std::nullopt,
-               std::optional<double> kd = std::nullopt,
-               double tau_feedforward = 0.0, double duration = 1.0);
+  /// The same as goto_rad, with a longer default duration.
+  MoveResult move_to(double target_rad, std::optional<double> kp = std::nullopt,
+                     std::optional<double> kd = std::nullopt,
+                     double tau_feedforward = 0.0, double duration = 1.0);
 
   // ── calibration ───────────────────────────────────────────────────────
 

@@ -105,10 +105,28 @@ int main() {
                  [&] { gripper.goto_rad(-0.5); });
     check_throws("move_to refuses when not connected",
                  [&] { gripper.move_to(-0.5); });
+    check_throws("home refuses when not connected", [&] { gripper.home(); });
+    check_throws("move_at_speed refuses when not connected",
+                 [&] { gripper.move_at_speed(40.0); });
+    check_throws("move_at_speed_rad refuses when not connected",
+                 [&] { gripper.move_at_speed_rad(-0.5); });
     check_throws("read_param refuses when not connected",
                  [&] { gripper.read_param(7); });
     check_throws("write_param refuses when not connected",
                  [&] { gripper.write_param(7, 1.0); });
+
+    // goto_rad's argument refusals are checked BEFORE the connection, so a
+    // caller holding a disconnected gripper still learns what it got wrong.
+    // Nothing is sent either way — the point is which complaint comes back
+    // first, which is why these are CommandError and not NotInitializedError.
+    check_throws("goto_rad refuses a non-zero dq_target before connecting",
+                 [&] { gripper.goto_rad(-0.5, std::nullopt, std::nullopt, 0.1); });
+    check_throws(
+        "goto_rad refuses a non-zero tau_feedforward before connecting",
+        [&] { gripper.goto_rad(-0.5, std::nullopt, std::nullopt, 0.0, 0.5); });
+    check_throws("goto_rad refuses duration 0 before connecting",
+                 [&] { gripper.goto_rad(-0.5, std::nullopt, std::nullopt, 0.0,
+                                        0.0, 0.0); });
 
     // These report rather than throw.
     check(!gripper.send_mit_frame(0.0, 0.0, 0.0), "send_mit_frame reports false");

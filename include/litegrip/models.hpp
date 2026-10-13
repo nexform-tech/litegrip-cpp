@@ -122,9 +122,12 @@ struct GripperConfig {
   /// limits: while it is false, "which end is closed" is a guess and both
   /// orderings are equally plausible. Mirrors models.GripperConfig.calibrated.
   ///
-  /// Note it does NOT gate raw motion — this repository's goto_rad()/move_to()
-  /// take an explicit angle and never consult it (the same split as Python,
-  /// where only limit_target()/press_target() call _check_calibrated).
+  /// It gates the positioning family too: goto_rad(), goto_mm(), move_to(),
+  /// home() and move_at_speed*() take an explicit angle or opening, but they
+  /// clamp it into the calibrated travel and refuse outright while `calibrated`
+  /// is false — the same gate as Python's gripper.py goto_rad. Paths that
+  /// command no target derived from the travel — stop(),
+  /// enter_zero_gravity(), send_mit_frame() — do not consult it.
   bool calibrated = false;
 
   // Jaw travel (mm) — the caliper measurement of your gripper's travel.
