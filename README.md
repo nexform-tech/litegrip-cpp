@@ -249,7 +249,7 @@ a speed in rad/s.
 
 **The ramp is bounded, and that bound is the point of it.** Each frame's command
 leads the measured position by at most `MotionConfig::max_lead_mm` (4 mm), which
-caps the frame's torque near `kp × max_lead_mm / rad_to_mm` — 6.6 N·m at the
+caps the frame's torque near `kp × max_lead_mm / rad_to_mm` — 5.4 N·m at the
 factory `kp = 100`, under the DM4310's ±10 N·m frame limit, and the figure holds
 for any target because the cap is on the lead rather than on the distance
 travelled. A hard step to the target has no such cap: at `kp = 100 Nm/rad` an
@@ -259,8 +259,8 @@ was rebuilt around is that case, in the Python SDK, whose default gains are
 `kp = 100`: `goto(40.0, duration=0.5)` overshot its own target by 42.7 mm and
 crossed the calibrated closed zero. This SDK ships those same gains, so that
 failure is what the ramp stands between — a hard step to the far end
-(1.41 rad of travel) draws 141 N·m and saturates, while the ramp bounds the same
-move to the 6.6 N·m above. `open()` and `close()` press onto a calibrated stop on
+(1.17 rad of travel) draws 117 N·m and saturates, while the ramp bounds the same
+move to the 5.4 N·m above. `open()` and `close()` press onto a calibrated stop on
 purpose; they cap the emitted command at the calibrated extreme, so the jaw stops
 on the limit and is never driven past it.
 
@@ -317,8 +317,8 @@ by lowering the commanded speed; then the damping, never above the caller's
 
 **The runaway watch.** The hold frames carry no position error, so no position
 limit can act on them; the only lever is removing the torque. Once the measured
-position is `MotionConfig::hold_runaway_rad` (`0.05 rad`, about 3.05 mm at the
-factory `rad_to_mm` of `61.0123`) past the closed-side calibrated limit, `grasp`
+position is `MotionConfig::hold_runaway_rad` (`0.05 rad`, about 3.67 mm at the
+factory `rad_to_mm` of `73.4573`) past the closed-side calibrated limit, `grasp`
 streams `MotionConfig::stop_release_s` of zero-torque frames and returns with
 `GraspResult::travel_guard` set and `ok` false. Only the closing side is judged,
 because that is the side the feed-forward pushes. This is a **runaway detector, not an accuracy bound**:
@@ -541,7 +541,7 @@ equal and opposite: dividing the recorded span by the caliper measurement alone
 leaves every mm-based move 1.2% short — 1 mm lost per full stroke — while
 putting the recorded span into `max_stroke_mm` adds the same millimetre a second
 time. On the shipped unit the defaults reproduce the factory file's own scale
-exactly: `86 / 1.409552 = 61.0123 mm/rad`. A probe whose two stops coincide has
+exactly: `86 / 1.170748 = 73.4573 mm/rad`. A probe whose two stops coincide has
 no scale to derive and says so (`CommError`) instead of writing the nominal one.
 
 ### The direction is preserved, not discovered
@@ -716,13 +716,15 @@ re-aims every frame — so the engine carries its own bounds instead:
 / `home` / `move_at_speed` / `move_at_speed_rad`. The `goto` family used to pass
 through `guard_motion_frame` instead, and on the shipped files that gate refused
 real work: the red lines (`[-1.24, -0.01] rad`,
-`calibration/safety_limits_350.json`) sit *inside* the calibrated travel
-(`[-1.357481, +0.052071] rad`), so `home()` — whose target is the calibrated
-closed position — threw `LimitViolation` every time, and targets closer than
-3.8 mm to the calibrated closed end, or 7.2 mm to the open end, were refused,
-while `close()`, aiming past the same point, was not. (Both are the red line to
-the calibrated travel end, on the factory calibration's 61.0123 mm/rad.) The
-gate now has one caller left: `ControlLoop`.
+`calibration/safety_limits_350.json`) cut into the calibrated travel
+(`[-1.141184, +0.029564] rad`) on the closed side — on the open side the red line
+falls 7.3 mm *past* the calibrated stop, so no reachable target is outside it —
+and the closed side alone was enough: `home()`, whose target is the calibrated
+closed position, threw `LimitViolation` every time, and targets closer than
+2.9 mm to the calibrated closed end were refused, while `close()`, aiming past
+the same point, was not. (That is the red line to the calibrated travel end, on
+the factory calibration's 73.4573 mm/rad.) The gate now has one caller left:
+`ControlLoop`.
 
 That is a deliberate trade, and the cost is real: a `goto` target outside the
 red lines is no longer refused. What still bounds it is the calibrated travel —
@@ -785,38 +787,50 @@ positioning move's.
 ### Why a cycle reports it is recovering
 
 A move prints one line per safety mode it **enters**, on stderr, naming the move
-and the mode. A steady open/close cycle prints four, and all four are expected:
+and the mode. `recovering from outside the red lines` is the recovery crawl
+arriving — the scope `MotionEngine::recover_to_interior` pushes before it drives
+inward; the other line names the mode the move itself runs under. It is not a
+fault report, and which lines a cycle prints follows from where its two rest
+positions fall. On the shipped files a steady open/close cycle prints three:
 
 ```text
 [litegrip] entering a safety mode: open: recovering from outside the red lines
 [litegrip] entering a safety mode: open (stop inside the limit)
-[litegrip] entering a safety mode: close: recovering from outside the red lines
 [litegrip] entering a safety mode: close (press onto the stop)
 ```
 
-`recovering from outside the red lines` is the recovery crawl arriving — the
-scope `MotionEngine::recover_to_interior` pushes before it drives inward; the
-other line names the mode the move itself runs under. It is not a fault report:
-both rest positions of a cycle sit **outside** the shipped red lines, so the next
-move starts illegal and walks the jaw back inside before it does anything else.
+The crawl is entered once per move, and only when that move *starts* outside the
+shipped red lines (`[-1.24, -0.01] rad`). On the shipped calibration, one rest
+position is outside and the other is not:
 
-| Rest position | Measured on the reference unit | Shipped red line | Past it by |
-| --- | --- | --- | --- |
-| `open` at the 80 mm work point | 79.5 mm (-1.2509 rad) | -1.24 rad | 0.7 mm |
-| `close` pressed onto the stop | -0.2 mm (+0.0553 rad) | -0.01 rad | 4.0 mm |
+| Rest position | Position | Verdict |
+| --- | --- | --- |
+| `close` pressed onto the stop | `+0.029564` rad | 2.9 mm past the closed red line |
+| `open` at the 80 mm work point | `-1.0595` rad | inside both; the open red line lies 7.3 mm past the open stop |
 
-Both are the design, not an accident of these numbers. `close()` aims past the
-closed red line on purpose, onto the mechanical stop; and the factory
-calibration's `work_stroke_mm = 80.0` is beyond the open red line, which sits at
-78.8 mm on that same calibration. The crawl is bounded and inward only, at
-`tau = 0`, and it returns immediately when the jaw is already inside — so a unit
-whose rest positions *are* inside the red lines prints no such line at all.
+The close rest is outside the red lines by design: `close()` aims past the closed
+red line on purpose, onto the mechanical stop, and that is where a stopped close
+leaves the jaw. The open rest is inside them because the shipped
+`work_stroke_mm = 80.0` holds the jaw 6 mm short of the calibrated open stop. So
+the open leg — which starts on the close rest — crawls inward first, and the
+close leg — which starts at the work point — does not: one recovery line per
+cycle. The crawl is bounded and inward only, at `tau = 0`, and a move that
+starts inside the red lines prints no such line and sends no crawl frames at
+all.
 
-The red lines above are the ones `safety_limits_350.json` ships as the default
+Both of the reference unit's rest positions sat outside the red lines, its own
+calibration putting the 80 mm work point past the open one (which fell at
+78.8 mm there), so a cycle on that unit printed four lines, one per move. Which
+of three or four your cycle prints is a property of your rest positions and the
+red lines in force, not a fault either way. `test/test_motion.cpp` pins the
+three above for the shipped files.
+
+The red lines are the ones `safety_limits_350.json` ships as the default
 baseline, and that file marks its own numbers `NOT VERIFIED ON THIS UNIT` — they
-are the reference unit's hand-push bound. Widen or tighten the red lines and
-which moves report a recovery changes with them; the numbers in the table are
-the reference unit's, measured there, not a promise about yours.
+are the reference unit's hand-push bound, and they now bound a calibration that
+is not the reference unit's. Widen or tighten the red lines and which moves
+report a recovery changes with them; the positions in the table are the shipped
+calibration's, not a promise about yours.
 
 ## Safety invariants
 

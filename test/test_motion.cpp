@@ -1402,8 +1402,8 @@ void test_a_goto_that_used_to_saturate() {
   // kp = 100 explicitly: this is the test fixture's kp and the number the
   // failure was stated with. It is also what the packaged calibration carries,
   // so the saturation this test describes is the shipped configuration rather
-  // than a caller's choice — a 1.41 rad full-travel step at 100 Nm/rad is
-  // 141 Nm, fourteen times the MIT frame range.
+  // than a caller's choice — a 1.17 rad full-travel step at 100 Nm/rad is
+  // 117 Nm, eleven times the MIT frame range.
   const double start = kPosOpenRad;
   const double goal = kPosClosedRad - 40.0 / kRadToMm;
   const double step_tau = 100.0 * std::fabs(goal - start);
@@ -2357,6 +2357,60 @@ void test_recovery_from_closed_stop() {
         "recovery: crawled below the red max");
 }
 
+void test_the_shipped_calibration_spans_the_shipped_red_lines() {
+  // The README's "why a cycle reports it is recovering" section is arithmetic
+  // on two shipped files, so pin it here rather than quote it: the factory
+  // calibration's closed stop lies OUTSIDE the closed red line while its 80 mm
+  // work point lies INSIDE the open one, so a steady cycle takes exactly one
+  // recovery crawl per cycle — the close leg starts legal, the open leg does
+  // not. Recalibrating changes where the work point falls; this fails if it
+  // crosses a red line and the documented cycle stops describing the shipped
+  // files.
+  GripperConfig cfg;  // values from calibration/factory_calibration.json
+  cfg.pos_closed_rad = 0.029564;
+  cfg.pos_open_rad = -1.141184;
+  cfg.rad_to_mm = 73.45731105242119;
+  cfg.work_stroke_mm = 80.0;
+  cfg.calibrated = true;
+
+  const double work_point = cfg.pos_closed_rad - 80.0 / cfg.rad_to_mm;
+  check_near(work_point, -1.0595, 1e-4, "shipped work point");
+  check(work_point > kRedMin && work_point < kRedMax,
+        "the 80 mm work point rests inside the red lines");
+  check(cfg.pos_closed_rad > kRedMax,
+        "the closed stop rests outside the closed red line");
+  check(cfg.pos_open_rad > kRedMin,
+        "the open red line lies past the open stop, so nothing there recovers");
+
+  {  // The open leg starts on the closed stop, which is outside the red lines,
+     // and crawls inward before it does anything else.
+    FakeIo io(cfg, /*start_rad=*/ cfg.pos_closed_rad, std::nullopt, 0.0,
+              /*stops=*/true);
+    SafetyGuard guard = make_guard();
+    MotionEngine engine(io, guard, instant_config());
+    const MoveResult res = engine.open();
+    check(res.ok && res.reached && !res.stalled,
+          "shipped open: arrives at the work point");
+    check(!io.frames.empty() && io.frames.front().kp == 50.0,
+          "shipped open: starts with the recovery crawl");
+    check_near(io.frames.back().pos_after, work_point, 1e-3,
+               "shipped open: parks at the 80 mm work point");
+  }
+  {  // The close leg starts there, inside the red lines, so it must NOT crawl.
+    FakeIo io(cfg, /*start_rad=*/ work_point, std::nullopt, 0.0,
+              /*stops=*/true);
+    SafetyGuard guard = make_guard();
+    MotionEngine engine(io, guard, instant_config());
+    const MoveResult res = engine.close();
+    check(res.ok && res.stalled, "shipped close: presses onto the stop");
+    check(!io.frames.empty() && io.frames.front().kp == 100.0,
+          "shipped close: starts legal, so no recovery line is printed");
+    check(io.frames.back().pos_after > kRedMax,
+          "shipped close: ends outside the closed red line, so the next open "
+          "leg does recover");
+  }
+}
+
 void test_recovery_jammed_is_fault() {
   // A block just inside the stop: the crawl can never reach the red lines.
   FakeIo io(test_config(), /*start_rad=*/ kPosOpenRad,
@@ -2477,6 +2531,7 @@ int main() {
   test_ceilings_and_refusals();
   test_recovery_from_open_stop();
   test_recovery_from_closed_stop();
+  test_the_shipped_calibration_spans_the_shipped_red_lines();
   test_recovery_jammed_is_fault();
   test_recovery_config_ceilings();
   test_litegrip_forwarding();

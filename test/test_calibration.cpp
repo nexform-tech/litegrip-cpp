@@ -60,12 +60,19 @@ int main() {
     if (factory.has_value()) {
       check(factory->has_closed && factory->has_open && factory->has_rad_to_mm,
             "required fields present");
-      // Values from the file, unchanged from the Python SDK's copy.
-      check_near(factory->zero_position_rad, 0.052071, 1e-12,
+      // Values from the file. The Python SDK ships its own copy of this data,
+      // and the two have diverged: this file is a recalibration, the Python
+      // copy still carries what this file carried before it.
+      check_near(factory->zero_position_rad, 0.029564, 1e-12,
                  "zero_position_rad");
-      check_near(factory->max_position_rad, -1.357481, 1e-12,
+      check_near(factory->max_position_rad, -1.141184, 1e-12,
                  "max_position_rad");
-      check_near(factory->rad_to_mm, 61.01229326764816, 1e-12, "rad_to_mm");
+      check_near(factory->rad_to_mm, 73.45731105242119, 1e-12, "rad_to_mm");
+      // The scale is the probe's own convention, not an independent choice:
+      // (kJawTravelMm + kStopInsetMm) / travel. Pinned here so a hand edit that
+      // moves one of the two numbers fails instead of shipping.
+      check_near(factory->rad_to_mm, 86.0 / 1.170748, 1e-12,
+                 "rad_to_mm is the span over the recorded travel");
       check(factory->can_id.has_value() && *factory->can_id == 8, "can_id");
       check(factory->mst_id.has_value() && *factory->mst_id == 24, "mst_id");
       check(factory->canfd_mode.has_value() && !*factory->canfd_mode,
@@ -366,10 +373,27 @@ int main() {
 
   // ── the calibrated flag ───────────────────────────────────────────────
   {
-    // The shipped factory file predates the flag; absence leaves no opinion,
-    // which every consumer reads as "yes".
+    // The shipped factory file states the flag outright (it was written by a
+    // calibration run), so it says "calibrated" rather than leaving it unsaid.
     const auto factory = litegrip::read_calibration_file(kFactoryPath);
-    check(factory.has_value() && !factory->calibrated.has_value(),
+    check(factory.has_value() && factory->calibrated.has_value() &&
+              *factory->calibrated,
+          "the shipped factory file states calibrated=true");
+
+    // A file that predates the flag leaves no opinion, which every consumer
+    // reads as "yes" — the branch a hand-written or vendor file still takes.
+    const std::string no_flag = std::string(kFixtureDir) + "/no_flag.json";
+    FILE* no_flag_file = std::fopen(no_flag.c_str(), "w");
+    check(no_flag_file != nullptr, "write a file without the calibrated flag");
+    if (no_flag_file != nullptr) {
+      const std::string text =
+          "{\"zero_position_rad\": 0.1, \"max_position_rad\": -1.5, "
+          "\"rad_to_mm\": 74.8}";
+      std::fwrite(text.data(), 1, text.size(), no_flag_file);
+      std::fclose(no_flag_file);
+    }
+    const auto silent = litegrip::read_calibration_file(no_flag);
+    check(silent.has_value() && !silent->calibrated.has_value(),
           "a file without the flag reports no opinion about being calibrated");
 
     const std::string path = std::string(kFixtureDir) + "/uncal.json";

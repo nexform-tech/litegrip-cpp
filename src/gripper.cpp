@@ -394,7 +394,7 @@ MoveResult LiteGrip::goto_rad(double position_rad, std::optional<double> kp,
   // still the placeholder defaults: it is arithmetic on numbers that describe
   // no real travel, and it produces a real target. On the defaults
   // goto_mm(40.0) lands at +0.61 rad, past this unit's closed stop at
-  // +0.05 rad, so the jaws are driven into it and press there. Every other
+  // +0.03 rad, so the jaws are driven into it and press there. Every other
   // motion already refuses through check_calibrated; this was the way around
   // it. (Python gripper.py goto_rad has the same gate for the same reason.)
   check_calibrated(config_);
@@ -413,19 +413,23 @@ MoveResult LiteGrip::goto_rad(double position_rad, std::optional<double> kp,
   // a target or a measured position outside the red lines; this call is now an
   // engine ramp bounded by the CALIBRATED TRAVEL instead, exactly like
   // open()/close(), which never went through the gate. On the shipped files the
-  // red lines ([-1.24, -0.01] rad, calibration/safety_limits_350.json) sit
-  // INSIDE the calibrated travel ([-1.357481, +0.052071] rad), so:
+  // red lines ([-1.24, -0.01] rad, calibration/safety_limits_350.json) cut into
+  // the calibrated travel ([-1.141184, +0.029564] rad) on the CLOSED side only:
+  // the open red line lies past the open stop, off the end of the travel, so no
+  // reachable position is outside it. The closed side alone is enough for both
+  // of these:
   //   * home() works now. Its target is the calibrated closed position
-  //     (+0.052071), outside the closed red line, so the gate refused it every
+  //     (+0.029564), outside the closed red line, so the gate refused it every
   //     time — while close(), aiming past the same point, did not.
-  //   * targets closer than 3.8 mm to the calibrated closed end, or 7.2 mm to
-  //     the open end, are reachable now and were refused before. Both are the
-  //     red line to the calibrated travel end on the factory calibration's
-  //     61.0123 mm/rad: (0.052071 + 0.01) x 61.0123 and (-1.24 + 1.357481) x
-  //     61.0123. Do not take the margins quoted in safety_limits_350.json's
-  //     provenance (5.60 mm / 2.99 mm) — those are the red line to the
-  //     MECHANICAL OBSERVED bounds, at a scale of about 10.9 mm/rad that is
-  //     not this repository's.
+  //   * targets closer than 2.9 mm to the calibrated closed end are reachable
+  //     now and were refused before. That is the red line to the calibrated
+  //     travel end on the factory calibration's 73.4573 mm/rad:
+  //     (0.029564 + 0.01) x 73.4573. The open end refused nothing: its red line
+  //     sits (-1.24 + 1.141184) x 73.4573 = 7.3 mm PAST the calibrated stop, so
+  //     every position the clamp admits is already inside it. Do not take the
+  //     margins quoted in safety_limits_350.json's provenance (5.60 mm /
+  //     2.99 mm) — those are the red line to the MECHANICAL OBSERVED bounds, at
+  //     a scale of about 10.9 mm/rad that is not this repository's.
   // To put a red-line TARGET check back at this one site, test `clamped`
   // against safety_->limits() and throw LimitViolation. The gate's other steps
   // have no work to do here any more: dq and tau are fixed at zero above, and

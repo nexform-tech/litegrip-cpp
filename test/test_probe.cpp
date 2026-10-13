@@ -243,21 +243,26 @@ void test_the_pass_takes_its_direction_from_close_sign() {
 // ── the scale comes from the jaw travel plus the probe's inset ───────────
 
 void test_the_reference_scale_is_the_hand_recorded_one() {
-  // (85 + 1) / 1.409552 must be the number the shipped factory calibration
+  // (85 + 1) / 1.170748 must be the number the shipped factory calibration
   // file carries, so re-probing a shipped unit reproduces its own scale
   // instead of writing a different one.
-  check_near(rad_to_mm_from_travel(GripperGeometry::kJawTravelMm, 1.409552),
-             61.01229326764816, 1e-9,
-             "the reference scale (py: 61.01229326764816)");
+  check_near(rad_to_mm_from_travel(GripperGeometry::kJawTravelMm, 1.170748),
+             73.45731105242119, 1e-9,
+             "the shipped unit's scale");
 }
 
 void test_deriving_from_the_jaw_travel_alone_would_be_short() {
   // The counter-example, pinned so the numerator cannot quietly lose the
-  // inset: 85 / 1.409552 is 0.69 mm/rad away from the recorded scale.
-  const double short_scale = GripperGeometry::kJawTravelMm / 1.409552;
-  check(short_scale < 61.01229326764816, "the short scale is short");
-  check(61.01229326764816 - short_scale < 0.8,
+  // inset: 85 / 1.170748 is 0.85 mm/rad away from the recorded scale.
+  const double short_scale = GripperGeometry::kJawTravelMm / 1.170748;
+  check(short_scale < 73.45731105242119, "the short scale is short");
+  check(73.45731105242119 - short_scale < 0.9,
         "short by a coarse amount, not by a typo");
+  // The shortfall is the inset's share of the span — 1/86 — not a number that
+  // moves with the unit, so a unit whose travel is measured differently still
+  // loses the same fraction of every mm-based move.
+  check_near((73.45731105242119 - short_scale) / 73.45731105242119, 1.0 / 86.0,
+             1e-12, "the shortfall is the inset's share of the span");
 }
 
 void test_the_default_config_carries_the_measured_travel() {

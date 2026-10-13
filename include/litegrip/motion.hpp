@@ -176,8 +176,8 @@ struct MotionConfig {
   // never reaches it — against an object the jaws stop on the object, and
   // against nothing they stop on the real stop, which sits at (or near) the
   // calibrated limit, since the calibration is probed from those stops. 0.05
-  // rad is the margin for a calibration that is slightly off, about 3.05 mm at
-  // the factory rad_to_mm = 61.0123. A real runaway is measured in millimetres.
+  // rad is the margin for a calibration that is slightly off, about 3.67 mm at
+  // the factory rad_to_mm = 73.4573. A real runaway is measured in millimetres.
   double hold_runaway_rad = 0.05;
   // [Deprecated] A hold no longer uses gains (see above). Kept so an older
   // config still compiles; setting them has no effect.
