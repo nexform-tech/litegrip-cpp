@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <thread>
 
 #include "litegrip/exceptions.hpp"
@@ -355,6 +356,22 @@ bool GripperBus::update_state(double timeout_s) {
   return controller_->poll_until(*motor_, timeout_s);
 }
 
+bool await_refresh_reply(double timeout_s,
+                         const std::function<void()>& send_refresh,
+                         const std::function<bool(double)>& await_status) {
+  // Each attempt gets HALF the caller's budget, so the retry cannot make the
+  // call outlast timeout_s — a policy that doubled the deadline would be a
+  // worse bug than the one it fixes.
+  const double budget = timeout_s / 2.0;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    send_refresh();
+    if (await_status(budget)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool GripperBus::refresh_status(double timeout_s) {
   if (controller_ == nullptr || motor_ == nullptr) {
     return false;
@@ -362,19 +379,24 @@ bool GripperBus::refresh_status(double timeout_s) {
 
   // A disabled motor does not stream status frames on its own, so the refresh
   // command (which is answered regardless of enable state) is how position is
-  // read before the first enable. Sends no motion command.
-  const std::uint64_t prev_rx = motor_->rx_count();
-  controller_->refresh_status(*motor_);
-
-  const double deadline = monotonic_now() + timeout_s;
-  while (monotonic_now() < deadline) {
-    controller_->poll(0.01);
-    if (motor_->rx_count() > prev_rx) {
-      return true;
-    }
-    sleep_s(0.005);
-  }
-  return false;
+  // read before the first enable. Sends no motion command. The retry policy is
+  // in await_refresh_reply(): the first call after connect() is answered late
+  // by the mst_id detection's parameter read, not by this request, so one
+  // attempt can be lost on a perfectly healthy link.
+  return await_refresh_reply(
+      timeout_s, [this] { controller_->refresh_status(*motor_); },
+      [this](double attempt_budget) {
+        const std::uint64_t prev_rx = motor_->rx_count();
+        const double deadline = monotonic_now() + attempt_budget;
+        while (monotonic_now() < deadline) {
+          controller_->poll(0.01);
+          if (motor_->rx_count() > prev_rx) {
+            return true;
+          }
+          sleep_s(0.005);
+        }
+        return false;
+      });
 }
 
 double GripperBus::get_position() const {
