@@ -34,6 +34,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <exception>
+#include <functional>
 #include <limits>
 #include <string>
 #include <thread>
@@ -43,6 +45,7 @@
 #include "litegrip/constants.hpp"
 #include "litegrip/exceptions.hpp"
 #include "litegrip/probe.hpp"
+#include "litegrip/teardown.hpp"
 
 namespace litegrip {
 namespace {
@@ -129,6 +132,20 @@ LiteGrip::LiteGrip(GripperConfig config)
       safety_(std::make_unique<SafetyGuard>(canonical_baseline())),
       mst_id_(config_.mst_id) {}
 
+bool teardown_step_quietly(const char* what,
+                           const std::function<void()>& step) noexcept {
+  try {
+    step();
+    return true;
+  } catch (const std::exception& error) {
+    std::fprintf(stderr, "[litegrip] %s failed during teardown: %s\n", what,
+                 error.what());
+  } catch (...) {
+    std::fprintf(stderr, "[litegrip] %s failed during teardown\n", what);
+  }
+  return false;
+}
+
 LiteGrip::~LiteGrip() { disconnect(); }
 
 LiteGrip::LiteGrip(LiteGrip&& other) noexcept
@@ -189,15 +206,21 @@ bool LiteGrip::connect() {
   return true;
 }
 
-void LiteGrip::disconnect() {
+void LiteGrip::disconnect() noexcept {
   if (!connected_) {
     return;
   }
   if (enabled_ && disable_on_disconnect_) {
-    disable();
+    // This runs from the destructor, where an escaping exception terminates
+    // the process instead of finishing the shutdown. A disable frame on a dead
+    // bus raises CommError, so the step is contained and reported on stderr.
+    teardown_step_quietly("disable", [this] { disable(); });
   }
+  // Reached whether or not that disable went out: the socket must close even
+  // when the motor never got its frame.
   if (bus_ != nullptr) {
-    bus_->disconnect(disable_on_disconnect_);
+    teardown_step_quietly(
+        "bus disconnect", [this] { bus_->disconnect(disable_on_disconnect_); });
   }
   connected_ = false;
   enabled_ = false;
@@ -239,10 +262,15 @@ bool LiteGrip::init() {
 
 bool LiteGrip::disable() {
   check_connected();
-  const bool result = bus_->disable();
+  // Cleared BEFORE the bus call, not after. A disable frame that throws leaves
+  // the motor in whatever state the interrupted call left it in, but leaving
+  // this object thinking it is still enabled as well makes the destructor
+  // retry the very call that just threw — and throw again from a noexcept
+  // context. The flag means "this SDK believes the motor is enabled", and once
+  // the disable is attempted it no longer does.
   enabled_ = false;
   status_flags_ &= ~GripperStatus::kEnabled;
-  return result;
+  return bus_->disable();
 }
 
 bool LiteGrip::clear_fault() {

@@ -32,6 +32,10 @@ namespace litegrip {
 /// connect_raii()); the destructor always disconnects, so a connected gripper
 /// is never left enabled by accident.
 ///
+/// The destructor does not throw, and neither does disconnect() — destroying a
+/// gripper whose CAN link has died must still return an exit code. See
+/// teardown.hpp for how a failing disable is contained and reported.
+///
 /// Implements MotionIo by private inheritance — LiteGrip is the IO the action
 /// engine drives; the seam's methods keep their existing public names.
 class LiteGrip : private MotionIo {
@@ -76,7 +80,13 @@ class LiteGrip : private MotionIo {
 
   /// Close the bus, disabling the motor first unless
   /// disable_on_disconnect() is false.
-  void disconnect();
+  ///
+  /// Does not throw, from any state, on any bus. The destructor and the move
+  /// assignment both call it and both are noexcept, so a disable frame that
+  /// fails on a dead bus is reported on stderr and swallowed rather than
+  /// terminating the process; the bus is closed either way. Call disable()
+  /// directly when the failure has to reach the caller.
+  void disconnect() noexcept;
 
   // ── enable / init / fault ─────────────────────────────────────────────
 
@@ -89,6 +99,10 @@ class LiteGrip : private MotionIo {
   /// replaced without touching anything else.
   bool init();
 
+  /// Drop torque on the motor so the jaws can be moved by hand. Throws
+  /// CommError when the frame cannot be sent — this is the entry to use when
+  /// the caller has to know the motor was actually let go; disconnect() is the
+  /// one that never throws.
   bool disable();
 
   /// Clear latched faults (UV / OC / OT): disable -> clear (0xFB) -> enable,

@@ -9,6 +9,7 @@
 #include <thread>
 
 #include "litegrip/exceptions.hpp"
+#include "litegrip/teardown.hpp"
 
 namespace litegrip {
 namespace {
@@ -51,7 +52,7 @@ bool GripperBus::connect() {
   return true;
 }
 
-void GripperBus::disconnect(bool disable) {
+void GripperBus::disconnect(bool disable) noexcept {
   if (!connected_) {
     return;
   }
@@ -61,7 +62,10 @@ void GripperBus::disconnect(bool disable) {
   // init(): the Python original would have left that motor enabled (holding
   // position with torque) after disconnect.
   if (disable && motor_ != nullptr && (initialized_ || motor_->is_enabled())) {
-    GripperBus::disable();
+    // ~GripperBus() calls this, and a destructor that lets a CommError escape
+    // terminates the process — the failure is contained and reported instead.
+    teardown_step_quietly("disable",
+                          [this] { GripperBus::disable(); });
   }
 
   if (controller_) {

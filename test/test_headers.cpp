@@ -4,9 +4,12 @@
 // This is a compile-time test first and a runtime test second: if any header
 // fails to stand on its own, the build breaks here rather than in a consumer.
 
+#include <functional>
 #include <type_traits>
+#include <utility>
 
 #include "litegrip/litegrip.hpp"
+#include "litegrip/teardown.hpp"
 
 // The value types must be default-constructible and copyable — they cross
 // layer boundaries as plain values.
@@ -24,6 +27,17 @@ static_assert(std::is_copy_constructible_v<litegrip::SafetyLimits>);
 static_assert(!std::is_copy_constructible_v<litegrip::GripperBus>);
 static_assert(!std::is_copy_constructible_v<litegrip::ControlLoop>);
 static_assert(!std::is_copy_constructible_v<litegrip::LiteGrip>);
+
+// Teardown never throws: the destructors are implicitly noexcept, so an
+// escaping CommError from a disable frame on a dead bus would terminate the
+// process instead of finishing the shutdown (issue #14).
+static_assert(std::is_nothrow_destructible_v<litegrip::LiteGrip>);
+static_assert(std::is_nothrow_destructible_v<litegrip::GripperBus>);
+static_assert(noexcept(std::declval<litegrip::LiteGrip&>().disconnect()));
+static_assert(noexcept(std::declval<litegrip::GripperBus&>().disconnect()));
+// ...and the container that makes that possible is itself noexcept.
+static_assert(noexcept(litegrip::teardown_step_quietly(
+    "step", std::declval<const std::function<void()>&>())));
 
 // The hold seam must be polymorphic (R2).
 static_assert(std::has_virtual_destructor_v<litegrip::HoldPolicy>);

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdio>
 #include <iostream>
+#include <stdexcept>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -16,6 +17,7 @@
 #include "litegrip/exceptions.hpp"
 #include "litegrip/gripper.hpp"
 #include "litegrip/safety.hpp"
+#include "litegrip/teardown.hpp"
 
 #ifndef LITEGRIP_TEST_DATA_DIR
 #error "LITEGRIP_TEST_DATA_DIR must be defined by CMake"
@@ -480,6 +482,42 @@ int main() {
     // The moved-from object must be inert: its destructor must not try to close
     // a bus it no longer owns.
     check(!original.is_connected(), "a moved-from gripper reports disconnected");
+  }
+
+  // ── the teardown step wrapper (~LiteGrip must not terminate) ───────────
+  //
+  // The destructor path runs disable() and the bus close. Both do bus I/O and
+  // can throw; the destructor is noexcept, so an escaping exception aborts the
+  // process instead of finishing the shutdown. Reaching the line after the
+  // step IS the assertion here — the guarantee is "does not throw", and the
+  // only way to observe it is to keep running.
+  {
+    bool ran = false;
+    check(litegrip::teardown_step_quietly("step", [&] { ran = true; }),
+          "a teardown step that succeeds reports success");
+    check(ran, "...and it really ran");
+  }
+  {
+    // Reaching the check at all is the guarantee: an escaping exception would
+    // abort the process here instead of reporting a failure.
+    const bool completed = litegrip::teardown_step_quietly(
+        "disable", [] { throw litegrip::CommError("CAN send failed"); });
+    check(!completed, "a failing teardown step reports failure, not a throw");
+  }
+  {
+    // Not everything thrown on a teardown path is a LiteGripError, and a
+    // std::terminate on an unexpected type is still a process that never
+    // returns an exit code.
+    const bool completed = litegrip::teardown_step_quietly(
+        "disable", [] { throw std::runtime_error("not ours"); });
+    check(!completed, "a non-SDK exception is contained too");
+  }
+  {  // Public and callable by hand: it has to be safe from any state, including
+     // never having been connected.
+    litegrip::LiteGrip gripper;
+    gripper.disconnect();
+    gripper.disconnect();
+    check(!gripper.is_connected(), "disconnect() is safe on a fresh gripper");
   }
 
   if (g_failures != 0) {
