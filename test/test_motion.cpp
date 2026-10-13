@@ -1607,85 +1607,6 @@ void test_move_at_speed_target_already_reached() {
 }
 
 
-// ── set_force (Python dump S9) ───────────────────────────────────────────
-
-void test_set_force() {
-  // In flight: 1.0 Nm, what the closing leg hands over. The setpoint is 20 N =
-  // 2.0 Nm, climbed at force_ramp_n_s — and the climb is per FRAME, so one
-  // frame adds 20 N/s x 0.005 s x 0.1 Nm/N = 0.01 Nm and the 1.0 Nm gap takes
-  // 100 frames. `duration` is the hold AFTER that climb (Python parity).
-  FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
-            /*stops=*/true);
-  SafetyGuard guard = make_guard();
-  MotionEngine engine(io, guard, instant_config());
-  io.motor_.tau = 1.0;
-
-  check(engine.set_force(20.0, 0.3), "S9: ok");
-  check(io.frames.size() == 160,
-        "S9: 100 climb + 60 hold frames = climb + duration/frame_interval");
-  const Frame& f = io.frames[0];
-  check(f.q == -1.0 && f.kp == 0.0 && f.kd == 0.0 && f.dq == 0.0,
-        "S9: pure torque source at the measured position");
-  check_near(f.tau_ff, 1.01, 1e-9,
-             "S9: first frame = in flight + one step (py: 1.01)");
-  check_near(io.frames[99].tau_ff, 2.0, 1e-9,
-             "S9: lands EXACTLY on the setpoint at frame 99 (py)");
-
-  bool step_is_flat = true;
-  for (std::size_t i = 1; i < 100; ++i) {
-    step_is_flat = step_is_flat &&
-                   std::fabs((io.frames[i].tau_ff - io.frames[i - 1].tau_ff) -
-                             0.01) <= 1e-9;
-  }
-  check(step_is_flat, "S9: every climbing frame adds the same 0.01 Nm");
-
-  bool tail_at_setpoint = true;
-  for (std::size_t i = 99; i < io.frames.size(); ++i) {
-    tail_at_setpoint = tail_at_setpoint && io.frames[i].tau_ff == 2.0;
-  }
-  check(tail_at_setpoint, "S9: every frame from the landing on stays at 2.0 Nm");
-
-  // The cadence is frame_interval. (This used to assert the opposite — a
-  // hardcoded 0.005 that ignored the config, so an engine retuned to another
-  // rate streamed at the old one.) At 0.01 s frames the same wall clock is
-  // half the frames: 1.0 Nm / 0.02 Nm and 0.3 s / 0.01 s.
-  MotionConfig m = instant_config();
-  m.frame_interval = 0.01;
-  FakeIo io2(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
-             /*stops=*/true);
-  SafetyGuard guard2 = make_guard();
-  MotionEngine engine2(io2, guard2, m);
-  io2.motor_.tau = 1.0;
-  engine2.set_force(20.0, 0.3);
-  check(io2.frames.size() == 80,
-        "S9: 50 climb + 30 hold frames at a 0.01 s cadence");
-  check_near(io2.frames[49].tau_ff, 2.0, 1e-9, "S9: 0.01 s climb lands at 50");
-
-  // Already at the setpoint (or past it): there is nothing to climb, so the
-  // call is exactly `duration` — no padding frame for a climb that did not
-  // happen.
-  for (double in_flight : {2.0, 3.0}) {
-    FakeIo io3(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
-               /*stops=*/true);
-    SafetyGuard guard3 = make_guard();
-    MotionEngine engine3(io3, guard3, instant_config());
-    io3.motor_.tau = in_flight;
-    engine3.set_force(20.0, 0.3);
-    check(io3.frames.size() == 60, "S9: no climb when already at the setpoint");
-    check_near(io3.frames[0].tau_ff, 2.0, 1e-9,
-               "S9: starts at the setpoint, does not ramp down to it");
-  }
-
-  // Over the guard's torque ceiling: refused before any frame is sent.
-  FakeIo io4(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
-             /*stops=*/true);
-  SafetyGuard guard4 = make_guard();
-  MotionEngine engine4(io4, guard4, instant_config());
-  check_throws<LimitViolation>([&] { engine4.set_force(40.0, 0.3); },
-                               "S9: 40 N = 4.0 Nm exceeds tau_max (3.5)");
-  check(io4.frames.empty(), "S9: refused before sending");
-}
-
 // ── the held force is a pure torque source ───────────────────────────────
 //
 // A hold frame used to carry kp=150 / kd=2. A force control wants a force, and
@@ -1765,29 +1686,6 @@ void test_the_hold_frame_carries_no_gains() {
     gainless = gainless && f.kp == 0.0 && f.kd == 0.0;
   }
   check(gainless, "hold: a configured hold_kp/hold_kd never reaches a frame");
-}
-
-void test_set_force_carries_no_gains() {
-  FakeIo io = yielding_gripper();
-  io.motor_.pos = kObjectRad;  // already gripping the workpiece
-  SafetyGuard guard = make_guard();
-  MotionEngine engine(io, guard, instant_config());
-
-  // Long enough for the climb to land: from zero torque the setpoint is
-  // 20 N / 20 N/s = 1 s of climbing, before duration even starts.
-  check(engine.set_force(20.0, 1.0), "set_force: ok");
-  check(!io.frames.empty(), "set_force: frames were sent");
-
-  bool gainless = true;
-  for (const Frame& f : io.frames) {
-    gainless = gainless && f.kp == 0.0 && f.kd == 0.0;
-  }
-  check(gainless, "set_force: no gains on any frame");
-  check_near(io.frames.front().tau_nm, 0.01, 1e-9,
-             "set_force: the first frame is one step off zero");
-  check_near(io.frames.back().tau_nm, 2.0, 1e-6,
-             "set_force: the last frame sits on the setpoint");
-  check(io.motor_.pos > kObjectRad, "set_force: the workpiece yielded");
 }
 
 // ── a held force ramps to its setpoint (Python dump S10) ─────────────────
@@ -1989,11 +1887,6 @@ constexpr double kCreepRadSPerNm = 0.05;
 /// slice-granular guard can overshoot its threshold by.
 double slice_travel_rad(const MotionConfig& m) {
   return m.hold_interval * kCreepRadSPerNm * kGuardForceN * 0.1;
-}
-
-/// One frame's worth, rad — set_force judges every frame, not every slice.
-double frame_travel_rad(const MotionConfig& m) {
-  return m.frame_interval * kCreepRadSPerNm * kGuardForceN * 0.1;
 }
 
 int release_frame_count(const MotionConfig& m) {
@@ -2209,64 +2102,12 @@ void test_an_uncalibrated_config_gets_no_hold_guard() {
   check(!hold.guarded, "guard: and is not guarded");
 }
 
-// ── the guard on set_force (its own frame loop, same predicate) ──────────
-
-void test_set_force_stops_when_the_jaw_runs_out_of_the_travel() {
-  // Starts inside the travel, just short of the closed limit: the climb covers
-  // part of the creep and the hold covers the rest, so the trip lands in the
-  // middle of that segment rather than on a boundary.
-  FakeIo io(test_config(), /*start_rad=*/ kPosClosedRad - 0.02, std::nullopt,
-            0.0, /*stops=*/false, 0.0, 0.0, kCreepRadSPerNm);
-  SafetyGuard guard = make_guard();
-  MotionConfig m = instant_config();
-  MotionEngine engine(io, guard, m);
-
-  check(!engine.set_force(kGuardForceN, 5.0),
-        "guard: set_force reports the cut-short hold");
-
-  const double out_rad =
-      closing_travel_excursion_rad(io.config(), io.motor_.pos);
-  check(out_rad > 0.0, "guard: the jaws really walked out");
-  // Judged every frame, so the granularity is one frame, not one slice.
-  check(out_rad <= m.hold_runaway_rad + frame_travel_rad(m) + 1e-9,
-        "guard: released next to the threshold");
-  check(frame_travel_rad(m) < slice_travel_rad(m),
-        "guard: the frame granularity is the tighter of the two");
-
-  const std::vector<Frame> release = release_tail(io.frames);
-  check(static_cast<int>(release.size()) == release_frame_count(m),
-        "guard: the tail is stop_release_s of frames");
-  check(all_limp(release), "guard: every release frame is limp");
-}
-
-void test_set_force_leaves_an_uncalibrated_config_alone() {
-  // set_force has never required a calibration, and the guard does not add a
-  // requirement: with no calibration it is off and the force goes out as
-  // before.
-  FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
-            /*stops=*/false, 0.0, 0.0, kCreepRadSPerNm);
-  SafetyGuard guard = make_guard();
-  MotionConfig m = instant_config();
-  MotionEngine engine(io, guard, m);
-  io.config().calibrated = false;
-  io.motor_.pos = kPosClosedRad + 1.0;
-  check(closing_travel_excursion_rad(io.config(), io.motor_.pos) >
-            m.hold_runaway_rad,
-        "guard: the start would be outside the guard if it were on");
-
-  check(engine.set_force(kGuardForceN, 0.2),
-        "guard: an uncalibrated set_force still succeeds");
-  check_near(io.frames.back().tau_ff, kGuardForceN * 0.1, 1e-9,
-             "guard: and streamed the full setpoint");
-}
-
-// ── non-finite setpoints and the climb loop (Python audit 2026-10-10) ────
+// ── non-finite setpoints (Python audit 2026-10-10) ───────────────────────
 //
 // Every one of these was measured on the old code, which sent the NaN onward:
 // grasp() passed a NaN force into the closing leg's torque budget for the
-// whole leg, grasp()'s NaN hold_s made `bounded` false — an UNBOUNDED hold
-// rather than the short one it looks like — and set_force()'s climb loop
-// (`while probe != target_nm`) never terminated while sending no frame at all.
+// whole leg, and grasp()'s NaN hold_s made `bounded` false — an UNBOUNDED hold
+// rather than the short one it looks like.
 // A refusal must come before the mechanism moves: a NaN is not a large or a
 // small boundary, it has no meaning.
 
@@ -2301,54 +2142,6 @@ void test_grasp_refuses_a_non_finite_force_or_hold() {
   check_throws<CommandError>([&] { engine.grasp(std::nullopt, 0.0); },
                              "non-finite: the MotionConfig setpoint is checked too");
   check(io.frames.empty(), "non-finite: the config setpoint sent no frame");
-}
-
-void test_set_force_refuses_a_non_finite_force_or_duration() {
-  for (double bad : {kNaN, kInf, -kInf}) {
-    FakeIo io(test_config(), -1.0, std::nullopt, 0.0, /*stops=*/true);
-    SafetyGuard guard = make_guard();
-    MotionEngine engine(io, guard, instant_config());
-
-    check_throws<CommandError>([&] { engine.set_force(bad, 0.0); },
-                               "non-finite: set_force(force_n) refused");
-    check(io.frames.empty(), "non-finite: set_force(force_n) sent no frame");
-
-    check_throws<CommandError>([&] { engine.set_force(kGuardForceN, bad); },
-                               "non-finite: set_force(duration) refused");
-    check(io.frames.empty(), "non-finite: set_force(duration) sent no frame");
-  }
-}
-
-void test_the_force_climb_never_spins_when_a_step_is_absorbed() {
-  // A step small enough for the arithmetic to eat (`probe + step == probe`)
-  // never reaches the setpoint, and `while (probe != target_nm)` spins on it
-  // forever without sending a frame. Each step now verifies that the distance
-  // to the setpoint really shrank.
-  FakeIo io(test_config(), -1.0, std::nullopt, 0.0, /*stops=*/true);
-  SafetyGuard guard = make_guard();
-  MotionConfig m = instant_config();
-  m.force_ramp_n_s = 1e-15;
-  MotionEngine engine(io, guard, m);
-
-  check_throws<CommandError>([&] { engine.set_force(kGuardForceN, 0.0); },
-                             "non-finite: a swallowed step raises instead of spinning");
-  check(io.frames.empty(), "non-finite: the swallowed-step climb sent no frame");
-}
-
-void test_a_normal_climb_still_lands_on_the_setpoint() {
-  // The gate above must not have changed the normal climb: still one step per
-  // frame, landing exactly on the setpoint.
-  FakeIo io(test_config(), -1.0, std::nullopt, 0.0, /*stops=*/true);
-  SafetyGuard guard = make_guard();
-  MotionEngine engine(io, guard, instant_config());
-
-  check(engine.set_force(kGuardForceN, 0.0), "non-finite: a normal climb passes");
-  check(!io.frames.empty(), "non-finite: a normal climb sends frames");
-  if (io.frames.empty()) return;
-  check_near(io.frames.front().tau_ff, kRampStepNm, 1e-9,
-             "non-finite: the first frame is one step off zero");
-  check_near(io.frames.back().tau_ff, kGuardForceN * 0.1, 1e-9,
-             "non-finite: the climb lands exactly on the setpoint");
 }
 
 // ── zero-gravity (Python dump S7) ────────────────────────────────────────
@@ -2618,8 +2411,6 @@ void test_litegrip_forwarding() {
                                     "LiteGrip::open while disconnected");
   check_throws<NotInitializedError>([&] { g.grasp(); },
                                     "LiteGrip::grasp while disconnected");
-  check_throws<NotInitializedError>([&] { g.set_force(10.0); },
-                                    "LiteGrip::set_force while disconnected");
   check_throws<NotInitializedError>([&] { g.move_at_speed(40.0); },
                                     "LiteGrip::move_at_speed while disconnected");
   check_throws<NotInitializedError>([&] { g.enter_zero_gravity(0.0); },
@@ -2667,10 +2458,8 @@ int main() {
   test_ramp_to_gains_reach_the_frames();
   test_ramp_to_refuses_what_the_ramp_cannot_honour();
   test_move_at_speed_target_already_reached();
-  test_set_force();
   test_a_yielding_workpiece_does_not_erode_the_hold_force();
   test_the_hold_frame_carries_no_gains();
-  test_set_force_carries_no_gains();
   test_the_climb_starts_from_the_torque_in_flight();
   test_every_climbing_frame_adds_the_same_amount();
   test_it_lands_exactly_on_the_setpoint_and_stays();
@@ -2683,12 +2472,7 @@ int main() {
   test_the_guard_follows_the_mount_direction();
   test_a_hold_entered_outside_the_travel_pushes_nothing();
   test_an_uncalibrated_config_gets_no_hold_guard();
-  test_set_force_stops_when_the_jaw_runs_out_of_the_travel();
-  test_set_force_leaves_an_uncalibrated_config_alone();
   test_grasp_refuses_a_non_finite_force_or_hold();
-  test_set_force_refuses_a_non_finite_force_or_duration();
-  test_the_force_climb_never_spins_when_a_step_is_absorbed();
-  test_a_normal_climb_still_lands_on_the_setpoint();
   test_zero_gravity();
   test_ceilings_and_refusals();
   test_recovery_from_open_stop();

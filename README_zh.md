@@ -209,7 +209,6 @@ static LiteGrip connect_raii(GripperConfig config = GripperConfig{});
 | `close(speed_mm_s=None, progress={})` → `MoveResult` | 同样，朝闭合侧。`work_stroke_mm` 是张开侧的数，不改变闭合停在哪里。 |
 | `home()` → `MoveResult` | 斜坡走到标定闭合位置。不是压紧：它停在零点**上**，而不是压住零点。 |
 | `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | 闭合到工件上 —— 空载则闭合到闭合侧标定限位 —— 然后爬到并保持 `force_n` N。闭合段带着 `force_n` 作为力矩预算，所以撞上工件时压出的力不超过设定值。只有夹爪停下来后保力段才接手：`stalled`（两指之间有东西）或 `reached`（空载闭合到位）。`hold_s = 0` 保到故障或越位护栏为止。`force_n` 留空用 `MotionConfig::force_n`（20 N）。 |
-| `set_force(force_n, duration_s=0.3)` → `bool` | 在夹爪当前所在处保持 `force_n`，持续 `duration_s` 秒。 |
 | `goto_mm(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | 斜坡走到一个毫米目标（0 = 闭合）。 |
 | `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | 同样，单位是弧度。`dq_target` 与 `tau_feedforward` 必须是 0 —— 见下。 |
 | `move_to(target_rad, kp=None, kd=None, tau_feedforward=0.0, duration=1.0)` → `MoveResult` | 与 `goto_rad` 相同，默认 `duration` 更长。 |
@@ -255,10 +254,16 @@ DM4310 的 ±10 N·m 帧量程顶到饱和，而饱和帧会冲过目标而不�
 
 ### 夹取与力控
 
-`grasp(force_n, hold_s)` 先闭合再保力；`set_force(force_n, duration_s)` 在夹爪
-当前所在处保力。两者都按 `kp = kd = 0` 流帧，所以驱动器的输出**就是**前馈力矩
+`grasp(force_n, hold_s)` 是唯一能出力的方式：先闭合再保力。保力帧按
+`kp = kd = 0` 流帧，所以驱动器的输出**就是**前馈力矩
 `close_sign × force_n × 0.1 Nm`。这正是力与工件无关的原因：软工件让位时夹爪跟
 着走，夹持力度保持在设定值上。
+
+**力只有顶着东西才有意义。** 没有“在当前所在处施加一个力”的调用，这是有意的：
+那样的调用无法判断两指之间有没有东西，而保力帧不给驱动器任何位置或速度误差
+去作用，没有东西时力矩就是唯一的作用力，夹爪会加速。`grasp()` 从构造上避开了
+这一点 —— 它的闭合段走位置斜坡，先到工件（或到闭合侧标定限位）停下，保力段才
+接手。
 
 - **力是近似值。** `1 N = 0.1 Nm` 在 SDK 里就标着近似（`kForceCalibrationVerified`
   是 false），实际夹持力还取决于你的指爪几何。把 `force_n` 当可重复的设定值，
@@ -278,9 +283,9 @@ MotionConfig::press_safety`（0.9，于是压出的力矩落在设定值之下�
 
 **越位护栏。** 保力帧没有位置误差，所以任何位置约束都作用不到它；唯一可用的
 手段就是撤掉力矩。实测位置越过闭合侧标定限位达 `MotionConfig::hold_runaway_rad`
-（`0.05 rad`，按出厂 `rad_to_mm` 61.0123 约 3.05 mm）时，`grasp` 与 `set_force`
-连发 `MotionConfig::stop_release_s` 的零力矩帧后返回 —— `GraspResult::travel_guard`
-置位、`ok` 为假，或 `set_force` 返回 `false`。只判闭合侧，因为前馈力矩朝那边压。
+（`0.05 rad`，按出厂 `rad_to_mm` 61.0123 约 3.05 mm）时，`grasp`
+连发 `MotionConfig::stop_release_s` 的零力矩帧后返回，`GraspResult::travel_guard`
+置位、`ok` 为假。只判闭合侧，因为前馈力矩朝那边压。
 这是**失控探测，不是精度约束**：只有确实夹着东西的夹爪被放开时，才该调大
 `hold_runaway_rad`。未标定时护栏不启用。
 
@@ -623,7 +628,7 @@ gripper.close();                                         // 应该是合上，�
   放行「包装机械包络」内的位置（参考机手推的未验证上界），而所有已出货标定的
   止点都在它之外；未决项写在 `MotionEngine::recover_to_interior` 的定义处。
 
-**整个定位一族都在那条引擎斜坡上**：`open` / `close` / `grasp` / `set_force` /
+**整个定位一族都在那条引擎斜坡上**：`open` / `close` / `grasp` /
 零重力，如今还有 `goto_mm` / `goto_rad` / `move_to` / `home` /
 `move_at_speed` / `move_at_speed_rad`。`goto` 一族过去走的是
 `guard_motion_frame`，而在随包文件上那道闸门会拒绝真实工作：红线
@@ -737,7 +742,7 @@ gripper.close();                                         // 应该是合上，�
 | `can::MotorController` | 一条总线上的多电机派发 | `can/controller.py` |
 | `GripperBus` | 单爪总线 API（`init` = 持位） | `protocols/can_bus.py` |
 | `LiteGrip` | 高层 API | `gripper.py` |
-| `MotionEngine` | 动作引擎：open/close/grasp/set_force/定位斜坡/零重力 | `actions.py` + `gripper.py` |
+| `MotionEngine` | 动作引擎：open/close/grasp/定位斜坡/零重力 | `actions.py` + `gripper.py` |
 | `SafetyGuard` + `SafetyLimits` | 红线、力矩预算、看门狗、模式 | `safety_limits.py`（核心） |
 | `ControlLoop` | 后台 200 Hz 流式发送 + 限速 + 闸门 | 旧的 Python 侧守护进程 |
 
@@ -756,7 +761,7 @@ gripper.close();                                         // 应该是合上，�
 | 每次运动都打 `[litegrip] entering a safety mode: ... recovering from outside the red lines` | 随包文件下这是预期行为，不是故障。开/闭循环的两个停驻位置都在红线之外，所以每次运动先把爪子爬回红线内 —— 见 [每轮都报回收是正常的](#每轮都报回收是正常的)。 |
 | `open()` 或 `close()` 返回 `ok = false`，而夹爪离止点很远 | 有东西挡住了行程。`protection_tripped` 置位说明是行进段力矩保护有意失力的。 |
 | 某个 `goto` 返回 `ok = false` 且 `released = true` | 没到位，引擎把力撤了，而不是留在那里压着。查行程里有什么。 |
-| `set_force()` 返回 `false`，或 `GraspResult::travel_guard` 置位 | 越位护栏触发：实测位置越过了闭合侧标定限位。见 [夹取与力控](#夹取与力控)。 |
+| `GraspResult::travel_guard` 置位 | 越位护栏触发：实测位置越过了闭合侧标定限位。见 [夹取与力控](#夹取与力控)。 |
 | `open()` 没走满行程 | 配置了工作行程 —— 那正是它的用途。见 [工作行程](#工作行程)。 |
 | `CommError: CAN send timeout ...` | 发送缓冲在整个重试窗口里一直是满的，所以有一帧**没有**发出去。总线负载过高，或接口卡死；SDK 报出来而不是悄悄丢掉。 |
 | `SafetyFault: ...: no valid feedback — motion is refused` | 没有新的状态帧。未使能的电机不流状态帧；`refresh_status()` 可以要一帧。 |

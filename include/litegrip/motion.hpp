@@ -1,4 +1,4 @@
-// litegrip/motion.hpp — the action engine (open / close / grasp / set_force /
+// litegrip/motion.hpp — the action engine (open / close / grasp /
 // positioning ramps / zero-gravity).
 //
 // Port of litegrip_driver/litegrip/actions.py plus the matching parts of
@@ -26,7 +26,7 @@
 //     "mechanical observed range" (the reference unit's unverified hand-push
 //     bound, safety.hpp), which no shipped calibration's stops lie inside —
 //     see the TODO-style note on the function for the follow-up;
-//   * hold-type operations (grasp's hold, set_force, exit_zero_gravity) never
+//   * hold-type operations (grasp's hold, exit_zero_gravity) never
 //     run the recovery drive-in: driving "inward" while holding a workpiece
 //     would open the grip. open()/close()/grasp()/move_at_speed*() — the
 //     MOVE entries — do.
@@ -489,17 +489,6 @@ class MotionEngine {
   /// physical.
   GraspResult grasp(std::optional<double> force_n = std::nullopt,
                     double hold_s = 0.0, MoveProgressCallback progress = {});
-
-  /// Apply force_n at the current position: ramp to it at force_ramp_n_s, then
-  /// hold it for duration_s. duration_s is the hold AFTER the climb, so the
-  /// call's wall clock is climb + duration and a short duration still reaches
-  /// the full force; 0 means "ramp and return". Same gainless frames and same
-  /// force-not-calibrated caveat as grasp().
-  ///
-  /// Returns false, and drops the torque, when the same
-  /// MotionConfig::hold_runaway_rad guard trips — this path streams the same
-  /// pure-torque frames and needs the same bound.
-  bool set_force(double force_n, double duration_s = 0.3);
 
   /// Positioning ramp to an absolute target: the SAME bounded ramp
   /// open()/close() run, with press = false. Mirrors

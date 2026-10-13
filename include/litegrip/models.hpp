@@ -191,7 +191,7 @@ struct GripperConfig {
   /// Grip force in N for a measured motor torque. Positive means *squeeze*.
   ///
   /// ⚠ The N value is NOT force-calibrated — it is torque times a constant,
-  /// matching the Python SDK so the two agree. See set_force().
+  /// matching the Python SDK so the two agree. See grasp().
   double force_n_from_torque(double torque_nm) const noexcept {
     return close_sign() * torque_nm * nm_to_n;
   }

@@ -4,7 +4,7 @@
 // consumers use: connect, init (hold), open/close/goto, calibrate, read state.
 //
 // Capability scope: lifecycle, hold-based init, calibration, position motion,
-// the action engine (open/close/grasp/set_force/positioning ramps/zero-gravity —
+// the action engine (open/close/grasp/positioning ramps/zero-gravity —
 // motion.hpp), state and parameter access. Trajectory record/playback and
 // teleop are later stages.
 //
@@ -165,11 +165,6 @@ class LiteGrip : private MotionIo {
   /// with GraspResult::travel_guard set and ok false.
   GraspResult grasp(std::optional<double> force_n = std::nullopt,
                     double hold_s = 0.0, MoveProgressCallback progress = {});
-
-  /// Apply force_n at the current position for duration_s (torque
-  /// feed-forward; same not-force-calibrated caveat as grasp()). Returns false
-  /// when the same MotionConfig::hold_runaway_rad guard trips.
-  bool set_force(double force_n, double duration_s = 0.3);
 
   /// Positioning move to an absolute opening in mm (0 = closed) at a constant
   /// speed. The same bounded ramp as goto_mm, so the same MoveResult reading
