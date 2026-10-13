@@ -456,9 +456,10 @@ MoveResult LiteGrip::goto_rad(double position_rad, std::optional<double> kp,
   //     (0.029564 + 0.01) x 73.4573. The open end refused nothing: its red line
   //     sits (-1.24 + 1.141184) x 73.4573 = 7.3 mm PAST the calibrated stop, so
   //     every position the clamp admits is already inside it. Do not take the
-  //     margins quoted in safety_limits_350.json's provenance (5.60 mm /
-  //     2.99 mm) — those are the red line to the MECHANICAL OBSERVED bounds, at
-  //     a scale of about 10.9 mm/rad that is not this repository's.
+  //     margins quoted in safety_limits_350.json's provenance (2.41 mm /
+  //     4.50 mm at 73.4573 mm/rad) — those are the red line to the MECHANICAL
+  //     OBSERVED bounds: 0.032793 and 0.061308 rad, a different pair of ends
+  //     from the 0.098816 and 0.039564 rad this block computes.
   // To put a red-line TARGET check back at this one site, test `clamped`
   // against safety_->limits() and throw LimitViolation. The gate's other steps
   // have no work to do here any more: dq and tau are fixed at zero above, and
