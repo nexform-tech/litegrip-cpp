@@ -55,8 +55,8 @@ struct GripperParams {
 /// millimetres-per-radian scale is that span over the measured travel in
 /// radians; deriving it from the 85 mm jaw travel instead would leave every
 /// mm-based move 1.2% short — 1 mm lost per full stroke. The factory
-/// calibration's own numbers show the pair: 1.409552 rad of travel is 86 mm at
-/// 61.01229326764816 mm/rad, and 85 mm at 60.303.
+/// calibration's own numbers show the pair: 1.170748 rad of travel is 86 mm at
+/// 73.45731105242119 mm/rad, and 85 mm at 72.603.
 struct GripperGeometry {
   /// Jaw travel measured with calipers, from the closed stop (mm).
   static constexpr double kJawTravelMm = 85.0;
