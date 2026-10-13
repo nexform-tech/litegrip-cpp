@@ -41,6 +41,14 @@ double monotonic_now() noexcept {
 
 std::string errno_text() { return std::strerror(errno); }
 
+/// The 11-bit id as the log lines print it ("0x08").
+std::string hex_id(int can_id) {
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "%03X",
+                static_cast<unsigned>(can_id) & CAN_SFF_MASK);
+  return buf;
+}
+
 std::string describe_interface(const std::string& channel) {
   return "CAN interface '" + channel + "'";
 }
@@ -258,11 +266,18 @@ void CanTransport::send(int can_id, const std::uint8_t* data, std::size_t size,
     }
     const double remaining = deadline - monotonic_now();
     if (remaining <= 0.0) {
+      // A full buffer means this frame did NOT go out. Returning quietly made
+      // the caller treat it as sent — on the bench that chain is what produced
+      // "moved 0.000 mm" reported as success. The header always promised the
+      // caller would find out; this is the implementation catching up to it.
       std::fprintf(stderr,
                    "[litegrip] CAN send timeout on %s (buffer full >%.1fs), "
-                   "frame to 0x%03X dropped\n",
+                   "frame to 0x%03X not sent\n",
                    channel_.c_str(), timeout_s, can_id & CAN_SFF_MASK);
-      return;
+      throw CommError("CAN send timeout on " + channel_ +
+                      ": the send buffer stayed full for more than " +
+                      std::to_string(timeout_s) + " s, so the frame to 0x" +
+                      hex_id(can_id) + " was not sent");
     }
     struct pollfd pfd{};
     pfd.fd = fd_;

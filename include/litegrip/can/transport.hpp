@@ -73,8 +73,15 @@ class CanTransport {
   void set_id_filter(const std::vector<int>& can_ids);
   void add_id_filter(int can_id);
 
-  /// Send one frame. Retries on EAGAIN until `timeout_s`; on exhaustion the
-  /// frame is dropped and a warning is logged (matching the Python original).
+  /// Send one frame. Retries on EAGAIN until `timeout_s`.
+  ///
+  /// Throws CommError when the send buffer stays full for that whole time: the
+  /// frame did NOT go out, and a caller that cannot send has to find out or it
+  /// reports motion that never happened. (It used to log and return, which is
+  /// how "moved 0.000 mm" came back as success on the bench. The Python
+  /// original now raises too; its TimeoutError is an OSError, and this SDK's
+  /// write-failure counterpart is CommError — not CANTimeoutError, which names
+  /// a *read* timeout.)
   void send(int can_id, const std::uint8_t* data, std::size_t size,
             double timeout_s = 0.1);
 
