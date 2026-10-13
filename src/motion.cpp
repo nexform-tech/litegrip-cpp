@@ -72,17 +72,6 @@ double toward(double value, double target, double step) {
   return std::max(value - step, target);
 }
 
-/// Python's int() truncates here (frame counts from a duration ratio).
-int frame_count_trunc(double ratio) {
-  if (!(ratio > 0.0)) {
-    return 0;
-  }
-  if (ratio >= 1.0e9) {
-    return 1000000000;
-  }
-  return static_cast<int>(ratio);
-}
-
 /// Refuse a target or a rate that is not a finite number, before any arithmetic
 /// gets to answer it with something real.
 ///
@@ -93,8 +82,8 @@ int frame_count_trunc(double ratio) {
 /// driven to as if the caller had asked for it — while a NaN rate becomes a NaN
 /// dq that only send_frame() refuses, i.e. mid-move, once the ramp has already
 /// started. Neither is a refusal at the entry, which is what Python does at
-/// these same sites (gripper.py goto_rad / move_at_speed / _move_at_speed_rad)
-/// and for the same reason.
+/// these same sites (gripper.py goto_rad / move_at_speed / ramp_to) and for the
+/// same reason.
 void check_finite(const char* source, const char* name, double value) {
   if (!std::isfinite(value)) {
     throw CommandError(std::string(source) + ": " + name +
@@ -451,12 +440,12 @@ void MotionEngine::recover_to_interior(const char* source) {
 
 // ── the ramp (Python actions._move_to_limit) ─────────────────────────────
 
-MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
-                                       bool press,
-                                       std::optional<double> target_rad,
-                                       std::optional<double> force_n,
-                                       const char* source,
-                                       const MoveProgressCallback& progress) {
+MoveResult MotionEngine::move_to_limit(
+    Toward toward, double speed_mm_s, bool press,
+    std::optional<double> target_rad, std::optional<double> force_n,
+    const char* source, const MoveProgressCallback& progress,
+    std::optional<double> duration_s, std::optional<double> kp,
+    std::optional<double> kd) {
   check_entry(source);
   const GripperConfig& gcfg = io_.config();
 
@@ -465,6 +454,31 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
   // to press onto — and the limit is only carried for reporting.
   if (target_rad.has_value()) {
     press = false;
+  }
+
+  // How long the leg lasts and how fast it goes are two statements of the same
+  // thing, so giving both is ambiguous rather than harmless. And a
+  // force-carrying approach has its speed budget set by the setpoint
+  // (force_approach_terms below), so a duration would be overwritten there.
+  if (duration_s.has_value()) {
+    if (speed_mm_s > 0.0) {
+      throw CommandError(
+          std::string(source) +
+          ": speed_mm_s and duration_s are mutually exclusive — one says how "
+          "fast, the other how long; give one");
+    }
+    if (force_n.has_value()) {
+      throw CommandError(
+          std::string(source) +
+          ": duration_s cannot be combined with a force — a force-carrying "
+          "approach's speed budget comes from the setpoint");
+    }
+    if (!std::isfinite(*duration_s) || *duration_s <= 0.0) {
+      throw CommandError(
+          std::string(source) +
+          ": duration_s must be a positive finite number — the speed is "
+          "derived as distance / duration_s, and zero or negative has no ramp");
+    }
   }
   const TargetSpec spec =
       target_rad.has_value()
@@ -491,11 +505,14 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
   // frame's three force-producing terms are handed shares of the setpoint's
   // budget (force_approach_terms). An ordinary move keeps the config kd and the
   // travel lead ceiling untouched.
-  double kd_frame = gcfg.kd;
+  // The caller's gains, when it gave any; emit() falls back to the config for
+  // the ones it did not. The force branch below recomputes kd_frame from the
+  // setpoint's budget, which is why this is not const.
+  double kd_frame = kd.value_or(gcfg.kd);
   double lead_ceiling_rad = config_.max_lead_mm / gcfg.rad_to_mm;
   if (force_n.has_value()) {
     const ApproachTerms terms = force_approach_terms(
-        gcfg.kp, gcfg.kd, speed_rad_s, config_.frame_interval,
+        kp.value_or(gcfg.kp), kd_frame, speed_rad_s, config_.frame_interval,
         *force_n * UnitConversion::kNToNm * config_.press_safety,
         lead_ceiling_rad);
     speed_rad_s = terms.speed_rad_s;
@@ -526,6 +543,22 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
   const double dist_mm = std::fabs(dist_rad) * gcfg.rad_to_mm;
   const double sign = dist_rad >= 0.0 ? 1.0 : -1.0;
   const double interval = config_.frame_interval;
+
+  // "How long this leg lasts": the distance is only known now, so that is
+  // where the speed is derived. dist_mm == 0 gives speed 0 -> ramp_s 0 ->
+  // ramp_steps 1, i.e. "already there" as the degenerate ramp rather than a
+  // special case. The ceiling is re-checked because the top-of-function check
+  // saw speed_mm_s == 0.
+  if (duration_s.has_value()) {
+    speed_mm_s = *duration_s > 0.0 ? dist_mm / *duration_s : 0.0;
+    speed_rad_s = speed_mm_s / gcfg.rad_to_mm;
+    if (std::fabs(speed_rad_s) > kMaxCommandVelocityCeilingRadS) {
+      throw LimitViolation(
+          std::string(source) +
+          ": duration_s implies a speed beyond the commanded-velocity ceiling");
+    }
+  }
+
   const double ramp_s = speed_mm_s > 0.0 ? dist_mm / speed_mm_s : 0.0;
   const int ramp_steps = std::max(1, frame_count_round(ramp_s / interval));
   const int settle_steps =
@@ -543,6 +576,15 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
   const double stop_cap_rad =
       std::max(config_.stop_lead_mm / gcfg.rad_to_mm, min_cap_rad);
   const double press_zone_rad = config_.press_zone_mm / gcfg.rad_to_mm;
+
+  // A trip that is already inside reach_tol gets no stall verdict at all. The
+  // ramp's frame count follows duration/speed and NOT the distance, so a
+  // nearly-zero trip (home() straight after close() is 0.02 mm) runs a
+  // full-length ramp in place, and the window displacement of a jaw that is
+  // merely parked would read as a stall. The press path is unaffected: its
+  // target lies beyond the stop, where "arrived on the stop and not moving" IS
+  // the stall worth reporting. Mirrors actions._move_to_limit.
+  const bool judge_stall = press || dist_mm > config_.reach_tol * gcfg.rad_to_mm;
 
   std::vector<double> hist;
   hist.push_back(before.position_rad);
@@ -582,7 +624,7 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
     // emit() returns what actually went out (clamped into the calibrated
     // travel), so the reported final command is the sent one, not the
     // computed one.
-    last_cmd = emit(cmd, dq, 0.0, std::nullopt, kd_frame, source);
+    last_cmd = emit(cmd, dq, 0.0, kp, kd_frame, source);
     last_i = i;
 
     if (i % sample_every != 0 && i != total_steps) {
@@ -616,7 +658,7 @@ MoveResult MotionEngine::move_to_limit(Toward toward, double speed_mm_s,
       snapshot.temperature_coil = st.temperature_coil;
       progress(snapshot);
     }
-    if (win_delta.has_value() && (press || i <= ramp_steps) &&
+    if (judge_stall && win_delta.has_value() && (press || i <= ramp_steps) &&
         *win_delta < win_thresh_rad) {
       stalled = true;
       break;
@@ -935,116 +977,98 @@ bool MotionEngine::set_force(double force_n, double duration_s) {
   return true;
 }
 
-// ── constant-speed moves (Python _move_at_speed_rad) ─────────────────────
+// ── the positioning ramp (Python actions.GripperActions.ramp_to) ─────────
 
-bool MotionEngine::move_at_speed(double target_mm, double speed_mm_s,
+MoveResult MotionEngine::ramp_to(double target_rad, double speed_mm_s,
+                                 std::optional<double> duration_s,
                                  std::optional<double> kp,
-                                 std::optional<double> kd) {
+                                 std::optional<double> kd,
+                                 MoveProgressCallback progress) {
+  check_entry("ramp_to");
+  const GripperConfig& gcfg = io_.config();
+  check_calibrated(gcfg);
+  check_finite("ramp_to", "target_rad", target_rad);
+
+  // The speed has to come from somewhere. A zero-speed ramp is a single frame,
+  // and that one frame IS the hard step this entry exists to remove — so give
+  // speed_mm_s, or give duration_s to say how long the leg lasts. Giving both
+  // is refused by move_to_limit; giving neither is refused here.
+  if (!duration_s.has_value() &&
+      !(std::isfinite(speed_mm_s) && speed_mm_s > 0.0)) {
+    throw CommandError(
+        "ramp_to: speed_mm_s must be a positive finite number, or give "
+        "duration_s to say how long the leg lasts");
+  }
+
+  // `toward` only names the move — the reported limit_rad and the safety
+  // mode's log line. The target is a point inside the travel, so the name
+  // comes from which calibrated end it sits nearer; a reverse mount orders the
+  // two ends the other way round, so compare distances, not magnitudes.
+  const Toward toward =
+      std::fabs(target_rad - gcfg.pos_closed_rad) <=
+              std::fabs(target_rad - gcfg.pos_open_rad)
+          ? Toward::kClose
+          : Toward::kOpen;
+
+  MoveResult res =
+      move_to_limit(toward, speed_mm_s, /*press=*/false, target_rad,
+                    std::nullopt, "ramp_to", progress, duration_s, kp, kd);
+  if (!res.ok && !res.protection_tripped) {
+    // Falling short is falling short. The loop broke with the last command
+    // still leading the measured position by the lead cap, and a lead cap
+    // against a blocked jaw is a standing torque: leave it on the bus and the
+    // drive presses the part for as long as it stays enabled. Pressing is
+    // open()/close()'s job, not a positioning move's.
+    release(res.state.position_rad, "ramp_to");
+    res.released = true;
+  }
+  return res;
+}
+
+// ── the move_at_speed entry points (Python gripper.move_at_speed_rad) ────
+
+MoveResult MotionEngine::move_at_speed(double target_mm, double speed_mm_s,
+                                       std::optional<double> kp,
+                                       std::optional<double> kd) {
   check_entry("move_at_speed");
   // The target is expressed in mm from the calibrated closed end, so without a
   // calibration there is no frame to express it in. Refuse before anything
   // moves: a refusal after a frame has gone out is not a refusal.
   check_calibrated(io_.config());
-  // Before the "nothing to do" shortcuts below, not after: both compare FALSE
-  // against a NaN, so it would slip past them and reach the ramp arithmetic.
   check_finite("move_at_speed", "target_mm", target_mm);
   check_finite("move_at_speed", "speed_mm_s", speed_mm_s);
-  // MOVE entry: establish legality before considering the requested
-  // displacement — a no-op move must not leave the gripper outside the red
-  // lines for the next caller to deal with.
-  recover_to_interior("move_at_speed");
-
+  if (!(speed_mm_s > 0.0)) {
+    throw CommandError(
+        "move_at_speed: speed_mm_s must be positive — a zero-speed move used "
+        "to report success without sending a frame");
+  }
   const GripperConfig& gcfg = io_.config();
-  const GripperState st = io_.get_state(true);
-  if (!st.has_data()) {
-    throw SafetyFault("move_at_speed: no valid feedback — refused");
-  }
-  const double current_mm = st.position_mm;
-  const double distance_mm = std::fabs(target_mm - current_mm);
-  if (distance_mm < 0.01 || speed_mm_s <= 0.0) {
-    return true;
-  }
-
-  const double duration_s = distance_mm / speed_mm_s;
-  // Convert to rad; close_sign handles the reverse mount.
-  const double s = gcfg.close_sign();
-  const double current_rad =
-      gcfg.pos_closed_rad - s * current_mm / gcfg.rad_to_mm;
-  const double target_rad =
-      gcfg.pos_closed_rad - s * target_mm / gcfg.rad_to_mm;
-  const double speed_rad_s = speed_mm_s / gcfg.rad_to_mm;
-
-  return move_at_speed_rad_impl(current_rad, target_rad, speed_rad_s,
-                                duration_s, kp, kd);
+  // rad_for_opening_mm handles the reverse mount; do not open-code it.
+  return ramp_to(gcfg.rad_for_opening_mm(target_mm), speed_mm_s, std::nullopt,
+                 kp, kd, {});
 }
 
-bool MotionEngine::move_at_speed_rad(double target_rad, double speed_rad_s,
-                                     std::optional<double> kp,
-                                     std::optional<double> kd) {
+MoveResult MotionEngine::move_at_speed_rad(double target_rad, double speed_rad_s,
+                                           std::optional<double> kp,
+                                           std::optional<double> kd) {
   check_entry("move_at_speed_rad");
-  // The target is clamped into [pos_open_rad, pos_closed_rad] below, which is
-  // the calibrated travel only when there is a calibration; the placeholder
-  // limits describe another unit's geometry.
+  // The target is clamped into the calibrated travel below, which is a real
+  // travel only when there is a calibration; the placeholder limits describe
+  // another unit's geometry.
   check_calibrated(io_.config());
   check_finite("move_at_speed_rad", "target_rad", target_rad);
   check_finite("move_at_speed_rad", "speed_rad_s", speed_rad_s);
-  recover_to_interior("move_at_speed_rad");
-
-  const GripperState st = io_.get_state(true);
-  if (!st.has_data()) {
-    throw SafetyFault("move_at_speed_rad: no valid feedback — refused");
-  }
-  const double current_rad = st.position_rad;
-  if (std::fabs(target_rad - current_rad) < 0.0001 || speed_rad_s <= 0.0) {
-    return true;
-  }
-  const double duration_s = std::fabs(target_rad - current_rad) / speed_rad_s;
-  return move_at_speed_rad_impl(current_rad, target_rad, speed_rad_s,
-                                duration_s, kp, kd);
-}
-
-bool MotionEngine::move_at_speed_rad_impl(double start_rad, double target_rad,
-                                          double speed_rad_s, double duration_s,
-                                          std::optional<double> kp,
-                                          std::optional<double> kd) {
-  if (std::fabs(speed_rad_s) > kMaxCommandVelocityCeilingRadS) {
-    throw LimitViolation(
-        "move_at_speed: speed exceeds the commanded-velocity ceiling");
+  if (!(speed_rad_s > 0.0)) {
+    throw CommandError(
+        "move_at_speed_rad: speed_rad_s must be positive — a zero-speed move "
+        "used to report success without sending a frame");
   }
   const GripperConfig& gcfg = io_.config();
-  auto scope = safety_.maintenance_scope("constant-speed move");
-
-  // Clamp into the commandable range first, exactly like goto_rad(): the
-  // calibrated travel is the legal command region, so this narrows into it —
-  // nothing is widened, and every frame below is bounded by it.
-  const double lo = std::min(gcfg.pos_closed_rad, gcfg.pos_open_rad);
-  const double hi = std::max(gcfg.pos_closed_rad, gcfg.pos_open_rad);
-  target_rad = std::max(lo, std::min(hi, target_rad));
-
-  const double direction = target_rad > start_rad ? 1.0 : -1.0;
-  // Python hardcodes 0.005 here (200 Hz), NOT frame_interval: the ramp rate
-  // is a protocol-level constant. Parity means following the same one.
-  const double interval = 0.005;
-  const int steps = std::max(1, frame_count_trunc(duration_s / interval));
-  const double actual_interval = duration_s / steps;
-
-  for (int i = 0; i <= steps; ++i) {
-    const double frac = static_cast<double>(i) / steps;
-    const double q = start_rad + (target_rad - start_rad) * frac;
-    const double dq = i < steps ? direction * speed_rad_s : 0.0;
-    send_frame(q, kp, kd, dq, 0.0, "move_at_speed");
-    if (i < steps) {
-      io_.get_state(false);  // Python: poll(0.0) — drain one status frame
-      sleep_s(actual_interval);
-    }
-  }
-
-  // Hold at the target briefly (Python: 20 frames, each followed by 0.005 s).
-  for (int i = 0; i < 20; ++i) {
-    send_frame(target_rad, kp, kd, 0.0, 0.0, "move_at_speed");
-    sleep_s(interval);
-  }
-  return true;
+  // Clamp like goto_rad(): the calibrated travel is the legal command region,
+  // so this narrows into it and nothing is widened. ramp_to itself does not
+  // clamp — its callers do.
+  return ramp_to(clamp_to_travel(gcfg, target_rad),
+                 speed_rad_s * gcfg.rad_to_mm, std::nullopt, kp, kd, {});
 }
 
 // ── zero-gravity mode (Python gripper.enter/exit_zero_gravity) ───────────

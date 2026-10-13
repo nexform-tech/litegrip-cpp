@@ -2,23 +2,32 @@
 // litegrip_driver/litegrip/gripper.py and wired to the safety core.
 //
 // Scope: lifecycle, hold-based init, calibration, position motion, the action
-// engine (open/close/grasp/set_force/constant-speed moves/zero-gravity — see
+// engine (open/close/grasp/set_force/positioning ramps/zero-gravity — see
 // motion.hpp), state and parameter access. Trajectory record/playback and
 // teleop are later stages.
 //
-// Safety wiring (D4): the POSITION-MOTION path (goto_rad / move_to / home) goes
-// through SafetyGuard::guard_motion_frame, so a target outside the red lines, a
-// measured position already outside them, over-ceiling gains, an over-budget
-// feed-forward torque, or a velocity beyond the deceleration zone are all
-// refused with a diagnosable reason and nothing is sent.
+// Safety wiring (D4): every position motion now runs the engine's bounded ramp
+// (src/motion.cpp), and the engine is a DOCUMENTED BYPASS of
+// SafetyGuard::guard_motion_frame. It carries its own bounds: every frame's
+// kp / kd / tau / dq is re-checked against the guard's TemporaryParams, every
+// emitted position is clamped into the calibrated travel (clamp_to_travel, in
+// the engine's single emit()), and a move that starts outside the red lines is
+// first driven back inside, inward only, by an engine-side recovery crawl that
+// fails closed.
 //
-// The paths that must keep working when the gripper is outside the red lines do
-// NOT go through that gate, and each says why at its definition:
+// goto_rad / move_to / home used to take the OTHER route — a single gate call
+// on a single constant command — and that split is gone (litegrip-python #58):
+// those three are ordinary positioning ramps now, exactly like open()/close().
+// What that costs is written up at goto_rad, where the gate call used to be.
+//
+// The paths that must keep working when the gripper is outside the red lines
+// still do NOT go through that gate, and each says why at its definition:
 //   * stop() / zero-torque frames — an emergency stop has to work from anywhere;
 //   * the calibration routines — they deliberately drive to the mechanical stops;
 //   * the action engine (src/motion.cpp) — it re-aims the target every frame,
-//     which the gate's one-target-per-call shape cannot express; it carries its
-//     own per-frame ceilings and an engine-side recovery drive-in instead.
+//     which the gate's one-target-per-call shape cannot express, so it carries
+//     its own per-frame ceilings and an engine-side recovery drive-in instead.
+// ControlLoop is the remaining caller of guard_motion_frame.
 
 #include "litegrip/gripper.hpp"
 
@@ -110,22 +119,6 @@ const char* motor_type_name(can::MotorType type) noexcept {
       return "DMG6220";
   }
   return "DM4310";
-}
-
-/// Measured feedback as the optional triple the safety gate wants. A motor that
-/// has never produced a status frame reports position 0.0, which is a fake
-/// value — hence nullopt rather than 0.0.
-struct Feedback {
-  std::optional<double> position;
-  std::optional<double> velocity;
-  std::optional<double> torque;
-};
-
-Feedback measured_feedback(can::MotorState* motor) {
-  if (motor == nullptr || !motor->has_data()) {
-    return Feedback{std::nullopt, std::nullopt, std::nullopt};
-  }
-  return Feedback{motor->position(), motor->velocity(), motor->torque()};
 }
 
 }  // namespace
@@ -294,11 +287,18 @@ bool LiteGrip::poll(double timeout_s) {
 
 // ── motion ────────────────────────────────────────────────────────────────
 
-bool LiteGrip::home() {
+MoveResult LiteGrip::home() {
   check_connected();
   check_enabled();
   // The calibrated closed limit, not the placeholder constant: a
   // reverse-mounted gripper closes at the numerically *other* end.
+  //
+  // This is an ordinary positioning ramp (see goto_rad), so it comes back
+  // ok = reached && !stalled. Note what it is NOT: a press onto the closed
+  // stop. close() aims past the calibrated limit on purpose so the jaw presses
+  // the real stop; home() aims AT the calibrated closed position and stops
+  // there, which is what makes it the call to use when the jaw should sit on
+  // the zero without loading it.
   return move_to(config_.pos_closed_rad, std::nullopt, std::nullopt, 0.0, 1.0);
 }
 
@@ -334,17 +334,17 @@ bool LiteGrip::set_force(double force_n, double duration_s) {
   return engine.set_force(force_n, duration_s);
 }
 
-bool LiteGrip::move_at_speed(double target_mm, double speed_mm_s,
-                             std::optional<double> kp,
-                             std::optional<double> kd) {
+MoveResult LiteGrip::move_at_speed(double target_mm, double speed_mm_s,
+                                   std::optional<double> kp,
+                                   std::optional<double> kd) {
   check_connected();
   MotionEngine engine(*this, *safety_);
   return engine.move_at_speed(target_mm, speed_mm_s, kp, kd);
 }
 
-bool LiteGrip::move_at_speed_rad(double target_rad, double speed_rad_s,
-                                 std::optional<double> kp,
-                                 std::optional<double> kd) {
+MoveResult LiteGrip::move_at_speed_rad(double target_rad, double speed_rad_s,
+                                       std::optional<double> kp,
+                                       std::optional<double> kd) {
   check_connected();
   MotionEngine engine(*this, *safety_);
   return engine.move_at_speed_rad(target_rad, speed_rad_s, kp, kd);
@@ -363,17 +363,36 @@ void LiteGrip::exit_zero_gravity() {
   engine.exit_zero_gravity();
 }
 
-bool LiteGrip::goto_mm(double position_mm, std::optional<double> kp,
-                       std::optional<double> kd, double duration) {
+MoveResult LiteGrip::goto_mm(double position_mm, std::optional<double> kp,
+                             std::optional<double> kd, double duration) {
   check_connected();
   check_enabled();
   return goto_rad(config_.rad_for_opening_mm(position_mm), kp, kd, 0.0, 0.0,
                   duration);
 }
 
-bool LiteGrip::goto_rad(double position_rad, std::optional<double> kp,
-                        std::optional<double> kd, double dq_target,
-                        double tau_feedforward, double duration) {
+MoveResult LiteGrip::goto_rad(double position_rad, std::optional<double> kp,
+                              std::optional<double> kd, double dq_target,
+                              double tau_feedforward, double duration) {
+  // The argument refusals come first, before any bus or config check: they are
+  // about what the caller asked for. Python's goto_rad orders them the same
+  // way.
+  if (dq_target != 0.0) {
+    throw CommandError(
+        "goto_rad: dq_target is not accepted — the ramp derives its own "
+        "velocity feed-forward from the distance and the duration");
+  }
+  if (tau_feedforward != 0.0) {
+    throw CommandError(
+        "goto_rad: tau_feedforward is not accepted — the ramp carries no "
+        "feed-forward torque; use set_force() or grasp() to apply a force");
+  }
+  if (!std::isfinite(duration) || duration <= 0.0) {
+    throw CommandError(
+        "goto_rad: duration must be a positive finite number — it is the "
+        "length of the ramp, and the speed is derived from it");
+  }
+
   check_connected();
   check_enabled();
 
@@ -393,31 +412,42 @@ bool LiteGrip::goto_rad(double position_rad, std::optional<double> kp,
                        std::to_string(position_rad) + ") — command not sent");
   }
 
-  const double effective_kp = kp.has_value() ? *kp : config_.kp;
-  const double effective_kd = kd.has_value() ? *kd : config_.kd;
+  const double clamped = clamp_to_travel(config_, position_rad);
 
-  // Clamp into the commandable range first. The model layer's opening range can
-  // be wider than what the red lines allow, so without this clamp a "fully open"
-  // target would be refused wholesale instead of moving as far as it may.
-  const double lower = std::min(config_.pos_closed_rad, config_.pos_open_rad);
-  const double upper = std::max(config_.pos_closed_rad, config_.pos_open_rad);
-  const double clamped = std::max(lower, std::min(upper, position_rad));
-
-  // The gate may throw (LimitViolation / SafetyFault); those propagate, because
-  // the safety layer rejects rather than clamps, and swallowing them here would
-  // hide exactly the condition the caller needs to know about.
-  const Feedback feedback = measured_feedback(bus_->motor());
-  const double q_safe = safety_->guard_motion_frame(
-      clamped, effective_kp, effective_kd, dq_target, tau_feedforward,
-      feedback.position, feedback.velocity, feedback.torque, "goto_rad");
-
-  return bus_->control_mit_stream(q_safe, effective_kp, effective_kd, duration,
-                                  dq_target, tau_feedforward);
+  // This is where a single guard_motion_frame() call used to sit, and its
+  // removal is a deliberate posture change, not an oversight. The gate refused
+  // a target or a measured position outside the red lines; this call is now an
+  // engine ramp bounded by the CALIBRATED TRAVEL instead, exactly like
+  // open()/close(), which never went through the gate. On the shipped files the
+  // red lines ([-1.24, -0.01] rad, calibration/safety_limits_350.json) sit
+  // INSIDE the calibrated travel ([-1.357481, +0.052071] rad), so:
+  //   * home() works now. Its target is the calibrated closed position
+  //     (+0.052071), outside the closed red line, so the gate refused it every
+  //     time — while close(), aiming past the same point, did not.
+  //   * targets closer than 3.8 mm to the calibrated closed end, or 7.2 mm to
+  //     the open end, are reachable now and were refused before. Both are the
+  //     red line to the calibrated travel end on the factory calibration's
+  //     61.0123 mm/rad: (0.052071 + 0.01) x 61.0123 and (-1.24 + 1.357481) x
+  //     61.0123. Do not take the margins quoted in safety_limits_350.json's
+  //     provenance (5.60 mm / 2.99 mm) — those are the red line to the
+  //     MECHANICAL OBSERVED bounds, at a scale of about 10.9 mm/rad that is
+  //     not this repository's.
+  // To put a red-line TARGET check back at this one site, test `clamped`
+  // against safety_->limits() and throw LimitViolation. The gate's other steps
+  // have no work to do here any more: dq and tau are fixed at zero above, and
+  // the engine re-checks kp / kd / dq / tau per frame against the same
+  // TemporaryParams ceilings.
+  MotionEngine engine(*this, *safety_);
+  return engine.ramp_to(clamped, /*speed_mm_s=*/0.0, duration, kp, kd,
+                        MoveProgressCallback{});
 }
 
-bool LiteGrip::move_to(double target_rad, std::optional<double> kp,
-                       std::optional<double> kd, double tau_feedforward,
-                       double duration) {
+MoveResult LiteGrip::move_to(double target_rad, std::optional<double> kp,
+                             std::optional<double> kd, double tau_feedforward,
+                             double duration) {
+  // Forward rather than call the engine directly: goto_rad owns the refusals
+  // and the calibrated-travel clamp, and forwarding keeps exactly one copy of
+  // them. This also keeps the not-connected refusal reachable from here.
   return goto_rad(target_rad, kp, kd, 0.0, tau_feedforward, duration);
 }
 

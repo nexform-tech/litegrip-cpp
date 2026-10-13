@@ -78,12 +78,20 @@ class GripperBus {
 
   // ── motion ────────────────────────────────────────────────────────────
 
-  /// Send one MIT control frame. Returns false when not initialised.
+  /// Send one MIT control frame. Returns false when not initialised or when the
+  /// frame could not be sent (a warning names the reason).
   bool control_mit(double q_target, double kp, double kd,
                    double dq_target = 0.0, double tau_feedforward = 0.0);
 
   /// Stream MIT frames for a duration (blocking). DM motors need a continuous
   /// frame stream to sustain motion.
+  ///
+  /// Returns true only when every frame went out; a stream with some failed
+  /// frames returns false and logs how many. Throws CommandError when the
+  /// timing is unusable — duration_s non-finite or <= 0, interval_s non-finite
+  /// or < 0 — because those send nothing at all, and CommError when not one
+  /// frame could be sent, because then the bus or the enable is broken and
+  /// returning success would report motion that never happened.
   bool control_mit_stream(double q_target, double kp, double kd,
                           double duration_s, double dq_target = 0.0,
                           double tau_feedforward = 0.0,

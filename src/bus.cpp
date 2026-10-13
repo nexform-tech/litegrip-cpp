@@ -259,26 +259,82 @@ bool GripperBus::control_mit(double q_target, double kp, double kd,
   if (controller_ == nullptr || motor_ == nullptr) {
     return false;
   }
-  controller_->control_mit(*motor_, kp, kd, q_target, dq_target,
-                           tau_feedforward);
+  try {
+    controller_->control_mit(*motor_, kp, kd, q_target, dq_target,
+                             tau_feedforward);
+  } catch (const std::exception& e) {
+    // Still false, not a throw: this is the one-frame send and its callers
+    // check the return value. The reason is no longer swallowed, though — a
+    // silent false is what made a dropped frame look like motion.
+    std::fprintf(stderr, "[litegrip] %s: MIT frame not sent: %s\n",
+                 config_.can_channel.c_str(), e.what());
+    return false;
+  }
   return true;
 }
 
 bool GripperBus::control_mit_stream(double q_target, double kp, double kd,
                                     double duration_s, double dq_target,
                                     double tau_feedforward, double interval_s) {
+  // The timing is refused before the first frame, not per frame: a duration of
+  // 0 or NaN (and a NaN interval) makes the loop body run zero times, so the
+  // call would send nothing for the whole "duration" and still report success.
+  if (!std::isfinite(duration_s)) {
+    throw CommandError(
+        "control_mit_stream: duration_s is not a finite number (" +
+        std::to_string(duration_s) + ") — no frame was sent");
+  }
+  if (duration_s <= 0.0) {
+    throw CommandError("control_mit_stream: duration_s must be positive (" +
+                       std::to_string(duration_s) +
+                       ") — nothing is streamed over that span");
+  }
+  if (!std::isfinite(interval_s)) {
+    throw CommandError("control_mit_stream: interval_s is not a finite number");
+  }
+  if (interval_s < 0.0) {
+    throw CommandError("control_mit_stream: interval_s cannot be negative (" +
+                       std::to_string(interval_s) + ")");
+  }
   if (controller_ == nullptr || motor_ == nullptr) {
     return false;
   }
 
   const double deadline = monotonic_now() + duration_s;
+  int attempts = 0;
+  int sent = 0;
+  std::string last_error;
   while (monotonic_now() < deadline) {
-    controller_->control_mit(*motor_, kp, kd, q_target, dq_target,
-                             tau_feedforward);
+    ++attempts;
+    try {
+      controller_->control_mit(*motor_, kp, kd, q_target, dq_target,
+                               tau_feedforward);
+      ++sent;
+    } catch (const std::exception& e) {
+      last_error = e.what();
+    }
     controller_->poll(0.0);
     sleep_s(interval_s);
   }
-  return true;
+
+  // One dropped frame does not abort the stream — the motor needs the rest of
+  // the frames — but it must not come back as success either.
+  const int failed = attempts - sent;
+  if (failed > 0) {
+    std::fprintf(stderr,
+                 "[litegrip] %s: %d of %d MIT frames were not sent (last: "
+                 "%s)\n",
+                 config_.can_channel.c_str(), failed, attempts,
+                 last_error.c_str());
+  }
+  if (sent == 0) {
+    throw CommError(
+        "control_mit_stream: not one MIT frame went out (" +
+        std::to_string(failed) + " attempts, all failed, last: " + last_error +
+        ") — streaming nothing for " + std::to_string(duration_s) +
+        " s while reporting success is reporting motion that never happened");
+  }
+  return failed == 0;
 }
 
 bool GripperBus::poll(double timeout_s) {

@@ -73,10 +73,11 @@ double probe_to_limit(ProbeIo& io, double direction, const ProbeConfig& config,
 /// Move toward `target` one step at a time, guarded like the probe: stop at the
 /// torque ceiling, or as soon as the position stops changing.
 ///
-/// A plain goto_rad() streams ONE constant command for half a second with no
-/// ceiling; if the jaws already sit at the stop that command heads for, the
-/// pressing torque is `kp x 0.2` for the whole duration. Leading by one step at
-/// a time bounds it by the same ceiling as the probe.
+/// Why this does not simply call goto_rad(): that path drives a bounded engine
+/// ramp now, but it is bounded by the CALIBRATED TRAVEL, and the travel is
+/// exactly what is in doubt while calibrating — a config whose scale is wrong
+/// puts a plausible-looking target past the real stop. Leading by one step at a
+/// time and stopping on the torque ceiling needs no scale to be safe.
 void guarded_move_to(ProbeIo& io, double target, const ProbeConfig& config,
                      const char* label);
 

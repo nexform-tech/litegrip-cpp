@@ -1,5 +1,5 @@
 // litegrip/motion.hpp — the action engine (open / close / grasp / set_force /
-// constant-speed moves / zero-gravity).
+// positioning ramps / zero-gravity).
 //
 // Port of litegrip_driver/litegrip/actions.py plus the matching parts of
 // gripper.py. LiteGrip's open()/close()/grasp()/... construct one MotionEngine
@@ -248,6 +248,10 @@ using MoveProgressCallback = std::function<void(const MoveProgress&)>;
 ///    mid-travel is also a stall, but far from the calibrated stop — ok=false.
 ///  * grasp()'s closing leg: success = reached the no-load target and did NOT
 ///    stall, i.e. reached && !stalled.
+///  * the positioning moves (goto_mm / goto_rad / move_to / home /
+///    move_at_speed*): their target is a point INSIDE the travel, so success =
+///    reached && !stalled. A shortfall there is ok=false, and unless the
+///    travel-leg protection ended it, `released` is set as well.
 ///  * a move ended by the travel-leg stall-torque protection is never `ok`:
 ///    the gripper was blocked and then let go limp, which is not a press.
 struct MoveResult {
@@ -260,6 +264,20 @@ struct MoveResult {
   /// rules out `ok`. Mirrors actions.MoveResult.protected, renamed because
   /// `protected` is a C++ keyword.
   bool protection_tripped = false;
+  /// The move fell short (ok == false) and the engine then took the force off:
+  /// stop_release_s of kp = kd = tau = 0 frames, so the drive is not left
+  /// pressing the part. Only MotionEngine::ramp_to sets it, and it does NOT
+  /// change `ok`.
+  ///
+  /// Why it is needed: a press=false ramp that stalls mid-travel breaks out of
+  /// the loop with its last command still leading the measured position by the
+  /// lead cap, and a lead cap against a blocked jaw is a standing torque —
+  /// about kp x max_lead_mm. open()/close() pressing IS the intent (their
+  /// target lies past the stop); a positioning move pressing is not.
+  ///
+  /// Distinct from protection_tripped: that protection releases on its own, so
+  /// a protected move leaves `released == false`.
+  bool released = false;
   GripperState state;
   double target_rad = 0.0;     // where the ramp aimed
   double limit_rad = 0.0;      // this end's calibrated limit
@@ -474,16 +492,41 @@ class MotionEngine {
   /// pure-torque frames and needs the same bound.
   bool set_force(double force_n, double duration_s = 0.3);
 
-  /// Constant-speed move to an absolute opening (mm, 0 = closed) / angle.
-  /// The internal ramp is linear with a velocity feed-forward, then 20 hold
-  /// frames at the target (Python parity). Returns true for "nothing to do"
-  /// (already there / speed <= 0) as well as for a completed move.
-  bool move_at_speed(double target_mm, double speed_mm_s = 30.0,
+  /// Positioning ramp to an absolute target: the SAME bounded ramp
+  /// open()/close() run, with press = false. Mirrors
+  /// actions.GripperActions.ramp_to.
+  ///
+  /// Give `speed_mm_s` OR `duration_s`, not both; neither given is refused —
+  /// a zero-speed ramp is a single frame, i.e. exactly the unbounded hard step
+  /// this entry exists to replace. `duration_s` is the LENGTH OF THE RAMP: the
+  /// speed is derived as distance / duration_s once the start position is
+  /// known, so the frame count follows the duration and not the distance.
+  ///
+  /// `toward` is derived here from which calibrated end the target sits nearer
+  /// (reporting only: it names `limit_rad` and the safety mode's log line).
+  /// The target is NOT clamped here — the caller clamps into the calibrated
+  /// travel; emit() still bounds every outgoing frame regardless.
+  ///
+  /// A shortfall that the travel-leg protection did not end is followed by
+  /// stop_release_s of kp = kd = tau = 0 frames and reports
+  /// MoveResult::released — see that field for why.
+  MoveResult ramp_to(double target_rad, double speed_mm_s = 0.0,
+                     std::optional<double> duration_s = std::nullopt,
                      std::optional<double> kp = std::nullopt,
-                     std::optional<double> kd = std::nullopt);
-  bool move_at_speed_rad(double target_rad, double speed_rad_s = 0.5,
-                         std::optional<double> kp = std::nullopt,
-                         std::optional<double> kd = std::nullopt);
+                     std::optional<double> kd = std::nullopt,
+                     MoveProgressCallback progress = {});
+
+  /// Positioning move to an absolute opening (mm, 0 = closed) / angle at a
+  /// constant speed. Both are ramp_to with the speed spelled differently, so
+  /// they share its lead cap, stall window and arrival criterion — and its
+  /// MoveResult reading: `ok` means reached && !stalled. A non-positive speed
+  /// is refused; the old code reported success without sending a frame.
+  MoveResult move_at_speed(double target_mm, double speed_mm_s = 30.0,
+                           std::optional<double> kp = std::nullopt,
+                           std::optional<double> kd = std::nullopt);
+  MoveResult move_at_speed_rad(double target_rad, double speed_rad_s = 0.5,
+                               std::optional<double> kp = std::nullopt,
+                               std::optional<double> kd = std::nullopt);
 
   /// Enter zero-gravity: stream all-zero torque frames for duration_s
   /// (0 = a single bootstrap frame). The motor becomes back-drivable.
@@ -527,13 +570,27 @@ class MotionEngine {
   /// passes.
   ///
   /// `target_rad` is an explicit destination (work_limit_target's open-side
-  /// work point). Given one, the leg is an ORDINARY positioning move — `press`
-  /// is ignored — and `limit_rad` is that direction's calibrated limit, kept
-  /// for reporting.
+  /// work point, or ramp_to's target). Given one, the leg is an ORDINARY
+  /// positioning move — `press` is ignored — and `limit_rad` is that
+  /// direction's calibrated limit, kept for reporting.
+  ///
+  /// `duration_s` and `kp`/`kd` are the ramp_to additions, appended after
+  /// `progress` so every existing call site is unchanged. `duration_s` states
+  /// how LONG the ramp lasts instead of how fast it goes: the distance is only
+  /// known once the start position has been read, so the speed is derived
+  /// there (distance / duration_s) and `ramp_steps` becomes
+  /// round(duration_s / frame_interval) — INDEPENDENT of distance, which is
+  /// what the stall-verdict rule below depends on. Give it with neither a
+  /// positive `speed_mm_s` nor a `force_n` (a force-carrying approach's speed
+  /// budget comes from the setpoint). `kp`/`kd` override the config gains for
+  /// every frame this leg emits. Mirrors _move_to_limit.
   MoveResult move_to_limit(Toward toward, double speed_mm_s, bool press,
                            std::optional<double> target_rad,
                            std::optional<double> force_n, const char* source,
-                           const MoveProgressCallback& progress);
+                           const MoveProgressCallback& progress,
+                           std::optional<double> duration_s = std::nullopt,
+                           std::optional<double> kp = std::nullopt,
+                           std::optional<double> kd = std::nullopt);
 
   struct HoldOutcome {
     bool ok = false;
@@ -573,13 +630,6 @@ class MotionEngine {
 
   /// Enabled + guard latch, shared by every motion entry.
   void check_entry(const char* source);
-
-  /// The constant-speed ramp itself (Python _move_at_speed_rad): absolute
-  /// schedule from start_rad, duration-derived step count, a 20-frame hold.
-  bool move_at_speed_rad_impl(double start_rad, double target_rad,
-                              double speed_rad_s, double duration_s,
-                              std::optional<double> kp,
-                              std::optional<double> kd);
 
   double now_s() const;           // monotonic_fn, or steady_clock
   void sleep_s(double seconds);   // sleep_fn, or this_thread
