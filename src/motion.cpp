@@ -577,6 +577,28 @@ MoveResult MotionEngine::move_to_limit(
       std::max(config_.stop_lead_mm / gcfg.rad_to_mm, min_cap_rad);
   const double press_zone_rad = config_.press_zone_mm / gcfg.rad_to_mm;
 
+  // The frame-count backstop. An ordinary move ends by schedule, so its frame
+  // count IS one of its terminal conditions; a force-carrying approach cannot
+  // end that way — the lead cap the setpoint's budget leaves is a fraction of a
+  // millimetre (force_approach_terms), so a reading even a few frames old pins
+  // the command next to a stale position and the jaw falls behind the schedule
+  // by friction and read lag. ramp_steps arriving says the schedule is done,
+  // not the jaw. So here the frame count is only a backstop, sized at the
+  // SLOWEST speed that still counts as progress: any slower and the stall
+  // window has already fired inside win_s, so this bound cannot be reached
+  // first. Mirrors actions._move_to_limit's `ceiling`.
+  int ceiling = total_steps;
+  if (force_n.has_value()) {
+    const double floor_rad_s = win_s > 0.0 ? win_thresh_rad / win_s : 0.0;
+    if (0.0 < floor_rad_s && floor_rad_s < speed_rad_s) {
+      ceiling = std::max(
+          total_steps,
+          static_cast<int>(std::ceil(std::fabs(dist_rad) / floor_rad_s /
+                                     interval)) +
+              settle_steps);
+    }
+  }
+
   // A trip that is already inside reach_tol gets no stall verdict at all. The
   // ramp's frame count follows duration/speed and NOT the distance, so a
   // nearly-zero trip (home() straight after close() is 0.02 mm) runs a
@@ -595,18 +617,43 @@ MoveResult MotionEngine::move_to_limit(
   double last_sample_pos = before.position_rad;
   double last_cmd = before.position_rad;
   int last_i = 0;
+  int arrived_at = -1;  // first frame of the press-after-arrival phase
 
-  for (int i = 1; i <= total_steps; ++i) {
+  for (int i = 1; i <= ceiling; ++i) {
     const GripperState st = io_.get_state(false);
     const double pos = st.position_rad;
 
+    // The schedule phase. Without a force setpoint it is timed: ramp_steps IS
+    // the frame the schedule finishes. With one it cannot be — the lead cap the
+    // budget leaves is a fraction of a millimetre, so the jaw falling behind
+    // the schedule is the norm, and ramp_steps arriving does not mean the jaw
+    // arrived. Cutting over by the clock would judge it into the hold phase
+    // (stop judging the stall, drop the velocity feed-forward) while it is
+    // still in free travel. So a force-carrying leg is told by POSITION: not
+    // arrived is still the ramp, arrived is the hold. Past ramp_steps q_sched
+    // parks on the target, so the two readings agree there.
+    const bool arrived = std::fabs(pos - target) < config_.reach_tol;
+    const bool in_ramp = i <= ramp_steps || (force_n.has_value() && !arrived);
     double q_sched;
     double dq;
-    if (i <= ramp_steps) {
+    if (in_ramp) {
       q_sched = before.position_rad +
-                dist_rad * (static_cast<double>(i) / ramp_steps);
+                dist_rad * std::min(1.0, static_cast<double>(i) / ramp_steps);
       dq = sign * speed_rad_s;
     } else {
+      // The press-after-arrival phase (q_sched = target, dq = 0): rein in a jaw
+      // that is still moving. With a force setpoint this is also the STILL
+      // WINDOW before the handover — settle_steps frames after arrival the
+      // position loop's job is done and the hold takes over from rest (the
+      // real-hardware failure was handing over mid-travel). With no force
+      // setpoint this break is unreachable: the loop's own bound is
+      // ramp_steps + settle_steps.
+      if (arrived_at < 0) {
+        arrived_at = i;
+      }
+      if (i - arrived_at >= settle_steps) {
+        break;
+      }
       q_sched = target;
       dq = 0.0;
     }
@@ -627,7 +674,7 @@ MoveResult MotionEngine::move_to_limit(
     last_cmd = emit(cmd, dq, 0.0, kp, kd_frame, source);
     last_i = i;
 
-    if (i % sample_every != 0 && i != total_steps) {
+    if (i % sample_every != 0 && i != ceiling) {
       continue;
     }
     // This sample's measured speed, for the torque protection's "is the jaw
@@ -649,7 +696,7 @@ MoveResult MotionEngine::move_to_limit(
       MoveProgress snapshot;
       snapshot.phase = MovePhase::kMove;
       snapshot.i = i;
-      snapshot.total_steps = total_steps;
+      snapshot.total_steps = ceiling;
       snapshot.cmd_rad = last_cmd;
       snapshot.pos_rad = pos;
       snapshot.delta_rad = hist[n - 1] - hist[n - 2];
@@ -658,7 +705,7 @@ MoveResult MotionEngine::move_to_limit(
       snapshot.temperature_coil = st.temperature_coil;
       progress(snapshot);
     }
-    if (judge_stall && win_delta.has_value() && (press || i <= ramp_steps) &&
+    if (judge_stall && win_delta.has_value() && (press || in_ramp) &&
         *win_delta < win_thresh_rad) {
       stalled = true;
       break;
@@ -755,15 +802,54 @@ GraspResult MotionEngine::grasp(std::optional<double> force_n, double hold_s,
   check_finite("grasp", "force_n", force);
   check_finite("grasp", "hold_s", hold_s);
 
-  // The approach stops INSIDE the limit (press=false): on an empty gripper it
-  // reaches; on a workpiece it stalls early, which is the point. It carries the
-  // setpoint's force, so the torque it meets the workpiece with is bounded by
-  // the same setpoint it will hold (force_approach_terms).
-  const MoveResult move = move_to_limit(Toward::kClose, config_.grasp_speed_mm_s,
-                                        /*press=*/false, std::nullopt, force,
-                                        "grasp", progress);
-  const HoldOutcome hold = hold_force(force, hold_s, progress);
+  // Same order as ramp_to: "enabled?" before "calibrated?", both refusals
+  // rather than a grip. The explicit target_rad branch does not go through
+  // limit_target, so the calibration check has to be made here — without it an
+  // uncalibrated config would be refused silently, later, somewhere else.
+  check_entry("grasp");
+  const GripperConfig& gcfg = io_.config();
+  check_calibrated(gcfg);
 
+  // The closing leg aims at the closed-side calibrated limit ITSELF, not at
+  // limit_target's 5% inside it. The reserved travel was free travel: the jaw
+  // arrived with nothing ahead of it and the hold then had to push it the last
+  // few millimetres with torque alone — half of the "fast jolt at the end" on
+  // real hardware. Aiming at the limit leaves the jaw on the object or on the
+  // stop, both stopped, which is what the hold may take over from. Passing
+  // target_rad forces press=false, so ok / reached are judged exactly as
+  // before. It carries the setpoint's force, so the torque it meets the
+  // workpiece with is bounded by the same setpoint it will hold
+  // (force_approach_terms).
+  const MoveResult move = move_to_limit(Toward::kClose, config_.grasp_speed_mm_s,
+                                        /*press=*/false, gcfg.pos_closed_rad,
+                                        force, "grasp", progress);
+  return hand_over(move, force, hold_s, progress);
+}
+
+GraspResult MotionEngine::hand_over(const MoveResult& move, double force,
+                                    double hold_s,
+                                    const MoveProgressCallback& progress) {
+  if (!(move.reached || move.stalled)) {
+    // Neither arrived nor on something — the jaw is still in free travel, and
+    // the position loop (kp x lead + kd x velocity error) is the only thing
+    // holding it back right now. The hold frames carry neither term, so handing
+    // a moving jaw over means wiring the setpoint torque straight onto a jaw
+    // that is still rolling: measured speed jumped from the velocity loop's
+    // 0.82 rad/s to 5.12 rad/s on 2026-10-13, still accelerating when hold_s
+    // ran out. Report the failure honestly instead of handing over.
+    release(move.state.position_rad, "grasp");
+    GraspResult result;
+    result.ok = false;
+    result.reached = move.reached;
+    result.stalled = move.stalled;
+    result.state = move.state;
+    result.target_rad = move.target_rad;
+    result.force_n = force;
+    result.cycles = 0;
+    result.travel_guard = false;
+    return result;
+  }
+  const HoldOutcome hold = hold_force(force, hold_s, progress);
   GraspResult result;
   result.ok = hold.ok;
   result.reached = move.reached;

@@ -55,6 +55,16 @@ struct MotionEngineTestAccess {
     const MotionEngine::HoldOutcome o = engine.hold_force(force_n, hold_s, {});
     return Hold{o.ok, o.cycles, o.guarded};
   }
+
+  /// Drive grasp()'s handover gate with a synthetic closing-leg result. The
+  /// engine can no longer produce a "neither reached nor stalled" leg on its
+  /// own (a force-carrying leg ends on arrival or a stall; the frame count is a
+  /// backstop that cannot fire first), so the gate is exercised directly — the
+  /// Python suite monkeypatches _move_to_limit to the same end.
+  static GraspResult hand_over(MotionEngine& engine, const MoveResult& move,
+                               double force_n, double hold_s) {
+    return engine.hand_over(move, force_n, hold_s, {});
+  }
 };
 
 }  // namespace litegrip
@@ -152,7 +162,8 @@ class FakeMotor {
   FakeMotor(double pos, std::optional<double> block_rad, double sticky_rad,
             int err, std::optional<double> limit_lo,
             std::optional<double> limit_hi, double yield_rad_s = 0.0,
-            double yield_tau_nm = 0.0, double creep_rad_s_per_nm = 0.0)
+            double yield_tau_nm = 0.0, double creep_rad_s_per_nm = 0.0,
+            int report_lag_ticks = 0)
       : pos(pos),
         err(err),
         block_rad(block_rad),
@@ -162,16 +173,32 @@ class FakeMotor {
         yield_rad_s(yield_rad_s),
         yield_tau_nm(yield_tau_nm),
         creep_rad_s_per_nm(creep_rad_s_per_nm),
+        report_lag_ticks(std::max(0, report_lag_ticks)),
         block_dir(block_rad.has_value()
                       ? (*block_rad > pos ? 1.0 : -1.0)
-                      : 0.0) {}
+                      : 0.0) {
+    // Read-lag history: the last (lag + 1) physical positions, newest at the
+    // back. Seeded with the start so a lagged read before the first step is the
+    // start position, not garbage.
+    pos_hist_.assign(static_cast<std::size_t>(this->report_lag_ticks) + 1, pos);
+  }
 
   double reported_pos() const {
+    // Read lag (frames): the real get_state(wait=false) returns a cached
+    // reading a few frames old (fake_can.py's report_lag_ticks). The
+    // force-carrying approach's command is min(schedule, reading + lead cap),
+    // and with the cap a fraction of a millimetre the lag alone eats it, so the
+    // jaw cannot keep up with its own schedule — the dimension this model was
+    // missing. lag == 0 returns `pos` unchanged (bit-for-bit the old fake); a
+    // lagged value comes from pos_hist_.front(). Tests that write `pos`
+    // directly do so only with lag == 0, so pos_hist_ is advanced by step()
+    // alone.
+    const double p = report_lag_ticks > 0 ? pos_hist_.front() : pos;
     if (sticky_rad > 0.0) {
       // Python's round() is half-to-even; std::nearbyint is the same rule.
-      return std::nearbyint(pos / sticky_rad) * sticky_rad;
+      return std::nearbyint(p / sticky_rad) * sticky_rad;
     }
-    return pos;
+    return p;
   }
 
   void set_block(std::optional<double> block) {
@@ -213,6 +240,13 @@ class FakeMotor {
     if (limit_hi.has_value()) next = std::min(next, *limit_hi);
     vel = (next - pos) / dt;
     pos = next;
+    if (report_lag_ticks > 0) {
+      pos_hist_.push_back(next);
+      if (pos_hist_.size() >
+          static_cast<std::size_t>(report_lag_ticks) + 1) {
+        pos_hist_.erase(pos_hist_.begin());
+      }
+    }
     // tau is reported against the POST-step position, like fake_can.py.
     tau = std::max(-kTauMax, std::min(kTauMax, kp * (q - pos) + tau_ff));
   }
@@ -228,6 +262,8 @@ class FakeMotor {
   double yield_rad_s = 0.0;
   double yield_tau_nm = 0.0;
   double creep_rad_s_per_nm = 0.0;
+  int report_lag_ticks = 0;
+  std::vector<double> pos_hist_;  // last lag+1 positions, newest at the back
   double block_dir = 0.0;
 };
 
@@ -237,12 +273,13 @@ class FakeIo : public MotionIo {
                   std::optional<double> block_rad = std::nullopt,
                   double sticky_rad = 0.0, bool stops = false,
                   double yield_rad_s = 0.0, double yield_tau_nm = 0.0,
-                  double creep_rad_s_per_nm = 0.0)
+                  double creep_rad_s_per_nm = 0.0, int report_lag_ticks = 0)
       : cfg_(std::move(cfg)),
         motor_(start_rad, block_rad, sticky_rad, /*err=*/1,
                stops ? std::optional<double>(kLimitLo) : std::nullopt,
                stops ? std::optional<double>(kLimitHi) : std::nullopt,
-               yield_rad_s, yield_tau_nm, creep_rad_s_per_nm) {}
+               yield_rad_s, yield_tau_nm, creep_rad_s_per_nm,
+               report_lag_ticks) {}
 
   const GripperConfig& config() const noexcept override { return cfg_; }
   GripperConfig& config() noexcept { return cfg_; }
@@ -712,7 +749,8 @@ void test_grasp_onto_object() {
   check(!res.reached && res.stalled, "S3: stalled on the object");
   check_near(res.force_n, 20.0, 0.0, "S3: default force");
   check(res.cycles == 3, "S3: hold slices (py: 3)");
-  check_near(res.target_rad, 0.02346115, 1e-12, "S3: approach target");
+  check_near(res.target_rad, kPosClosedRad, 1e-12,
+             "S3: the closing leg aims at the closed-side stop");
   check(io.frames.size() == 310, "S3: frame count (py: 310)");
 
   // Hold frames: index 190 on, q = the blocked position, and NO gains — a hold
@@ -850,8 +888,10 @@ void test_force_approach_terms() {
 /// Python's TestForceApproachPressBudget._grasp().
 struct GraspBench {
   GraspBench(double start_rad, std::optional<double> block_rad,
-             double speed_mm_s, bool stops = true)
-      : io(test_config(), start_rad, block_rad, /*sticky_rad=*/0.0, stops),
+             double speed_mm_s, bool stops = true, int report_lag_ticks = 0)
+      : io(test_config(), start_rad, block_rad, /*sticky_rad=*/0.0, stops,
+           /*yield_rad_s=*/0.0, /*yield_tau_nm=*/0.0, /*creep_rad_s_per_nm=*/0.0,
+           report_lag_ticks),
         guard(make_guard()),
         config(grasp_config(speed_mm_s)),
         engine(io, guard, config) {}
@@ -995,6 +1035,123 @@ void test_an_empty_grasp_still_reaches_the_target() {
   }
   check_near(fastest, 50.0 / kRadToMm, 1e-12,
              "FAP: a budget it can afford leaves the speed alone");
+}
+
+// ── the closing leg hands over only on contact ───────────────────────────
+// Python TestGraspHandsOverOnlyOnContact. On 2026-10-13, grasp(10.0) on an
+// empty gripper handed a jaw that was still travelling (0.82 rad/s) to the
+// torque-only hold, and it left at 5.12 rad/s. The closing leg could not
+// finish: a force-carrying leg caps how far its command may lead the reading,
+// and with the 10 N budget that cap is 0.25 mm — a read even a few frames old
+// pins the command next to a stale position, and the old frame budget expired
+// with reached and stalled both false. The fake had no read lag, so the cap
+// always kept up and this path was never exercised.
+
+/// The closing leg's frames — the hold streams feed-forward only, so `tau_ff`
+/// splits the two legs apart.
+std::vector<Frame> close_frames_of(const FakeIo& io) {
+  std::vector<Frame> out;
+  for (const Frame& f : io.frames) {
+    if (f.tau_ff == 0.0 && f.kp != 0.0) out.push_back(f);
+  }
+  return out;
+}
+
+/// The engine's ramp_steps for a trip from `start_rad` to the closed stop at
+/// `speed_mm_s` (the distance is only known once the start is read).
+int grasp_ramp_steps(double start_rad, double speed_mm_s) {
+  const double dist_mm = std::fabs(kPosClosedRad - start_rad) * kRadToMm;
+  return std::max(1, static_cast<int>(std::nearbyint(dist_mm / speed_mm_s / kDt)));
+}
+
+void test_a_stale_reading_no_longer_strands_the_close_leg() {
+  // Read lag (frames): the real get_state(wait=false) returns a cached reading
+  // a few frames old, and a force-carrying approach's command is
+  // min(schedule, reading + lead cap). The 5 N budget leaves a 0.25 mm cap, so
+  // three frames of lag (3 x 0.67 rad/s x 5 ms = 0.010 rad) eat it several
+  // times over and the jaw cannot keep up with its own schedule. The lag is the
+  // dimension the fake was missing: without it the cap always keeps up and the
+  // regression cannot be reproduced.
+  constexpr int kLag = 3;
+  GraspBench bench(-1.0, std::nullopt, 50.0, /*stops=*/true, kLag);
+  const GraspResult res = bench.engine.grasp(5.0, 0.2);
+
+  const int ramp_steps = grasp_ramp_steps(-1.0, 50.0);
+  check(res.reached, "lag: an empty grip still reaches the closed stop");
+  check(!res.stalled, "lag: and does not report a stall");
+  check(res.ok, "lag: and reports ok");
+  check_near(bench.io.motor_.pos, res.target_rad,
+             bench.config.reach_tol + 1e-12, "lag: the jaws end on the stop");
+  // The lead cap is eaten by the lag, so the jaw trails its schedule and the
+  // close leg runs LONGER than the schedule. The old frame budget
+  // (ramp_steps + settle_steps) ended it at the frame count with reached and
+  // stalled both false — and grasp() then handed the moving jaw to the hold.
+  const std::vector<Frame> close = close_frames_of(bench.io);
+  check(static_cast<int>(close.size()) > ramp_steps,
+        "lag: the close leg runs past the schedule, not out of frames");
+}
+
+void test_the_close_leg_is_at_rest_when_the_hold_takes_over() {
+  // The handover happens from rest: the close leg ends on the stop with the
+  // jaw stopped. The old behaviour handed a jaw that was still at 0.82 rad/s
+  // over to gainless frames — acceleration from there, measured at 5.12 rad/s.
+  constexpr int kLag = 3;
+  GraspBench bench(-1.0, std::nullopt, 50.0, /*stops=*/true, kLag);
+  const GraspResult res = bench.engine.grasp(5.0, 0.2);
+  const std::vector<Frame> close = close_frames_of(bench.io);
+  const double speed_rad_s = bench.config.grasp_speed_mm_s / kRadToMm;
+
+  check(res.reached, "rest: the close leg reached the stop");
+  check(close.size() > 3, "rest: there are close frames to judge");
+  if (close.size() <= 3) return;
+  for (std::size_t i = close.size() - 2; i < close.size(); ++i) {
+    const double v =
+        std::fabs(close[i].pos_after - close[i - 1].pos_after) / kDt;
+    check(v < 0.05 * speed_rad_s,
+          "rest: the jaw is at rest before the hold takes over");
+  }
+  check_near(close.back().pos_after, res.target_rad,
+             bench.config.reach_tol + 1e-12, "rest: the close ends on the stop");
+}
+
+void test_neither_reached_nor_stalled_is_not_handed_over() {
+  // The gate itself: a closing leg that ended in free travel is not handed
+  // over, and not one feed-forward frame goes out. The engine can no longer
+  // produce such a leg on its own (a force-carrying leg ends on arrival or a
+  // stall; the frame count is a backstop that cannot fire first), so the result
+  // is injected — the Python suite monkeypatches _move_to_limit to the same end.
+  FakeIo io(test_config(), /*start_rad=*/ -1.0, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  MoveResult stranded;
+  stranded.ok = false;
+  stranded.reached = false;
+  stranded.stalled = false;
+  stranded.state.position_rad = kPosOpenRad + 0.2;  // still in free travel
+  stranded.target_rad = kPosClosedRad;
+  stranded.limit_rad = kPosClosedRad;
+
+  const GraspResult res =
+      MotionEngineTestAccess::hand_over(engine, stranded, 5.0, 0.2);
+
+  check(!res.ok, "gate: the stranded close is reported as a failure");
+  check(!res.reached, "gate: reached is not claimed");
+  check(!res.stalled, "gate: stalled is not claimed");
+  check(res.cycles == 0, "gate: no hold slice ran");
+  check_near(res.force_n, 5.0, 0.0, "gate: the setpoint is still reported");
+  // The hard judge of "not handed over": not one feed-forward frame. A release
+  // frame is kp=kd=tau=0, so kp cannot separate them — only tau_ff can.
+  check(!io.frames.empty(), "gate: the force was released in place");
+  bool any_ff = false;
+  bool any_release = false;
+  for (const Frame& f : io.frames) {
+    if (f.tau_ff != 0.0) any_ff = true;
+    if (f.kp == 0.0 && f.kd == 0.0 && f.tau_ff == 0.0) any_release = true;
+  }
+  check(!any_ff, "gate: no feed-forward torque frame was streamed");
+  check(any_release, "gate: a release frame went out");
 }
 
 // ── stall / press-zone / stiction (Python dump S4-S6) ────────────────────
@@ -2492,6 +2649,9 @@ int main() {
   test_an_unbudgeted_close_still_presses_the_travel_cap();
   test_a_low_setpoint_decides_the_speed();
   test_an_empty_grasp_still_reaches_the_target();
+  test_a_stale_reading_no_longer_strands_the_close_leg();
+  test_the_close_leg_is_at_rest_when_the_hold_takes_over();
+  test_neither_reached_nor_stalled_is_not_handed_over();
   test_blocked_mid_travel_is_not_success();
   test_protection_follows_the_release_setting();
   test_stiction_does_not_false_stall();

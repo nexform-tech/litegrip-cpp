@@ -87,7 +87,7 @@ struct MotionConfig {
   // ── motion ────────────────────────────────────────────────────────────
   double speed_mm_s = 50.0;        // open/close speed
   double grasp_speed_mm_s = 50.0;  // grasp's closing-leg speed
-  double margin = 0.05;            // (grasp only) travel fraction kept inside the limit
+  double margin = 0.05;            // travel fraction limit_target keeps inside the limit
   double frame_interval = 0.005;   // 200 Hz ramp frame interval, s
   double sample_interval = 0.05;   // 20 Hz stall-sampling interval, s
   double settle_s = 0.3;           // hold-at-target tail after the ramp, s (not stall-judged)
@@ -246,8 +246,8 @@ using MoveProgressCallback = std::function<void(const MoveProgress&)>;
 ///  * open()/close(): success = pressed onto the stop and stalled, so ok=true
 ///    comes with stalled=true and (almost always) reached=false. Blocked
 ///    mid-travel is also a stall, but far from the calibrated stop — ok=false.
-///  * grasp()'s closing leg: success = reached the no-load target and did NOT
-///    stall, i.e. reached && !stalled.
+///  * grasp()'s closing leg: success = reached the closed-side calibrated stop
+///    and did NOT stall, i.e. reached && !stalled.
 ///  * the positioning moves (goto_mm / goto_rad / move_to / home /
 ///    move_at_speed*): their target is a point INSIDE the travel, so success =
 ///    reached && !stalled. A shortfall there is ok=false, and unless the
@@ -289,8 +289,8 @@ struct MoveResult {
 
 /// grasp result. Mirrors actions.GraspResult.
 struct GraspResult {
-  bool ok = false;       // the hold ended normally (no fault / abort)
-  bool reached = false;  // the closing leg reached the no-load target
+  bool ok = false;       // the hold ran, or (ok=false) the handover was refused
+  bool reached = false;  // the closing leg reached the closed-side calibrated stop
   bool stalled = false;  // the closing leg stalled (= grabbed the workpiece)
   GripperState state;
   double target_rad = 0.0;
@@ -463,10 +463,19 @@ class MotionEngine {
   MoveResult close(std::optional<double> speed_mm_s = std::nullopt,
                    MoveProgressCallback progress = {});
 
-  /// Close onto the workpiece (stopping inside the limit, not pressing onto
-  /// the stop) then hold force_n for hold_s (0 = until a fault). The hold
-  /// RAMPS to the setpoint from the torque in flight, at force_ramp_n_s, on
-  /// gainless (kp=kd=0) frames — see MotionConfig's force-hold block.
+  /// Close onto the workpiece — or onto the closed-side calibrated stop if
+  /// there is nothing there — then hold force_n for hold_s (0 = until a
+  /// fault). The hold RAMPS to the setpoint from the torque in flight, at
+  /// force_ramp_n_s, on gainless (kp=kd=0) frames — see MotionConfig's
+  /// force-hold block.
+  ///
+  /// The handover happens only from rest: the closing leg reached the stop
+  /// (`reached`) or stalled on the object (`stalled`). The hold frames carry no
+  /// position term and no velocity term, so handing a jaw over while it is
+  /// still in free travel would leave the setpoint torque as the only thing
+  /// acting on it. When the leg did neither, grasp() releases in place and
+  /// reports ok=false with cycles=0 rather than run away — the closing leg
+  /// therefore ends on the position, the frame count only a backstop.
   ///
   /// The gainless hold is also what MotionConfig::hold_runaway_rad guards: once
   /// the measured position has walked that far past the closed-side calibrated
@@ -570,9 +579,12 @@ class MotionEngine {
   /// passes.
   ///
   /// `target_rad` is an explicit destination (work_limit_target's open-side
-  /// work point, or ramp_to's target). Given one, the leg is an ORDINARY
-  /// positioning move — `press` is ignored — and `limit_rad` is that
-  /// direction's calibrated limit, kept for reporting.
+  /// work point, ramp_to's target, or grasp's closed-side calibrated stop).
+  /// Given one, the leg is an ORDINARY positioning move — `press` is ignored —
+  /// and `limit_rad` is that direction's calibrated limit, kept for reporting.
+  /// A force-carrying leg given one ends ON THE POSITION (arrival or a stall),
+  /// not on the frame count: the frame count is only a backstop sized at the
+  /// slowest speed that still counts as progress (see the `ceiling` below).
   ///
   /// `duration_s` and `kp`/`kd` are the ramp_to additions, appended after
   /// `progress` so every existing call site is unchanged. `duration_s` states
@@ -606,12 +618,24 @@ class MotionEngine {
   HoldOutcome hold_force(double force_n, double hold_s,
                          const MoveProgressCallback& progress);
 
+  /// The handover gate: hand a finished closing leg to the force hold, or
+  /// refuse. The hold's frames carry no position term and no velocity term, so
+  /// handing a jaw over while it is STILL IN FREE TRAVEL leaves the setpoint
+  /// torque as the only thing acting on it and it accelerates (0.82 -> 5.12
+  /// rad/s measured, 2026-10-13). The hold may take over only from rest:
+  /// `reached` (on the closed-side stop) or `stalled` (on the object).
+  /// Otherwise release in place and report ok=false, cycles=0. Split out of
+  /// grasp() so the suite can drive it with a stranded MoveResult — Python
+  /// monkeypatches _move_to_limit to the same end.
+  GraspResult hand_over(const MoveResult& move, double force, double hold_s,
+                        const MoveProgressCallback& progress);
+
   /// Grants the test suite the two hold_force behaviours that grasp() cannot
   /// reach — the guard judged BEFORE the first frame (grasp always runs its
   /// closing leg first, which brings the jaws back inside) and the guard
-  /// disabled on an uncalibrated config (grasp refuses such a config earlier).
-  /// The Python suite reaches actions._hold_force the same way. Not part of the
-  /// public surface.
+  /// disabled on an uncalibrated config (grasp refuses such a config earlier)
+  /// — and hand_over itself, with a synthetic stranded leg. The Python suite
+  /// reaches actions._hold_force the same way. Not part of the public surface.
   friend struct MotionEngineTestAccess;
 
   /// Drop the torque: stop_release_s of kp = kd = tau = 0 frames at `pos`.
