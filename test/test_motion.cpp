@@ -1399,11 +1399,11 @@ void test_a_goto_that_used_to_saturate() {
   // MIT frame range — the command was clipped and the drive ran away. The ramp
   // cuts every frame to the lead cap instead.
   //
-  // kp = 100 explicitly: this is the test fixture's kp, and the number the
-  // failure was stated with. The packaged C++ calibration carries kp = 5.0,
-  // where a 1.41 rad full-travel step is 7.05 Nm and does NOT saturate — the
-  // argument holds for a caller that passes kp = 100, which is what the Python
-  // SDK's default does and what this fixture does.
+  // kp = 100 explicitly: this is the test fixture's kp and the number the
+  // failure was stated with. It is also what the packaged calibration carries,
+  // so the saturation this test describes is the shipped configuration rather
+  // than a caller's choice — a 1.41 rad full-travel step at 100 Nm/rad is
+  // 141 Nm, fourteen times the MIT frame range.
   const double start = kPosOpenRad;
   const double goal = kPosClosedRad - 40.0 / kRadToMm;
   const double step_tau = 100.0 * std::fabs(goal - start);

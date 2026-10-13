@@ -232,9 +232,10 @@ trusting it, or call `refresh_status()` first.
 | `move_at_speed_rad(target_rad, speed_rad_s=0.5, kp=None, kd=None)` → `MoveResult` | The same in radians. |
 | `enter_zero_gravity(duration_s=0.0)` / `exit_zero_gravity()` → `void` | The motor stays enabled but exerts no torque, so it can be back-driven by hand. Any motion command resumes normal control. |
 
-`kp` and `kd` fall back to `GripperConfig::kp` (`5.0` on the shipped
-calibration, `100.0` on the placeholder defaults) and `.kd` (`2.0`) on every
-call that takes them.
+`kp` and `kd` fall back to `GripperConfig::kp` (`100.0` — the placeholder
+defaults and the shipped calibration agree on it, and the mount templates carry
+no gains at all, so all three entry points describe the same unit) and `.kd`
+(`2.0`) on every call that takes them.
 
 **One ramp, three ways to say the speed.** Every positioning call — the `goto`
 family and the `move_at_speed` family alike — runs one ramp of one frame per
@@ -248,16 +249,18 @@ a speed in rad/s.
 
 **The ramp is bounded, and that bound is the point of it.** Each frame's command
 leads the measured position by at most `MotionConfig::max_lead_mm` (4 mm), which
-caps the frame's torque near `kp × max_lead_mm / rad_to_mm` — 0.33 N·m at the
-factory `kp = 5.0`, 6.6 N·m at `kp = 100`. A hard step to the target has no such
-cap: at `kp = 100 Nm/rad` an error past about `0.1 rad` already saturates the
-DM4310's ±10 N·m frame limit, and a saturated frame overshoots the target instead
-of stopping on it. The 2026-10-12 bench failure this family was rebuilt around is
-that case, in the Python SDK, whose default gains are `kp = 100`:
-`goto(40.0, duration=0.5)` overshot its own target by 42.7 mm and crossed the
-calibrated closed zero. At the factory `kp = 5.0` a hard step to the far end
-draws 7.0 N·m and does not saturate — the ramp still bounds it, and this is the
-failure it bounds. `open()` and `close()` press onto a calibrated stop on
+caps the frame's torque near `kp × max_lead_mm / rad_to_mm` — 6.6 N·m at the
+factory `kp = 100`, under the DM4310's ±10 N·m frame limit, and the figure holds
+for any target because the cap is on the lead rather than on the distance
+travelled. A hard step to the target has no such cap: at `kp = 100 Nm/rad` an
+error past about `0.1 rad` saturates that limit, and a saturated frame overshoots
+the target instead of stopping on it. The 2026-10-12 bench failure this family
+was rebuilt around is that case, in the Python SDK, whose default gains are
+`kp = 100`: `goto(40.0, duration=0.5)` overshot its own target by 42.7 mm and
+crossed the calibrated closed zero. This SDK ships those same gains, so that
+failure is what the ramp stands between — a hard step to the far end
+(1.41 rad of travel) draws 141 N·m and saturates, while the ramp bounds the same
+move to the 6.6 N·m above. `open()` and `close()` press onto a calibrated stop on
 purpose; they cap the emitted command at the calibrated extreme, so the jaw stops
 on the limit and is never driven past it.
 
@@ -299,9 +302,9 @@ object (or at the closed-side calibrated stop) before the hold takes over.
   keeps pushing with `force_n`, and an empty `grasp()` closes onto the mechanical
   stop at that force.
 - **Below about 3.7 N the approach speed becomes the limit**, because one frame
-  of travel at `grasp_speed_mm_s` already spends the whole torque budget. That
-  figure is for the placeholder gains (`kp = 100`); at the factory `kp = 5.0` the
-  same threshold sits below 0.23 N, so the speed is not what holds you back.
+  of travel at `grasp_speed_mm_s` already spends the whole torque budget. Cap the
+  travel time with `grasp_speed_mm_s` rather than asking for a force that the
+  mechanism's own friction absorbs.
 
 **Approaching with a force.** `grasp`'s closing leg carries the setpoint's
 force, but it is still a set of **position** frames: what it presses with on
@@ -420,7 +423,7 @@ tuned-on-hardware values, so changing nothing is a supported configuration.
 | --- | --- | --- |
 | `can_channel` | `"can0"` | CAN interface |
 | `can_id` / `mst_id` | `0x08` / auto | Motor id; the master id is detected when unset |
-| `kp` / `kd` | `5.0` / `2.0` | Position and damping gains for every move that does not override them |
+| `kp` / `kd` | `100.0` / `2.0` | Position and damping gains for every move that does not override them |
 | `pos_closed_rad` / `pos_open_rad` | placeholders | The two calibrated limits — the ordering carries the mount direction |
 | `calibrated` | `false` | Gates every motion entry that derives a target from the travel |
 | `max_stroke_mm` | `85.0` | Your caliper measurement of the jaw travel, in mm |
