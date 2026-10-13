@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -108,6 +109,9 @@ class GripperBus {
   /// Send the 0xCC refresh and wait for the reply. A disabled motor does not
   /// stream status frames on its own, so this is how position is read before
   /// the first enable. Sends no motion command and changes no motor output.
+  ///
+  /// Retries once, each attempt on half of `timeout_s`, so the call still
+  /// takes at most `timeout_s` — see await_refresh_reply().
   bool refresh_status(double timeout_s = 0.5);
 
   double get_position() const;    // rad
@@ -147,5 +151,23 @@ class GripperBus {
   bool connected_ = false;
   bool initialized_ = false;
 };
+
+/// The retry policy behind GripperBus::refresh_status(), on its own so it can
+/// be driven without a bus (test/test_bus.cpp).
+///
+/// The motor answers the mst_id detection's parameter read about 0.5 s late,
+/// after that strategy's deadline. The reply lands inside the first refresh
+/// window, where it is discarded as a parameter frame rather than counted as a
+/// status frame, so the first refresh after connect() went unanswered on a
+/// healthy link and refresh_status() returned false until the caller retried by
+/// hand. Nothing on the bus was wrong; one attempt was simply lost.
+///
+/// `send_refresh` puts the 0xCC request on the bus and `await_status` waits for
+/// a status frame within the budget it is handed. Two attempts, each given half
+/// of `timeout_s`, so the retry cannot make the call outlast `timeout_s`.
+/// Returns true as soon as a status frame arrives.
+bool await_refresh_reply(double timeout_s,
+                         const std::function<void()>& send_refresh,
+                         const std::function<bool(double)>& await_status);
 
 }  // namespace litegrip

@@ -8,6 +8,7 @@
 #include <iostream>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "litegrip/bus.hpp"
 #include "litegrip/exceptions.hpp"
@@ -151,6 +152,42 @@ int main() {
     bus.set_hold_policy(nullptr);
     check(std::string(bus.hold_policy().name()) == "TrackingPolicy",
           "null policy is ignored");
+  }
+
+  // ── the refresh retry policy ──────────────────────────────────────────
+  //
+  // The first refresh_status() after connect() is answered late by the mst_id
+  // detection's parameter read rather than by its own request, so one attempt
+  // is lost on a healthy link. The policy is driven with lambdas here because
+  // the failure it covers needs a motor that answers 0.5 s late.
+  {
+    int sends = 0;
+    const bool ok =
+        litegrip::await_refresh_reply(0.5, [&] { ++sends; },
+                                      [](double) { return false; });
+    check(!ok, "refresh: nothing answering reports failure");
+    check(sends == 2, "refresh: ...after exactly two attempts, not more");
+  }
+  {
+    // The bug's shape: the first attempt is lost, the second is answered.
+    int sends = 0;
+    const bool ok = litegrip::await_refresh_reply(
+        0.5, [&] { ++sends; }, [&](double) { return sends == 2; });
+    check(ok, "refresh: a lost first attempt is retried and succeeds");
+    check(sends == 2, "refresh: the answered attempt ends the retry");
+  }
+  {
+    std::vector<double> budgets;
+    int sends = 0;
+    const bool ok = litegrip::await_refresh_reply(
+        0.5, [&] { ++sends; },
+        [&](double budget) {
+          budgets.push_back(budget);
+          return true;
+        });
+    check(ok && sends == 1, "refresh: an answered first attempt sends once");
+    check(budgets.size() == 1 && budgets[0] == 0.25,
+          "refresh: an attempt gets half the caller's budget");
   }
 
   if (g_failures != 0) {
