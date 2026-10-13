@@ -17,7 +17,7 @@
 //     back inside, inward-only, at the recovery ceilings from those same
 //     params, with tau = 0, failing closed on any doubt — see its definition
 //     for why guard_recovery_frame() cannot be the one doing this today;
-//   * hold-type operations (grasp's hold, set_force, exit_zero_gravity) never
+//   * hold-type operations (grasp's hold, exit_zero_gravity) never
 //     run the recovery drive-in: driving "inward" while squeezing a workpiece
 //     would open the grip.
 //
@@ -961,106 +961,6 @@ MotionEngine::HoldOutcome MotionEngine::hold_force(
   outcome.ok = true;
   outcome.state = st;
   return outcome;
-}
-
-bool MotionEngine::set_force(double force_n, double duration_s) {
-  check_entry("set_force");
-  // Before anything else. A non-finite setpoint makes the target torque NaN,
-  // and `fabs(NaN) > tau_max` is FALSE, so it would slip past the budget check
-  // below and the climb loop (written `probe != target_nm`) would never
-  // terminate while sending no frame at all. A non-finite duration reaches
-  // frame_count_round() as a NaN.
-  check_finite("set_force", "force_n", force_n);
-  check_finite("set_force", "duration_s", duration_s);
-  const double target_nm =
-      io_.config().close_sign() * force_n * UnitConversion::kNToNm;
-  if (std::fabs(target_nm) > safety_.limits().params.tau_max_nm) {
-    throw LimitViolation("set_force: " + std::to_string(force_n) + " N = " +
-                         std::to_string(target_nm) +
-                         " Nm exceeds tau_max_nm=" +
-                         std::to_string(safety_.limits().params.tau_max_nm));
-  }
-
-  const GripperState st = io_.get_state(true);
-  if (!st.has_data()) {
-    throw SafetyFault("set_force: no valid feedback — refused");
-  }
-  const double q = st.position_rad;
-
-  // The frames carry the feed-forward torque alone (kp=kd=0), ramped at
-  // force_ramp_n_s from the torque in flight — see hold_force() for why.
-  const double step_nm = config_.force_ramp_n_s * config_.frame_interval *
-                         UnitConversion::kNToNm;
-  double tau_cmd = std::fabs(st.torque_nm) < std::fabs(target_nm) ? st.torque_nm
-                                                                 : target_nm;
-
-  // Climb first, then hold. `duration_s` is the hold AFTER the climb, not a
-  // budget that includes it, so the call's wall clock is climb + duration and
-  // a short duration still reaches the full force. duration_s = 0 means "ramp
-  // to the setpoint and return" — the climb still completes.
-  //
-  // `!=` is deliberate: one step per frame lands exactly on the setpoint. It
-  // only terminates while every step really approaches the setpoint, so each
-  // step verifies that and raises otherwise instead of spinning (Python
-  // gripper.py:1576-1587). The non-finite setpoint is caught above — this is
-  // the same guard for a step too small for the arithmetic to carry
-  // (`value ± step == value`), which would also never move.
-  int climb_frames = 0;
-  if (step_nm > 0.0) {
-    double probe = tau_cmd;
-    while (probe != target_nm) {
-      const double dist_nm = std::fabs(target_nm - probe);
-      probe = toward(probe, target_nm, step_nm);
-      ++climb_frames;
-      // `not (<)` rather than `>=`: against a NaN the comparison is false, and
-      // `not false` is what raises. Writing `>=` would miss it.
-      if (!(std::fabs(target_nm - probe) < dist_nm)) {
-        throw CommandError("set_force: the torque ramp is not approaching the "
-                           "setpoint (stopped at " +
-                           std::to_string(probe) + ", setpoint " +
-                           std::to_string(target_nm) + ", step " +
-                           std::to_string(step_nm) + ") — command not sent");
-      }
-    }
-  }
-  const int hold_frames =
-      std::max(0, frame_count_round(duration_s / config_.frame_interval));
-
-  // Position guard, the same predicate grasp()'s hold phase uses: this path
-  // streams the same pure torque frames (kp = kd = 0, no position error for the
-  // command clamp to act on), so the only lever is dropping the torque. Only
-  // the closing side is judged — see closing_travel_excursion_rad. Off while the
-  // config is uncalibrated: set_force has never required a calibration, and the
-  // placeholder limits describe no real travel.
-  const GripperConfig& gcfg = io_.config();
-  const bool guarded = gcfg.calibrated;
-  const double guard_rad = config_.hold_runaway_rad;
-
-  // Failures are NOT wrapped into CommError the way Python does: the typed
-  // exception (LimitViolation for an over-budget torque, CommandError for an
-  // unsent frame) carries more than "force control failed" ever could.
-  for (int i = 0; i < climb_frames + hold_frames; ++i) {
-    // Checked before the frame goes out, so the first one is covered too: a
-    // call that starts outside the guard sends no torque at all.
-    if (guarded) {
-      const double pos = io_.get_state(/*wait=*/false).position_rad;
-      if (closing_travel_excursion_rad(gcfg, pos) > guard_rad) {
-        release(pos, "set_force");
-        return false;
-      }
-    }
-    if (i < climb_frames) {
-      tau_cmd = toward(tau_cmd, target_nm, step_nm);
-    } else {
-      tau_cmd = target_nm;
-    }
-    send_frame(q, 0.0, 0.0, 0.0, tau_cmd, "set_force");
-    // Drain incoming frames between sends: without this nothing reads the
-    // drive's status frames for the whole call.
-    io_.get_state(/*wait=*/false);
-    sleep_s(config_.frame_interval);
-  }
-  return true;
 }
 
 // ── the positioning ramp (Python actions.GripperActions.ramp_to) ─────────

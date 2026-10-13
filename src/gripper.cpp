@@ -2,7 +2,7 @@
 // litegrip_driver/litegrip/gripper.py and wired to the safety core.
 //
 // Scope: lifecycle, hold-based init, calibration, position motion, the action
-// engine (open/close/grasp/set_force/positioning ramps/zero-gravity — see
+// engine (open/close/grasp/positioning ramps/zero-gravity — see
 // motion.hpp), state and parameter access. Trajectory record/playback and
 // teleop are later stages.
 //
@@ -328,12 +328,6 @@ GraspResult LiteGrip::grasp(std::optional<double> force_n, double hold_s,
   return engine.grasp(force_n, hold_s, std::move(progress));
 }
 
-bool LiteGrip::set_force(double force_n, double duration_s) {
-  check_connected();
-  MotionEngine engine(*this, *safety_);
-  return engine.set_force(force_n, duration_s);
-}
-
 MoveResult LiteGrip::move_at_speed(double target_mm, double speed_mm_s,
                                    std::optional<double> kp,
                                    std::optional<double> kd) {
@@ -385,7 +379,7 @@ MoveResult LiteGrip::goto_rad(double position_rad, std::optional<double> kp,
   if (tau_feedforward != 0.0) {
     throw CommandError(
         "goto_rad: tau_feedforward is not accepted — the ramp carries no "
-        "feed-forward torque; use set_force() or grasp() to apply a force");
+        "feed-forward torque; use grasp() to apply a force");
   }
   if (!std::isfinite(duration) || duration <= 0.0) {
     throw CommandError(

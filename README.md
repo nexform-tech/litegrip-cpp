@@ -225,7 +225,6 @@ trusting it, or call `refresh_status()` first.
 | `close(speed_mm_s=None, progress={})` → `MoveResult` | The same, toward the closed side. `work_stroke_mm` is an open-side number and does not change where a close ends. |
 | `home()` → `MoveResult` | Ramps to the calibrated closed position. Not a press: it stops *on* the zero instead of loading it. |
 | `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | Closes onto the object — or onto the closed-side calibrated stop if there is nothing there — then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. The hold takes over only once the jaw is stopped: `stalled` (something is between the jaws) or `reached` (the jaws closed empty). `hold_s = 0` holds until a fault or the runaway watch. `force_n` empty uses `MotionConfig::force_n` (20 N). |
-| `set_force(force_n, duration_s=0.3)` → `bool` | Holds `force_n` where the jaws already are, for `duration_s` seconds. |
 | `goto_mm(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | Ramp to a position in millimetres (0 = closed). |
 | `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | The same in radians. `dq_target` and `tau_feedforward` must be 0 — see below. |
 | `move_to(target_rad, kp=None, kd=None, tau_feedforward=0.0, duration=1.0)` → `MoveResult` | The same as `goto_rad`, with a longer default `duration`. |
@@ -278,11 +277,19 @@ narrowing `open()`/`close()` rely on, and a clamp, not a widening.
 
 ### Gripping and force
 
-`grasp(force_n, hold_s)` closes, then holds; `set_force(force_n, duration_s)`
-holds wherever the jaws already are. Both stream frames with `kp = kd = 0`, so
-the drive's output *is* the feed-forward torque `close_sign × force_n × 0.1 Nm`.
-That is what makes the force independent of the workpiece: as a soft object
-yields, the jaws follow it and the grip stays at the setpoint.
+`grasp(force_n, hold_s)` is the only way to press with a force: it closes first
+and holds second. The hold frames carry `kp = kd = 0`, so the drive's output *is*
+the feed-forward torque `close_sign × force_n × 0.1 Nm`. That is what makes the
+force independent of the workpiece: as a soft object yields, the jaws follow it
+and the grip stays at the setpoint.
+
+**A force is only meaningful against something.** There is no call that applies a
+force at the current position, and that is deliberate: such a call cannot tell
+whether anything is between the jaws, and the hold frames give the drive no
+position or velocity error to work against, so with nothing there the torque is
+the only acting force and the jaws accelerate. `grasp()` avoids that by
+construction — its closing leg runs on the position ramp and arrives at the
+object (or at the closed-side calibrated stop) before the hold takes over.
 
 - **The force is approximate.** `1 N = 0.1 Nm` is marked approximate in the SDK
   (`kForceCalibrationVerified` is false), and the real clamping force also
@@ -309,10 +316,9 @@ by lowering the commanded speed; then the damping, never above the caller's
 limit can act on them; the only lever is removing the torque. Once the measured
 position is `MotionConfig::hold_runaway_rad` (`0.05 rad`, about 3.05 mm at the
 factory `rad_to_mm` of `61.0123`) past the closed-side calibrated limit, `grasp`
-and `set_force` stream `MotionConfig::stop_release_s` of zero-torque frames and
-return — `GraspResult::travel_guard` set with `ok` false, or `false` from
-`set_force`. Only the closing side is judged, because that is the side the
-feed-forward pushes. This is a **runaway detector, not an accuracy bound**:
+streams `MotionConfig::stop_release_s` of zero-torque frames and returns with
+`GraspResult::travel_guard` set and `ok` false. Only the closing side is judged,
+because that is the side the feed-forward pushes. This is a **runaway detector, not an accuracy bound**:
 raise `hold_runaway_rad` only if a jaw that is genuinely holding something is
 being released. The guard is off until the config is calibrated.
 
@@ -703,7 +709,7 @@ re-aims every frame — so the engine carries its own bounds instead:
   `MotionEngine::recover_to_interior`.
 
 **The whole positioning family is on that engine ramp**: `open` / `close` /
-`grasp` / `set_force` / zero-gravity, and now `goto_mm` / `goto_rad` / `move_to`
+`grasp` / zero-gravity, and now `goto_mm` / `goto_rad` / `move_to`
 / `home` / `move_at_speed` / `move_at_speed_rad`. The `goto` family used to pass
 through `guard_motion_frame` instead, and on the shipped files that gate refused
 real work: the red lines (`[-1.24, -0.01] rad`,
@@ -848,7 +854,7 @@ allows:
 | `can::MotorController` | multi-motor dispatch on one bus | `can/controller.py` |
 | `GripperBus` | single-gripper bus API (init = hold) | `protocols/can_bus.py` |
 | `LiteGrip` | high-level API | `gripper.py` |
-| `MotionEngine` | action engine: open/close/grasp/set_force/positioning ramps/zero-gravity | `actions.py` + `gripper.py` |
+| `MotionEngine` | action engine: open/close/grasp/positioning ramps/zero-gravity | `actions.py` + `gripper.py` |
 | `SafetyGuard` + `SafetyLimits` | red lines, torque budget, watchdog, modes | `safety_limits.py` (core) |
 | `ControlLoop` | background 200 Hz streaming + rate limit + gate | old Python-side daemon |
 
@@ -867,7 +873,7 @@ allows:
 | `[litegrip] entering a safety mode: ... recovering from outside the red lines`, every move | Expected on the shipped files, not a fault. Both rest positions of an open/close cycle lie outside the red lines, so each move crawls back inside first — see [Why a cycle reports it is recovering](#why-a-cycle-reports-it-is-recovering). |
 | `open()` or `close()` returns `ok = false` with the jaw far from the stop | Something blocked the travel. `protection_tripped` set means the travel-leg torque protection ended the move and let go on purpose. |
 | A `goto` returns `ok = false` with `released = true` | The move fell short and the engine took the force off rather than leaving the drive pressing. Check what is in the travel. |
-| `set_force()` returns `false`, or `GraspResult::travel_guard` is set | The runaway watch tripped: the measured position walked past the closed-side calibrated limit. See [Gripping and force](#gripping-and-force). |
+| `GraspResult::travel_guard` is set | The runaway watch tripped: the measured position walked past the closed-side calibrated limit. See [Gripping and force](#gripping-and-force). |
 | `open()` stops short of the full travel | A work stroke is configured — that is what it is for. See [The work stroke](#the-work-stroke). |
 | `CommError: CAN send timeout ...` | The send buffer stayed full for the whole retry window, so a frame did **not** go out. High bus load or a wedged interface; the SDK reports it instead of dropping the frame quietly. |
 | `SafetyFault: ...: no valid feedback — motion is refused` | No fresh status frame. A disabled motor does not stream them; `refresh_status()` asks for one. |
