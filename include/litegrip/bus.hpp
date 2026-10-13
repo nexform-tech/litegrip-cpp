@@ -40,7 +40,13 @@ class GripperBus {
   /// Disable (when initialised) and close the transport. `disable = false`
   /// leaves the motor enabled — holding position with torque — for callers
   /// that own the motor state themselves (LiteGrip::disable_on_disconnect).
-  void disconnect(bool disable = true);
+  ///
+  /// Does not throw, and the transport is always closed: a disable frame that
+  /// fails on a dead bus is reported on stderr and swallowed, because
+  /// ~GripperBus() calls this and an escaping exception would terminate the
+  /// process. Use disable() directly when the failure has to be visible to the
+  /// caller.
+  void disconnect(bool disable = true) noexcept;
 
   bool is_connected() const noexcept { return connected_; }
   bool is_initialized() const noexcept { return initialized_; }
