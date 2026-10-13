@@ -34,6 +34,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -783,6 +784,16 @@ std::string LiteGrip::save_calibration(std::optional<std::string> path) {
   const int mst = mst_id_.value_or(0);
   write_calibration_file(destination, config_, config_.can_id, mst,
                          motor_type_name(GripperParams::kMotorType));
+  std::printf("[litegrip] calibration saved to %s\n", destination.c_str());
+  // The factory calibration stays the standard value, so this file is not read
+  // back on its own — say so here rather than let the next run do something
+  // surprising. Mirrors the Python SDK's warning at the same call.
+  std::fprintf(stderr,
+               "[litegrip] warning: a no-argument load_calibration() does not "
+               "read %s back; name it — load_calibration(\"%s\") — or set "
+               "%s=%s\n",
+               destination.c_str(), destination.c_str(), kCalibEnvVar,
+               destination.c_str());
   return destination;
 }
 
@@ -791,22 +802,34 @@ bool LiteGrip::load_calibration(std::optional<std::string> path) {
 
   std::vector<std::string> sources;
   bool skip_other_channels = false;
+  bool report_ignored_local = false;
   if (path.has_value()) {
     // An explicit path is the caller's deliberate override: it may be
     // anywhere (including a template's path), and when it cannot be read the
     // packaged factory calibration is the documented fallback.
     sources = {*path, factory_calibration_path()};
   } else {
-    // This channel's own file first, then the legacy single-file location,
-    // then the factory one. LITEGRIP_CALIB can make several entries the same
-    // path; dedupe so the diagnostics do not repeat themselves.
-    sources = dedupe_paths({default_calibration_path(instance_channel),
-                            default_calibration_path(),
-                            factory_calibration_path()});
+    // The packaged factory calibration is the standard value for this
+    // gripper, and a file on this machine is read only when the caller names
+    // one. A leftover legacy file must not outrank the shipped baseline: on
+    // the bench machine it did, silently driving with a 22% wrong scale and
+    // no work stroke while a measured calibration sat next to it unused.
+    const char* env = std::getenv(kCalibEnvVar);
+    const bool named_by_env = env != nullptr && env[0] != '\0';
+    std::vector<std::string> candidates;
+    if (named_by_env) {
+      candidates.emplace_back(env);
+    }
+    candidates.push_back(factory_calibration_path());
+    sources = dedupe_paths(candidates);
     skip_other_channels = true;
+    // Nothing was named, so anything a no-argument load walked past gets
+    // reported below rather than left for the operator to discover.
+    report_ignored_local = !named_by_env;
   }
 
   std::optional<CalibrationFile> calibration;
+  std::string loaded_from;
   for (const std::string& source : sources) {
     calibration = read_calibration_file(source);
     if (!calibration.has_value()) {
@@ -825,7 +848,23 @@ bool LiteGrip::load_calibration(std::optional<std::string> path) {
       calibration.reset();
       continue;
     }
+    loaded_from = source;
     break;
+  }
+
+  if (report_ignored_local) {
+    const std::vector<std::string> ignored =
+        ignored_local_calibrations(instance_channel);
+    if (!ignored.empty()) {
+      std::fprintf(stderr,
+                   "[litegrip] local calibration not read: %s. A no-argument "
+                   "load_calibration() reads $%s and the shipped factory "
+                   "calibration only, so this run does not use it. To use one, "
+                   "name it: load_calibration(\"%s\"), or set %s=%s\n",
+                   join_paths(ignored).c_str(), kCalibEnvVar,
+                   ignored.front().c_str(), kCalibEnvVar,
+                   ignored.front().c_str());
+    }
   }
 
   if (!calibration.has_value()) {
@@ -836,6 +875,11 @@ bool LiteGrip::load_calibration(std::optional<std::string> path) {
                  join_paths(sources).c_str(), kDataDirEnvVar);
     return false;
   }
+
+  // Which file won, always: the whole point of the discovery change is that
+  // the answer stops being a guess. Mirrors the Python SDK's
+  // "Calibration loaded from %s".
+  std::printf("[litegrip] calibration loaded from %s\n", loaded_from.c_str());
 
   apply_calibration(*calibration, instance_channel);
   return true;

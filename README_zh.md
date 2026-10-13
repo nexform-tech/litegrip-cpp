@@ -119,8 +119,9 @@ sudo ip link set can0 up
 int main() {
   litegrip::GripperConfig cfg;                 // can0, can_id 0x08, DM4310
   auto gripper = litegrip::LiteGrip::connect_raii(cfg);
-  // 本通道的文件，取不到则用出厂标定。找不到时它返回 false（并打印试过的路径），
-  // 不是抛异常，所以要检查：没有标定的话，第一次运动才会抛。
+  // 设了 $LITEGRIP_CALIB 就用它，否则用随包的出厂标定。两者都读不到时它返回
+  // false（并打印试过的路径），不是抛异常，所以要检查：没有标定的话，第一次
+  // 运动才会抛。
   if (!gripper.load_calibration()) return 1;
   if (!gripper.init()) return 1;               // 使能并保持当前位置
 
@@ -442,7 +443,7 @@ const litegrip::MoveResult res = gripper.goto_mm(
 int main() {
   litegrip::GripperConfig cfg;          // can0, can_id 0x08, DM4310
   auto gripper = litegrip::LiteGrip::connect_raii(cfg);
-  if (!gripper.load_calibration()) {    // 本通道的文件，取不到则用出厂标定
+  if (!gripper.load_calibration()) {    // 设了 $LITEGRIP_CALIB 用它，否则用出厂标定
     return 1;                           // 返回 false 而不是抛异常：什么都没找到
   }
   gripper.init();                       // 使能并保持当前位置
@@ -537,8 +538,10 @@ rad_to_mm = (max_stroke_mm + GripperGeometry::kStopInsetMm) / 探到的跨度_ra
 ⚠ 本 SDK 的 `calibrate_guided()` **不读键盘**：只按堵转判据或力矩上限结束。
 Python SDK 那份还会在操作员按回车时提前返回，这里暂无对应实现。
 
-`save_calibration()` 把当前配置写进本通道自己的文件，那正是自动加载最先读的
-一份，所以下次运行无需额外指定就会生效。
+`save_calibration()` 把当前配置写进本通道自己的文件
+（`~/.litegrip/<channel>_calibration.json`）。不带参数的加载**不会**把它读回来
+—— 写的时候它会说明这一点 —— 想让下次运行用上它，要么把 `LITEGRIP_CALIB`
+指过去，要么把它作为路径传给 `load_calibration()`。
 
 ### 长期可用
 
@@ -546,12 +549,17 @@ Python SDK 那份还会在操作员按回车时提前返回，这里暂无对应
 标定按通道各存各的（`~/.litegrip/<channel>_calibration.json`），两台机器不会
 互相覆盖。
 
-不带参数的 `load_calibration()` 依次读：本通道自己的文件、旧的单文件位置
-`~/.litegrip/litegrip_calibration.json`、随包的出厂文件。出厂文件声明的是
-`channel: can0`，所以一台没有自己标定的 `can1` 机器会**大声失败**，而不是悄悄
-采用 `can0` 的方向：声明了别的通道的候选文件会被**跳过**。给 `can1` 一台自己的
-标定，要么 `load_template("normal")` —— 模板按名字载入、不看通道 —— 要么自己跑
-一次 `zero()`。也可以用 `LITEGRIP_CALIB` 钉死一个显式路径。
+不带参数的 `load_calibration()` 只在设了 `$LITEGRIP_CALIB` 时读它，否则读随包的
+出厂文件，别的都不读。所以本机测出来的标定绝不会被顺手装上：`~/.litegrip/` 里
+有这种文件而你没指名时，加载会把它路过的每个文件都点名打印出来，并且总会打印
+最终用了哪一份。以前一个陈旧文件会静默地盖过出厂文件，于是用错的换算比例跑，
+还丢掉工作行程。
+
+出厂文件声明的是 `channel: can0`，所以一台没有自己标定的 `can1` 机器会**大声
+失败**，而不是悄悄采用 `can0` 的方向：声明了别的通道的候选文件会被**跳过**。
+给 `can1` 一台自己的标定，要么 `load_template("normal")` —— 模板按名字载入、
+不看通道 —— 要么自己跑一次 `zero()`，然后把那份文件指名给 `load_calibration()`，
+或用 `LITEGRIP_CALIB` 钉住它。
 
 SDK 从不猜方向：标定或模板载入之前，每个运动入口都抛 `CommandError`（见
 [排错](#排错)）。
@@ -764,7 +772,8 @@ gripper.close();                                         // 应该是合上，�
 | --- | --- |
 | `ConnectError: CAN interface 'can0' not found` | 接口没起，或适配器没加载。跑第 2 步；用 `ip link show can0` 查。 |
 | `CommandError: not calibrated: pos_closed_rad / pos_open_rad are still the placeholder defaults ...` | 没有载入标定也没有载入模板，哪一端是闭合侧无从判断。跑 `load_calibration()`、`load_template(...)` 或第 4 步的 `zero()`。 |
-| `load_calibration()` 打印 "no calibration found" 并返回 `false` | 它试的三个文件都读不到：本通道自己的、旧的单文件、随包的出厂文件。最后一个把 `$LITEGRIP_DATA_DIR` 指向放着 `calibration/` 的目录即可 —— [安装](#安装)之后是 `$HOME/.local/share/litegrip_cpp`。 |
+| `load_calibration()` 打印 "no calibration found" 并返回 `false` | `$LITEGRIP_CALIB` 和随包的出厂文件都读不到。出厂文件那个把 `$LITEGRIP_DATA_DIR` 指向放着 `calibration/` 的目录即可 —— [安装](#安装)之后是 `$HOME/.local/share/litegrip_cpp`。 |
+| `local calibration not read: ...`，每次不带参数的 `load_calibration()` | 本机存着一份你没指名的标定时的正常提示。不带参数的加载只读出厂文件，所以这次跑用的是随包基线。把那份文件指名，或把 `LITEGRIP_CALIB` 设成它。 |
 | `GripperConfig::mount()` 返回 `nullopt` | 同一件事，只是还没走到报错：标定或模板载入之前不报方向。 |
 | 随包文件上 `goto_mm()` 不动，或 `home()` 抛异常 | 用了定位一族还没搬上引擎斜坡之前的旧二进制。重新构建；`home()` 的目标在闭侧红线之外，那正是旧闸门拒绝的东西。 |
 | `CommandError: ... is not a finite number ...`，或 `LimitViolation: ... speed ... exceeds the commanded-velocity ceiling` | 目标值/速率是 NaN、inf，或者斜坡的速度超过 1.5 rad/s —— 无论是直接给的还是由 `duration_s` 蕴含的。刻意在入口拒绝 —— 一帧都没发。 |

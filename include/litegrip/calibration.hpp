@@ -5,9 +5,13 @@
 // phase (see PLAN-litegrip-cpp.md D8).
 //
 // Path resolution mirrors the Python original:
-//   * per channel: env LITEGRIP_CALIB, else ~/.litegrip/<channel>_calibration.json
-//   * then the legacy single-file location ~/.litegrip/litegrip_calibration.json
-//   * then the packaged, read-only factory_calibration.json
+//   * a no-argument load reads env LITEGRIP_CALIB when it is set, then the
+//     packaged, read-only factory_calibration.json — and nothing else
+//   * ~/.litegrip/<channel>_calibration.json (what save_calibration() writes)
+//     and the legacy ~/.litegrip/litegrip_calibration.json are still resolved
+//     by default_calibration_path(), so a caller can name one or point
+//     LITEGRIP_CALIB at it, but a no-argument load does not pick them up: a
+//     leftover file must not silently outrank the shipped baseline
 // A candidate that declares a *different* channel is skipped, not adopted:
 // every LiteGrip ships at CAN id 0x08, so on a two-gripper machine the channel
 // is the only identity key (see LiteGrip::load_calibration).
@@ -54,6 +58,20 @@ std::string default_calibration_path();
 /// per-channel file comes first and why a candidate naming a different channel
 /// is skipped rather than adopted. Mirrors gripper.default_calib_path().
 std::string default_calibration_path(const std::string& channel);
+
+/// Calibrations on this machine that a no-argument load_calibration() will not
+/// read: `$HOME/.litegrip/<channel>_*.json` and the legacy
+/// `$HOME/.litegrip/litegrip_calibration.json`, sorted by path. Empty when that
+/// directory does not exist.
+///
+/// Reporting them is the point. They are written by save_calibration() and by
+/// older versions, so a machine can hold a measured, per-device calibration
+/// while the SDK drives with the factory one — and nothing would say so. Only
+/// names that could belong to `channel` are returned, so a second gripper's
+/// file does not appear in the first one's log. Mirrors the Python SDK's
+/// `_ignored_calib_files()`, which shipped in its #45.
+std::vector<std::string> ignored_local_calibrations(
+    const std::string& channel);
 
 /// Path of the packaged factory calibration (read-only fallback).
 ///
