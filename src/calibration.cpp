@@ -5,8 +5,10 @@
 
 #include "litegrip/calibration.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <dirent.h>
 #include <optional>
 #include <string>
 #include <sys/stat.h>
@@ -131,6 +133,38 @@ std::string default_calibration_path(const std::string& channel) {
     return ".litegrip/" + channel + "_calibration.json";
   }
   return std::string(home) + "/.litegrip/" + channel + "_calibration.json";
+}
+
+std::vector<std::string> ignored_local_calibrations(
+    const std::string& channel) {
+  const char* home = env_or_null("HOME");
+  if (home == nullptr) {
+    return {};
+  }
+  const std::string directory = std::string(home) + "/.litegrip";
+  DIR* dir = ::opendir(directory.c_str());
+  if (dir == nullptr) {
+    return {};
+  }
+
+  std::vector<std::string> ignored;
+  while (const struct dirent* entry = ::readdir(dir)) {
+    const std::string name = entry->d_name;
+    if (name.size() <= 5 || name.compare(name.size() - 5, 5, ".json") != 0) {
+      continue;
+    }
+    // Only names that could belong to THIS channel: a second gripper's file
+    // must not show up in the first one's log.
+    const std::string prefix = channel + "_";
+    if (name.rfind(prefix, 0) == 0 ||
+        name == "litegrip_calibration.json") {
+      ignored.push_back(directory + "/" + name);
+    }
+  }
+  ::closedir(dir);
+
+  std::sort(ignored.begin(), ignored.end());
+  return ignored;
 }
 
 std::string factory_calibration_path() {

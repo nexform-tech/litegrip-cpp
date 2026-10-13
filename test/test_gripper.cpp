@@ -7,13 +7,17 @@
 
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <sys/stat.h>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
+#include "litegrip/calibration.hpp"
 #include "litegrip/exceptions.hpp"
 #include "litegrip/gripper.hpp"
 #include "litegrip/safety.hpp"
@@ -47,6 +51,47 @@ void check_throws(const char* what, Fn&& fn) {
 
 const std::string kFactoryPath =
     std::string(LITEGRIP_TEST_DATA_DIR) + "/factory_calibration.json";
+
+/// Run `fn` with stdout AND stderr sent to `path`, and return what it wrote.
+///
+/// The diagnostics under test are `printf`/`fprintf` lines, so there is no
+/// seam to observe them through — the file descriptor is the seam. Both
+/// streams are captured together because the "loaded from" line goes to stdout
+/// while the warnings go to stderr, and this block asserts on both.
+std::string capture_output(const std::string& path,
+                           const std::function<void()>& fn) {
+  std::fflush(stdout);
+  std::fflush(stderr);
+  const int saved_out = ::dup(1);
+  const int saved_err = ::dup(2);
+  FILE* file = std::fopen(path.c_str(), "w");
+  if (file == nullptr || saved_out < 0 || saved_err < 0) {
+    return {};
+  }
+  const int fd = ::fileno(file);
+  ::dup2(fd, 1);
+  ::dup2(fd, 2);
+  fn();
+  std::fflush(stdout);
+  std::fflush(stderr);
+  ::dup2(saved_out, 1);
+  ::dup2(saved_err, 2);
+  ::close(saved_out);
+  ::close(saved_err);
+  std::fclose(file);
+
+  std::string out;
+  FILE* in = std::fopen(path.c_str(), "r");
+  if (in != nullptr) {
+    char buffer[4096];
+    std::size_t read = 0;
+    while ((read = std::fread(buffer, 1, sizeof(buffer), in)) > 0) {
+      out.append(buffer, read);
+    }
+    std::fclose(in);
+  }
+  return out;
+}
 
 // Fixtures written with std::fopen need their directory created first: on a
 // clean machine nothing has yet, and the checks must not depend on an earlier
@@ -400,34 +445,70 @@ int main() {
     }
 
     // The legacy slot holds a *can0* calibration (the pre-per-channel era had
-    // one shared file). A can0 unit adopts it...
-    seed(dot_litegrip + "/litegrip_calibration.json",
+    // one shared file): a stale one, of the kind that used to win silently and
+    // drive 22% wrong with no work stroke. A no-argument load must not read it
+    // — the factory baseline is what takes effect — and must say what it
+    // walked past.
+    const std::string legacy = dot_litegrip + "/litegrip_calibration.json";
+    seed(legacy,
          "{\"channel\": \"can0\", \"zero_position_rad\": 0.114, "
          "\"max_position_rad\": -1.491, \"rad_to_mm\": 65.0}");
+
+    const std::optional<litegrip::CalibrationFile> factory =
+        litegrip::read_calibration_file(kFactoryPath);
+    check(factory.has_value(), "the packaged factory calibration is readable");
+    const double factory_scale = factory.has_value() ? factory->rad_to_mm : 0.0;
+
+    const std::string log_path = std::string(kFixtureDir) + "/load_chain.log";
     litegrip::LiteGrip can0;
-    check(can0.load_calibration(), "a can0 unit adopts the can0 legacy file");
-    check(std::fabs(can0.config().rad_to_mm - 65.0) < 1e-12,
-          "the legacy file's own scale is in effect, not the factory fallback");
+    bool can0_loaded = false;
+    const std::string log = capture_output(
+        log_path, [&] { can0_loaded = can0.load_calibration(); });
+    check(can0_loaded, "a can0 unit still finds a calibration — the factory one");
+    check(std::fabs(can0.config().rad_to_mm - factory_scale) < 1e-12,
+          "the factory scale is in effect, not the legacy file's 65.0");
+    check(log.find("litegrip_calibration.json") != std::string::npos,
+          "the skipped legacy file is named on stderr");
+    check(log.find("local calibration not read") != std::string::npos,
+          "...and named as an unread local calibration, not a silent fallback");
+    check(log.find("calibration loaded from") != std::string::npos,
+          "the file that won is named too");
 
-    // ...while a can1 unit must skip it — and skip the can0 factory file
-    // too, failing loudly instead of silently adopting can0's direction and
-    // travel.
-    litegrip::GripperConfig can1_config;
-    can1_config.can_channel = "can1";
-    litegrip::LiteGrip can1(can1_config);
-    check(!can1.load_calibration(),
-          "a can1 unit adopts neither the can0 legacy file nor can0's factory "
-          "file");
-    check(!can1.config().calibrated, "the failed chain left it uncalibrated");
+    // The escape hatch is explicit and it works: naming the file — through
+    // LITEGRIP_CALIB here — reads it, so nothing useful was taken away.
+    ::setenv("LITEGRIP_CALIB", legacy.c_str(), 1);
+    litegrip::LiteGrip via_env;
+    check(via_env.load_calibration(), "$LITEGRIP_CALIB still loads the file");
+    check(std::fabs(via_env.config().rad_to_mm - 65.0) < 1e-12,
+          "the named file's own scale is in effect");
+    ::unsetenv("LITEGRIP_CALIB");
 
-    // Its own per-channel file wins over both.
+    // A can1 unit skips the can0 factory file as before, failing loudly rather
+    // than silently adopting can0's direction and travel. Its own per-channel
+    // file is not a candidate either now, so this stays a refusal — and says
+    // which file it left unread.
     seed(dot_litegrip + "/can1_calibration.json",
          "{\"channel\": \"can1\", \"zero_position_rad\": -1.491, "
          "\"max_position_rad\": 0.114, \"rad_to_mm\": 74.8}");
-    check(can1.load_calibration(), "the per-channel file is adopted");
+    litegrip::GripperConfig can1_config;
+    can1_config.can_channel = "can1";
+    litegrip::LiteGrip can1(can1_config);
+    bool can1_loaded = true;
+    const std::string can1_log = capture_output(
+        log_path, [&] { can1_loaded = can1.load_calibration(); });
+    check(!can1_loaded,
+          "a can1 unit adopts neither the can0 factory file nor its own "
+          "un-named local file");
+    check(!can1.config().calibrated, "the failed load left it uncalibrated");
+    check(can1_log.find("can1_calibration.json") != std::string::npos,
+          "the can1 unit's own unread file is named as well");
+
+    // A can1 unit's own file is still reachable the documented way: name it.
+    check(can1.load_calibration(dot_litegrip + "/can1_calibration.json"),
+          "naming the per-channel file loads it");
     check(can1.config().close_sign() < 0.0,
-          "the per-channel (reverse) direction is in effect");
-    check(can1.config().calibrated, "a successful chain load calibrates");
+          "the named (reverse) per-channel direction is in effect");
+    check(can1.config().calibrated, "a successful named load calibrates");
 
     // An explicit path is the caller's override: another channel's file loads
     // anyway (with a warning), because naming the file is unambiguous.
@@ -438,13 +519,32 @@ int main() {
     check(explicit_load.config().close_sign() < 0.0,
           "the explicit file's direction is adopted");
 
-    // Saving without a path lands in the channel's own file — the one the
-    // chain reads first, so it is picked up next run without being told.
+    // Saving without a path lands in the channel's own file, and says out loud
+    // that a no-argument load will not read it back.
     litegrip::GripperConfig saver_config;
     saver_config.can_channel = "can2";
     litegrip::LiteGrip saver(saver_config);
-    check(saver.save_calibration() == dot_litegrip + "/can2_calibration.json",
+    std::string saved;
+    const std::string save_log = capture_output(
+        log_path, [&] { saved = saver.save_calibration(); });
+    check(saved == dot_litegrip + "/can2_calibration.json",
           "save_calibration() writes the per-channel file");
+    check(save_log.find("does not") != std::string::npos &&
+              save_log.find("can2_calibration.json") != std::string::npos,
+          "save_calibration() warns that the file is not read back on its own");
+
+    // The scan behind that report lists only this channel's names.
+    const std::vector<std::string> ignored =
+        litegrip::ignored_local_calibrations("can2");
+    check(ignored.size() == 2 &&
+              ignored[0] == dot_litegrip + "/can2_calibration.json" &&
+              ignored[1] == dot_litegrip + "/litegrip_calibration.json",
+          "ignored_local_calibrations lists this channel's names, sorted");
+    const std::vector<std::string> ignored_other =
+        litegrip::ignored_local_calibrations("can9");
+    check(ignored_other.size() == 1 &&
+              ignored_other[0] == dot_litegrip + "/litegrip_calibration.json",
+          "another channel's files are not reported to this one");
 
     if (old_home != nullptr) {
       ::setenv("HOME", saved_home.c_str(), 1);

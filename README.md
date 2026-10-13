@@ -129,9 +129,9 @@ to a different channel. Everything after this step assumes the interface is up.
 int main() {
   litegrip::GripperConfig cfg;                 // can0, can_id 0x08, DM4310
   auto gripper = litegrip::LiteGrip::connect_raii(cfg);
-  // This channel's file, else the packaged factory one. It RETURNS false when
-  // none was found — having printed what it tried — rather than throwing, so
-  // check it: without a calibration the first move throws instead.
+  // $LITEGRIP_CALIB if it is set, else the packaged factory file. It RETURNS
+  // false when neither could be read — having printed what it tried — rather
+  // than throwing, so check it: without a calibration the first move throws.
   if (!gripper.load_calibration()) return 1;
   if (!gripper.init()) return 1;               // enable and hold the current position
 
@@ -486,7 +486,7 @@ subclasses tell you what to do about it:
 int main() {
   litegrip::GripperConfig cfg;          // can0, can_id 0x08, DM4310
   auto gripper = litegrip::LiteGrip::connect_raii(cfg);
-  if (!gripper.load_calibration()) {    // this channel's file, else the packaged factory one
+  if (!gripper.load_calibration()) {    // $LITEGRIP_CALIB if set, else the packaged factory file
     return 1;                           // false, not a throw: it found nothing to load
   }
   gripper.init();                       // enable and hold current position
@@ -596,9 +596,10 @@ Three routines measure the travel, and none of them touches the disk:
 stall criterion or the torque ceiling only. The Python SDK's version also returns
 as soon as the operator presses Enter; there is no equivalent here yet.
 
-`save_calibration()` writes the current config to this channel's own file, the
-one the automatic load reads first, so the result is picked up next run without
-being told.
+`save_calibration()` writes the current config to this channel's own file,
+`~/.litegrip/<channel>_calibration.json`. A no-argument load does **not** read it
+back — it says so as it writes — so make the next run use it by pointing
+`LITEGRIP_CALIB` at it, or by passing the path to `load_calibration()`.
 
 ### Keep it working
 
@@ -607,14 +608,19 @@ identity key** when two sit on one machine. Calibrations are stored one file per
 channel — `~/.litegrip/<channel>_calibration.json` — so two units never
 overwrite each other.
 
-A no-argument `load_calibration()` reads this channel's own file, then the
-legacy single-file location `~/.litegrip/litegrip_calibration.json`, then the
-packaged factory file. The factory file declares `channel: can0`, so a `can1`
-unit with no calibration of its own fails loudly rather than silently adopting
-`can0`'s direction: a candidate whose `channel` field names a different
-interface is *skipped*. Give a `can1` unit its own with either
-`load_template("normal")` — a template loads by name and ignores the channel —
-or a `zero()` of its own. Set `LITEGRIP_CALIB` to pin one explicit path instead.
+A no-argument `load_calibration()` reads `$LITEGRIP_CALIB` when it is set, then
+the packaged factory file, and nothing else. A calibration measured on this
+machine is therefore never picked up by accident: if `~/.litegrip/` holds one
+and you did not name it, the load names every file it walked past, and it always
+prints the file it used. A stale file used to outrank the factory one silently,
+which drove with the wrong scale and no work stroke.
+
+The factory file declares `channel: can0`, so a `can1` unit with no calibration
+of its own fails loudly rather than silently adopting `can0`'s direction: a
+candidate whose `channel` field names a different interface is *skipped*. Give a
+`can1` unit its own with either `load_template("normal")` — a template loads by
+name and ignores the channel — or a `zero()` of its own, and then name that file
+or point `LITEGRIP_CALIB` at it.
 
 The SDK never guesses a direction: until a calibration or a template is loaded,
 every motion entry throws `CommandError` (see [Troubleshooting](#troubleshooting)).
@@ -881,7 +887,8 @@ allows:
 | --- | --- |
 | `ConnectError: CAN interface 'can0' not found` | The interface is down or the adapter is not loaded. Run step 2; check `ip link show can0`. |
 | `CommandError: not calibrated: pos_closed_rad / pos_open_rad are still the placeholder defaults ...` | No calibration or template is loaded, so which end is closed is a guess. Run `load_calibration()`, `load_template(...)`, or `zero()` from step 4. |
-| `load_calibration()` prints "no calibration found" and returns `false` | None of the three files it tried could be read: this channel's own, the legacy one, then the packaged factory file. For that last one, point `$LITEGRIP_DATA_DIR` at the directory holding `calibration/` — `$HOME/.local/share/litegrip_cpp` after [Install it](#install-it). |
+| `load_calibration()` prints "no calibration found" and returns `false` | Neither `$LITEGRIP_CALIB` nor the packaged factory file could be read. For the factory file, point `$LITEGRIP_DATA_DIR` at the directory holding `calibration/` — `$HOME/.local/share/litegrip_cpp` after [Install it](#install-it). |
+| `local calibration not read: ...`, every no-argument `load_calibration()` | Expected on a machine that holds a calibration you did not name. A no-argument load reads the factory file only, so this run uses the shipped baseline. Name the file, or set `LITEGRIP_CALIB` to it. |
 | `GripperConfig::mount()` returns `nullopt` | The same thing, before it becomes an error: direction is not reported until a calibration or a template is loaded. |
 | `goto_mm()` on the shipped files and nothing moves, or `home()` throws | A stale binary from before the positioning family moved onto the engine ramp. Rebuild; `home()`'s target is outside the closed red line, which is what the old gate refused. |
 | `CommandError: ... is not a finite number ...`, or `LimitViolation: ... speed ... exceeds the commanded-velocity ceiling` | A NaN / inf target or rate, or a ramp past 1.5 rad/s — whether the speed was given or implied by `duration_s`. Refused at the entry, deliberately — nothing was sent. |

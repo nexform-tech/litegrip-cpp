@@ -260,9 +260,13 @@ class LiteGrip : private MotionIo {
                             std::optional<double> tau_limit = 2.0);
 
   /// Calibrate and persist in one call: calibrate() at its defaults, then
-  /// save_calibration() to this channel's own file, so the result is picked up
-  /// automatically next run. The gripper is driven against both end stops, so
-  /// make sure the travel is clear. Returns what calibrate() returned.
+  /// save_calibration() to this channel's own file. The gripper is driven
+  /// against both end stops, so make sure the travel is clear. Returns what
+  /// calibrate() returned.
+  ///
+  /// That file is *not* read back by a no-argument load_calibration(), which
+  /// reads the factory calibration only — so also point `LITEGRIP_CALIB` at
+  /// what this wrote, or load it by path on the next run.
   ///
   /// Mirrors the Python SDK's zero(), which is the same pair of calls; the two
   /// SDKs are being kept name-for-name compatible. The Python one passes its
@@ -297,10 +301,13 @@ class LiteGrip : private MotionIo {
   /// Persist the current calibration. Returns the path written.
   ///
   /// Without `path`, writes to this channel's own file
-  /// (default_calibration_path(channel)) — the file load_calibration() reads
-  /// by default, so a calibration saved here is picked up automatically next
-  /// run. One file per channel is what keeps two grippers on one machine from
-  /// overwriting each other.
+  /// (default_calibration_path(channel)). One file per channel is what keeps
+  /// two grippers on one machine from overwriting each other.
+  ///
+  /// A no-argument load_calibration() reads the factory calibration only, so
+  /// what this writes is *not* read back on its own: name it
+  /// (`load_calibration(returned_path)`) or point `LITEGRIP_CALIB` at it. A
+  /// warning on stderr says so at save time.
   std::string save_calibration(std::optional<std::string> path = std::nullopt);
 
   /// Load calibration into config. Two of the three ways to say which file:
@@ -308,12 +315,15 @@ class LiteGrip : private MotionIo {
   ///  * `path` — an explicit file, which may be anywhere (including a
   ///    template's path). Falls back to the packaged factory calibration when
   ///    that file cannot be read.
-  ///  * no argument — this channel's own file
-  ///    (default_calibration_path(channel)), then the legacy single-file
-  ///    location, then the factory one. A candidate whose `channel` field
-  ///    names a different interface is *skipped*, so a can1 unit fails loudly
-  ///    rather than silently adopting can0's calibration — every LiteGrip
-  ///    ships at CAN id 0x08, so the channel is the only identity key.
+  ///  * no argument — `$LITEGRIP_CALIB` when it is set, then the packaged
+  ///    factory calibration, and nothing else. A calibration measured on this
+  ///    machine is never picked up by accident: name it with `path`, or point
+  ///    `LITEGRIP_CALIB` at it. Files the load walked past in `~/.litegrip/`
+  ///    are named on stderr, and the file that won is printed. A candidate
+  ///    whose `channel` field names a different interface is *skipped*, so a
+  ///    can1 unit fails loudly rather than silently adopting can0's
+  ///    calibration — every LiteGrip ships at CAN id 0x08, so the channel is
+  ///    the only identity key.
   ///
   /// load_template() is the third way: declaring the mount by name.
   ///
