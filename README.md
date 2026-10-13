@@ -696,10 +696,11 @@ through `guard_motion_frame` instead, and on the shipped files that gate refused
 real work: the red lines (`[-1.24, -0.01] rad`,
 `calibration/safety_limits_350.json`) sit *inside* the calibrated travel
 (`[-1.357481, +0.052071] rad`), so `home()` — whose target is the calibrated
-closed position — threw `LimitViolation` every time, and targets within roughly
-5 mm of the closed end or 3 mm of the open end were refused, while `close()`,
-aiming past the same point, was not. The gate now has one caller left:
-`ControlLoop`.
+closed position — threw `LimitViolation` every time, and targets closer than
+3.8 mm to the calibrated closed end, or 7.2 mm to the open end, were refused,
+while `close()`, aiming past the same point, was not. (Both are the red line to
+the calibrated travel end, on the factory calibration's 61.0123 mm/rad.) The
+gate now has one caller left: `ControlLoop`.
 
 That is a deliberate trade, and the cost is real: a `goto` target outside the
 red lines is no longer refused. What still bounds it is the calibrated travel —

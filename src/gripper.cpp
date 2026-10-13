@@ -424,8 +424,14 @@ MoveResult LiteGrip::goto_rad(double position_rad, std::optional<double> kp,
   //   * home() works now. Its target is the calibrated closed position
   //     (+0.052071), outside the closed red line, so the gate refused it every
   //     time — while close(), aiming past the same point, did not.
-  //   * targets within ~5 mm of the closed end and ~3 mm of the open end are
-  //     reachable now, and were refused before.
+  //   * targets closer than 3.8 mm to the calibrated closed end, or 7.2 mm to
+  //     the open end, are reachable now and were refused before. Both are the
+  //     red line to the calibrated travel end on the factory calibration's
+  //     61.0123 mm/rad: (0.052071 + 0.01) x 61.0123 and (-1.24 + 1.357481) x
+  //     61.0123. Do not take the margins quoted in safety_limits_350.json's
+  //     provenance (5.60 mm / 2.99 mm) — those are the red line to the
+  //     MECHANICAL OBSERVED bounds, at a scale of about 10.9 mm/rad that is
+  //     not this repository's.
   // To put a red-line TARGET check back at this one site, test `clamped`
   // against safety_->limits() and throw LimitViolation. The gate's other steps
   // have no work to do here any more: dq and tau are fixed at zero above, and
