@@ -780,6 +780,7 @@ gripper.close();                                         // 应该是合上，�
 | `CommandError: goto_rad: dq_target is not accepted ...` | 传 0。斜坡自己排速度前馈，调用方给的值会跟它打架。 |
 | 夹爪朝反方向动 | 安装方向问题。见 [反装](#反装)：正装什么都不用声明，反装调 `load_template("reverse")`。 |
 | 每次运动都打 `[litegrip] entering a safety mode: ... recovering from outside the red lines` | 随包文件下这是预期行为，不是故障。开/闭循环的两个停驻位置都在红线之外，所以每次运动先把爪子爬回红线内 —— 见 [每轮都报回收是正常的](#每轮都报回收是正常的)。 |
+| 第一次 `init()` 打 `[litegrip] MIT mode switch could not be verified; continuing anyway` | 不是故障。`init()` 先失能电机、再让它切到 MIT 模式，然后回读模式寄存器确认；电机本来就在 MIT 模式、或者这次回读答得晚，链路正常时也会出这一行。真正证明链路的是紧接着的使能并持位，所以 `init()` 打完这行照常继续 —— 这行之后 `init()` 返回 `true`，说明它该做的都做了。 |
 | `open()` 或 `close()` 返回 `ok = false`，而夹爪离止点很远 | 有东西挡住了行程。`protection_tripped` 置位说明是行进段力矩保护有意失力的。 |
 | 某个 `goto` 返回 `ok = false` 且 `released = true` | 没到位，引擎把力撤了，而不是留在那里压着。查行程里有什么。 |
 | `GraspResult::travel_guard` 置位 | 越位护栏触发：实测位置越过了闭合侧标定限位。见 [夹取与力控](#夹取与力控)。 |
