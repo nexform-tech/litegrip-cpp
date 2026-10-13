@@ -47,7 +47,9 @@ namespace {
 
 /// Half the closed-side stick-slip quantum (~0.005 rad) plus margin: a motor
 /// status frame quantized to the 0.0103 rad grid must still read as "on its
-/// calibrated stop".
+/// calibrated stop". A floor, never the whole window — recover_to_interior()
+/// widens it to MotionConfig::stop_tol when that is larger, because close()
+/// may park that far past a calibrated limit and still report success.
 constexpr double kRecoveryTravelToleranceRad = 0.01;
 
 /// Python's round() is half-to-even; nearbyint matches it. Ratios this large
@@ -388,10 +390,14 @@ void MotionEngine::recover_to_interior(const char* source) {
   double lo = limits.mech_min_rad;
   double hi = limits.mech_max_rad;
   if (gcfg.calibrated && installed_travel > 1e-6) {
-    lo = std::min(gcfg.pos_closed_rad, gcfg.pos_open_rad) -
-         kRecoveryTravelToleranceRad;
-    hi = std::max(gcfg.pos_closed_rad, gcfg.pos_open_rad) +
-         kRecoveryTravelToleranceRad;
+    // The window past a calibrated limit may not be narrower than the
+    // tolerance move_to_limit() is allowed to call a successful press
+    // (config_.stop_tol, "parked on the stop"): a position close() reported as
+    // good must not be refused by the next move with "inspect the mechanism".
+    const double window_rad =
+        std::max(kRecoveryTravelToleranceRad, config_.stop_tol);
+    lo = std::min(gcfg.pos_closed_rad, gcfg.pos_open_rad) - window_rad;
+    hi = std::max(gcfg.pos_closed_rad, gcfg.pos_open_rad) + window_rad;
   }
 
   auto scope = safety_.recovery_scope(
