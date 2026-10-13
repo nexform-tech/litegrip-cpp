@@ -24,7 +24,8 @@
 
   "provenance": [
     "The interval values are inherited from the vendor calibration snapshot; the upstream SDK has no concept of red lines.",
-    "Open-side margin to the observed boundary: 0.032793 rad (about 2.99 mm). Closed-side: 0.061308 rad (about 5.60 mm).",
+    "Open-side margin to the observed boundary: 0.032793 rad = 2.41 mm at the packaged calibration's 73.4573 mm/rad. Closed-side: 0.061308 rad = 4.50 mm at that same scale.",
+    "The radians are this file's own numbers and are what the invariants are stated in. The millimetre equivalents are illustrative only: they move with the unit's rad_to_mm, so re-derive them on the deployment unit alongside the red lines themselves. The figures that used to sit here (\"about 2.99 mm\" / \"about 5.60 mm\") required rad_to_mm = 91.3, which no SDK build, description package or per-channel calibration carries.",
     "Sign convention: the closed end has the larger rad value, the open end the smaller (more negative)."
   ],
 
