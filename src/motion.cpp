@@ -48,9 +48,30 @@ namespace {
 /// Half the closed-side stick-slip quantum (~0.005 rad) plus margin: a motor
 /// status frame quantized to the 0.0103 rad grid must still read as "on its
 /// calibrated stop". A floor, never the whole window — recover_to_interior()
-/// widens it to MotionConfig::stop_tol when that is larger, because close()
-/// may park that far past a calibrated limit and still report success.
+/// widens it to whatever a call that reported success is allowed to leave
+/// behind (MotionConfig::stop_tol for a press, hold_runaway_rad for a hold).
 constexpr double kRecoveryTravelToleranceRad = 0.01;
+
+/// How far past a calibrated limit the measured position may still be believed,
+/// and therefore how wide recover_to_interior()'s window must be. It is the
+/// widest excursion a call that reported SUCCESS may leave the jaws at, or the
+/// next move refuses a legal start with "inspect the mechanism" (see #15 for
+/// close(), #47 for grasp()):
+///
+///  * kRecoveryTravelToleranceRad — the quantization floor above.
+///  * MotionConfig::stop_tol — where close() may park a press and still call
+///    itself ok ("parked on the stop").
+///  * MotionConfig::hold_runaway_rad — grasp()'s hold only ENDS once the
+///    excursion exceeds it, so a hold that never tripped its own guard has
+///    already been declared legal out to that radius.
+///
+/// A max(), not a replacement: a config that asks for less than the floor does
+/// not narrow the window, because the floor is what keeps a status frame
+/// quantized to the 0.0103 rad grid reading as "on its stop".
+double recovery_window_rad(const MotionConfig& config) {
+  return std::max({kRecoveryTravelToleranceRad, config.stop_tol,
+                   config.hold_runaway_rad});
+}
 
 /// Python's round() is half-to-even; nearbyint matches it. Ratios this large
 /// would overflow int (Python's int cannot) — clamped, because such a
@@ -335,9 +356,9 @@ int MotionEngine::release(double pos, const char* source) {
 // not by accident (test_safety pins the refusal), and widening the bounds is
 // mechanically rejected (assert_no_wider_than). Rather than widen a baseline,
 // the engine judges plausibility against THE UNIT'S OWN calibration: after
-// calibration, "within this unit's validated travel (± the sticky-
-// quantization tolerance)" replaces "inside the reference unit's hand-push
-// range". OPEN ITEM for the safety owner: once the envelope is re-measured
+// calibration, "within this unit's validated travel (± whatever a successful
+// call may leave behind, recovery_window_rad)" replaces "inside the reference
+// unit's hand-push range". OPEN ITEM for the safety owner: once the envelope is re-measured
 // per unit, this crawl should collapse into guard_recovery_frame() and the
 // twin logic should disappear.
 //
@@ -390,12 +411,11 @@ void MotionEngine::recover_to_interior(const char* source) {
   double lo = limits.mech_min_rad;
   double hi = limits.mech_max_rad;
   if (gcfg.calibrated && installed_travel > 1e-6) {
-    // The window past a calibrated limit may not be narrower than the
-    // tolerance move_to_limit() is allowed to call a successful press
-    // (config_.stop_tol, "parked on the stop"): a position close() reported as
-    // good must not be refused by the next move with "inspect the mechanism".
-    const double window_rad =
-        std::max(kRecoveryTravelToleranceRad, config_.stop_tol);
+    // The window past a calibrated limit may not be narrower than the furthest
+    // a call that REPORTED SUCCESS may leave the jaws (recovery_window_rad):
+    // a position close() or a grasp()'s hold called good must not be refused by
+    // the next move with "inspect the mechanism".
+    const double window_rad = recovery_window_rad(config_);
     lo = std::min(gcfg.pos_closed_rad, gcfg.pos_open_rad) - window_rad;
     hi = std::max(gcfg.pos_closed_rad, gcfg.pos_open_rad) + window_rad;
   }
