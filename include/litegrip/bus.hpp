@@ -176,4 +176,19 @@ bool await_refresh_reply(double timeout_s,
                          const std::function<void()>& send_refresh,
                          const std::function<bool(double)>& await_status);
 
+/// Wait for a fresh status frame, bounded by the staleness horizon.
+///
+/// The bound is kStaleAfterS itself, and that is the point: "fresh" is what
+/// GripperState::is_stale() answers, so the two have to describe the same
+/// thing. A wait shorter than the horizon returns snapshots no frame arrived
+/// for — anything aged between the wait and the horizon — with is_stale() still
+/// false, indistinguishable from a measurement, and the guard callers are told
+/// to write cannot catch them. Waiting the horizon makes a miss mean the
+/// snapshot is past kStaleAfterS, so is_stale() reports it. Waiting longer
+/// would only delay an answer that is stale already.
+///
+/// `await_status` waits for a status frame within the budget it is handed and
+/// reports whether one arrived. Returns true when one did.
+bool await_fresh_state(const std::function<bool(double)>& await_status);
+
 }  // namespace litegrip

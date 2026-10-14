@@ -372,6 +372,13 @@ bool await_refresh_reply(double timeout_s,
   return false;
 }
 
+bool await_fresh_state(const std::function<bool(double)>& await_status) {
+  // One attempt, the whole horizon: this is not a retry policy but the answer
+  // to "is this reading a measurement?" — and the horizon is where that answer
+  // changes (GripperState::is_stale()).
+  return await_status(kStaleAfterS);
+}
+
 bool GripperBus::refresh_status(double timeout_s) {
   if (controller_ == nullptr || motor_ == nullptr) {
     return false;

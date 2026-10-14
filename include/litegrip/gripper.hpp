@@ -344,8 +344,15 @@ class LiteGrip : private MotionIo {
 
   // ── state ─────────────────────────────────────────────────────────────
 
-  /// Current state. `wait` = wait up to 50 ms for a fresh status frame;
-  /// false = return the cached snapshot immediately (control loops).
+  /// Current state. `wait` = wait for a fresh status frame, up to the
+  /// staleness horizon (kStaleAfterS, 0.5 s); false = return the cached
+  /// snapshot immediately (control loops).
+  ///
+  /// The wait is bounded by that horizon on purpose, so the two say the same
+  /// thing: a read that waited and got no frame IS a stale read, and
+  /// is_stale() reports it (a miss also warns on stderr). A shorter wait would
+  /// hand back a snapshot no frame arrived for while is_stale() still called it
+  /// a measurement.
   ///
   /// A disabled motor does not stream status frames, so the snapshot may hold
   /// constructor defaults — check is_stale() / data_age_s before trusting it,

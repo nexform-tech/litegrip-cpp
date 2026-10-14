@@ -178,7 +178,7 @@ static LiteGrip connect_raii(GripperConfig config = GripperConfig{});
 | `connect()` → `bool` | 打开总线并注册电机；`mst_id` 未设置时自动探测。 |
 | `disconnect()` → `void` | 关闭总线；除非 `disable_on_disconnect()` 为假，先失能电机。 |
 | `poll(timeout_s=0.0)` → `bool` | 读一帧；读到即 `true`。 |
-| `get_state(wait=true)` → `GripperState` | 位置、速度、力矩、温度、错误位。`wait=true` 表示要一帧新的。 |
+| `get_state(wait=true)` → `GripperState` | 位置、速度、力矩、温度、错误位。`wait=true` 会等一帧新的，最多等 `kStaleAfterS`（0.5 s）。 |
 | `get_position_mm()` / `get_position_rad()` → `double` | 实测开口。 |
 | `get_force()` → `double` | `get_torque()` × 10，单位 N（**未经力标定** —— 见 [夹取与力控](#夹取与力控)）。 |
 | `get_torque()` → `double` | 实测力矩，Nm。 |
@@ -191,6 +191,11 @@ static LiteGrip connect_raii(GripperConfig config = GripperConfig{});
 
 未使能的电机不流状态帧，缓存的快照里可能还是构造函数默认值 —— 信它之前先看
 `GripperState::is_stale()` / `data_age_s`，或者先调 `refresh_status()`。
+
+`wait=true` 等满陈旧期而不是更短，所以「没等到帧」和 `is_stale()` 不会互相矛盾：
+这一等里没有帧到达，快照就比 `kStaleAfterS` 更旧，`is_stale()` 为真，调用同时向
+stderr 报警。对不流状态帧的夹爪，`get_state()` 会先耗满这 0.5 s 才给出结论 ——
+要「就要缓存值」用 `wait=false`，要强行要一帧用 `refresh_status()`，别干等。
 
 ### 使能与故障
 
