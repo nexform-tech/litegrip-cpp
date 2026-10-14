@@ -2357,47 +2357,74 @@ void test_recovery_from_closed_stop() {
         "recovery: crawled below the red max");
 }
 
-void test_recovery_window_follows_stop_tol() {
-  // The window past a calibrated limit may not be narrower than the tolerance
-  // move_to_limit() calls a successful press (MotionConfig::stop_tol, 0.02 rad
-  // by default). 0.015 rad past kPosClosedRad is a park close() reports as
-  // ok = true, and the flat 0.01 rad window used to refuse it from the NEXT
-  // move with "inspect the mechanism" — a message about a mechanism that is
-  // exactly where it was left.
-  const double parked = kPosClosedRad + 0.015;
-  {
-    FakeIo io(test_config(), /*start_rad=*/ parked, std::nullopt, 0.0,
-              /*stops=*/true);
-    SafetyGuard guard = make_guard();
-    MotionEngine engine(io, guard, instant_config());
-    const MoveResult res = engine.open();
-    check(res.ok, "recovery: a park inside stop_tol still recovers");
-    check(!io.frames.empty() && io.frames.front().kp == 50.0,
-          "recovery: ... and it got there through the recovery crawl");
-  }
-  {  // The window is stop_tol wide, not unbounded: a press may not park 0.035
-     // rad past the limit and call itself ok, so that start is still refused.
-    FakeIo io(test_config(), /*start_rad=*/ kPosClosedRad + 0.035,
+void test_recovery_window_covers_what_a_successful_call_leaves() {
+  // The window past a calibrated limit may not be narrower than the furthest a
+  // call that reported SUCCESS may leave the jaws, or the next move refuses a
+  // legal start with "inspect the mechanism" — a message about a mechanism that
+  // is exactly where it was left. Two calls can park out there: close()'s press
+  // (stop_tol, 0.02 by default — #15) and grasp()'s hold, whose guard only ends
+  // it above hold_runaway_rad (0.05 — #47).
+  const double press_park = kPosClosedRad + 0.015;
+  const double hold_park = kPosClosedRad + 0.047;  // #47's measured excursion
+
+  // A recovery that must SUCCEED is caught and reported rather than thrown out
+  // of main(). #47's own failure mode is an uncaught exception reaching
+  // std::terminate, so a regression here must fail one check, not abort the run
+  // and report nothing.
+  const auto recovers = [&](double start, const MotionConfig& cfg,
+                            const std::string& what) {
+    try {
+      FakeIo io(test_config(), start, std::nullopt, 0.0, /*stops=*/true);
+      SafetyGuard guard = make_guard();
+      MotionEngine engine(io, guard, cfg);
+      const MoveResult res = engine.open();
+      check(res.ok, what + ": ok");
+      check(!io.frames.empty() && io.frames.front().kp == 50.0,
+            what + ": ... through the recovery crawl");
+    } catch (const std::exception& e) {
+      std::printf("FAIL %s: threw %s\n", what.c_str(), e.what());
+      ++g_failures;
+    }
+  };
+
+  // #15: a park close() reports as ok = true.
+  recovers(press_park, instant_config(), "recovery: a park inside stop_tol");
+
+  // #47: a grasp that never tripped its own guard leaves the jaws here, and the
+  // 0.02 rad window used to refuse it. 0.047 rad is what grasp(20 N, 3 s) on an
+  // empty gripper measures on the shipped unit.
+  check(0.047 < instant_config().hold_runaway_rad,
+        "recovery: the #47 excursion is inside the hold's own guard");
+  check(0.047 > instant_config().stop_tol,
+        "recovery: ... and outside stop_tol, which is why it was refused");
+  recovers(hold_park, instant_config(),
+           "recovery: a hold excursion inside hold_runaway_rad");
+
+  {  // The window is hold_runaway_rad wide, not unbounded: 0.055 rad past the
+     // limit is past what any successful call may leave behind, so it is still
+     // refused rather than believed.
+    FakeIo io(test_config(), /*start_rad=*/ kPosClosedRad + 0.055,
               std::nullopt, 0.0, /*stops=*/true);
     SafetyGuard guard = make_guard();
     MotionEngine engine(io, guard, instant_config());
     check_throws<SafetyFault>(
         [&] { engine.open(); },
-        "recovery: 0.035 rad past the limit is still refused");
+        "recovery: 0.055 rad past the limit is still refused");
     check(io.frames.empty(), "recovery: that refusal sends no frame");
   }
-  {  // ...and the 0.01 floor survives a config that asks for less. It is a
-     // max(), not a replacement: the floor is what keeps a status frame
-     // quantized to the 0.0103 rad grid reading as "on its stop".
+  {  // ...and the 0.01 floor survives a config that asks for less from BOTH
+     // contributors. It is a max(), not a replacement: the floor is what keeps a
+     // status frame quantized to the 0.0103 rad grid reading as "on its stop".
     MotionConfig tight = instant_config();
     tight.stop_tol = 0.002;
-    FakeIo io(test_config(), /*start_rad=*/ parked, std::nullopt, 0.0,
+    tight.hold_runaway_rad = 0.002;
+    FakeIo io(test_config(), /*start_rad=*/ press_park, std::nullopt, 0.0,
               /*stops=*/true);
     SafetyGuard guard = make_guard();
     MotionEngine engine(io, guard, tight);
     check_throws<SafetyFault>(
         [&] { engine.open(); },
-        "recovery: a stop_tol below the floor does not narrow the window");
+        "recovery: thresholds below the floor do not narrow the window");
   }
 }
 
@@ -2575,7 +2602,7 @@ int main() {
   test_ceilings_and_refusals();
   test_recovery_from_open_stop();
   test_recovery_from_closed_stop();
-  test_recovery_window_follows_stop_tol();
+  test_recovery_window_covers_what_a_successful_call_leaves();
   test_the_shipped_calibration_spans_the_shipped_red_lines();
   test_recovery_jammed_is_fault();
   test_recovery_config_ceilings();

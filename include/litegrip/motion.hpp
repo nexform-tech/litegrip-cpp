@@ -178,6 +178,13 @@ struct MotionConfig {
   // calibrated limit, since the calibration is probed from those stops. 0.05
   // rad is the margin for a calibration that is slightly off, about 3.67 mm at
   // the factory rad_to_mm = 73.4573. A real runaway is measured in millimetres.
+  //
+  // ⚠ This is also a floor on recover_to_interior()'s window past a calibrated
+  // limit (src/motion.cpp's recovery_window_rad): the hold ends only once the
+  // excursion EXCEEDS this, so a grasp that never tripped its own guard has
+  // been declared legal out to this radius and must be a legal start for the
+  // next move. Raising it widens that window with it; lowering it does not
+  // narrow the window below stop_tol.
   double hold_runaway_rad = 0.05;
   // [Deprecated] A hold no longer uses gains (see above). Kept so an older
   // config still compiles; setting them has no effect.

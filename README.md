@@ -824,6 +824,15 @@ cycle. The crawl is bounded and inward only, at `tau = 0`, and a move that
 starts inside the red lines prints no such line and sends no crawl frames at
 all.
 
+That bound is the widest excursion a call that reported success may leave the
+jaws at: `MotionConfig::stop_tol` for `close()`'s press, `hold_runaway_rad` for
+`grasp()`'s hold, and never below the 0.01 rad quantization floor. Past it the
+move refuses with `SafetyFault: ... the measured position is outside the unit's
+own validated travel` rather than driving from a position it does not believe.
+Do not treat the two thresholds as independent: raising `hold_runaway_rad`
+widens this window with it, so the hold's guard cannot leave the jaw somewhere
+the next move refuses to start from.
+
 Both of the reference unit's rest positions sat outside the red lines, its own
 calibration putting the 80 mm work point past the open one (which fell at
 78.8 mm there), so a cycle on that unit printed four lines, one per move. Which
