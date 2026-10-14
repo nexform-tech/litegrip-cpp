@@ -2357,6 +2357,88 @@ void test_recovery_from_closed_stop() {
         "recovery: crawled below the red max");
 }
 
+void test_the_velocity_ceiling_is_decided_before_the_recovery_crawl() {
+  // #51. The README states every refusal of the positioning family comes
+  // "before any frame is sent", and the duration-implied ceiling check did
+  // not: it read the position AFTER the recovery drive-in, so a refused call
+  // had already crawled the jaws off their stop — and the distance it refused
+  // on was one the engine itself had created. On the bench, goto_mm(70.0,
+  // duration=0.05) threw as intended having already moved the jaws 4.23 mm.
+  //
+  // Start past the open stop, outside the red lines, so the crawl runs.
+  FakeIo io(test_config(), /*start_rad=*/ kPosOpenRad, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  // 0.64 rad in 0.1 s is 6.4 rad/s, four times the 1.5 rad/s ceiling.
+  check_throws<LimitViolation>(
+      [&] {
+        engine.ramp_to(-0.6, 0.0, 0.1, std::nullopt, std::nullopt, {});
+      },
+      "duration ceiling: a duration the crawl outruns is refused");
+  check(io.frames.empty(),
+        "duration ceiling: ... and the refusal sent no frame at all");
+}
+
+void test_the_duration_ceiling_is_sized_on_the_ramps_own_origin() {
+  // #51, the part a pre-crawl reading of the CALLER's position alone gets
+  // wrong: the ramp measures from where the crawl leaves the jaws — the red
+  // line — so that, not the measured start, is what the implied speed has to
+  // be computed from. Here the caller's own distance (0.015 rad to the closed
+  // stop) pays for 0.02 s with room to spare, while the ramp's real distance
+  // (0.114 rad, from the closed red line) does not. A check sized on the
+  // caller's position would pass and then throw after the crawl.
+  const double press_park = kPosClosedRad + 0.015;  // outside the red lines
+  FakeIo io(test_config(), /*start_rad=*/ press_park, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  const double caller_dist_rad = std::fabs(kPosClosedRad - press_park);
+  const double ramp_dist_rad = std::fabs(kPosClosedRad - kRedMax);
+  check(caller_dist_rad / 0.02 < kMaxCommandVelocityCeilingRadS,
+        "duration ceiling: the caller's own distance would pass");
+  check(ramp_dist_rad / 0.02 > kMaxCommandVelocityCeilingRadS,
+        "duration ceiling: ... and the ramp's distance from the red line does not");
+
+  check_throws<LimitViolation>(
+      [&] {
+        engine.ramp_to(kPosClosedRad, 0.0, 0.02, std::nullopt, std::nullopt,
+                       {});
+      },
+      "duration ceiling: sized on the ramp's origin, not the measured start");
+  check(io.frames.empty(), "duration ceiling: ... and nothing moved");
+}
+
+void test_a_duration_the_crawl_can_afford_still_runs() {
+  // The other half of #51: deciding the check before the crawl must not refuse
+  // the moves that were always fine. Same outside start, a duration the ramp's
+  // real distance can pay for (0.64 rad in 1.0 s = 0.64 rad/s, under the
+  // 1.5 rad/s ceiling), so the crawl runs and the ramp follows it.
+  FakeIo io(test_config(), /*start_rad=*/ kPosOpenRad, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  const MoveResult res =
+      engine.ramp_to(-0.6, 0.0, 1.0, std::nullopt, std::nullopt, {});
+
+  check(!io.frames.empty(), "duration ceiling: an affordable duration runs");
+  check(io.frames.front().kp == 50.0,
+        "duration ceiling: ... preceded by the recovery crawl");
+  check(res.ok && res.reached, "duration ceiling: ... and arrives");
+  // The ramp measures from the red line the crawl left the jaws at, not from
+  // the stop they started on: the first engine frame is one ramp step from the
+  // landing point, far short of the target.
+  std::size_t rec_n = 0;
+  while (rec_n < io.frames.size() && io.frames[rec_n].kp == 50.0) ++rec_n;
+  check(rec_n >= 1 && rec_n < io.frames.size(),
+        "duration ceiling: crawl then ramp");
+  check(io.frames[rec_n].q > kRedMin,
+        "duration ceiling: the ramp commands from the red line, not the stop");
+}
+
 void test_recovery_window_covers_what_a_successful_call_leaves() {
   // The window past a calibrated limit may not be narrower than the furthest a
   // call that reported SUCCESS may leave the jaws, or the next move refuses a
@@ -2602,6 +2684,9 @@ int main() {
   test_ceilings_and_refusals();
   test_recovery_from_open_stop();
   test_recovery_from_closed_stop();
+  test_the_velocity_ceiling_is_decided_before_the_recovery_crawl();
+  test_the_duration_ceiling_is_sized_on_the_ramps_own_origin();
+  test_a_duration_the_crawl_can_afford_still_runs();
   test_recovery_window_covers_what_a_successful_call_leaves();
   test_the_shipped_calibration_spans_the_shipped_red_lines();
   test_recovery_jammed_is_fault();

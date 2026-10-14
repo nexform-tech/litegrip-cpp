@@ -73,6 +73,23 @@ double recovery_window_rad(const MotionConfig& config) {
                    config.hold_runaway_rad});
 }
 
+/// Where a move that starts outside the red lines is about to leave the jaws:
+/// the red line on the side they are on, or the measured position itself when
+/// it is already inside. recover_to_interior() drives inward a crawl step at a
+/// time and stops on the first reading back inside, so that line is where the
+/// ramp behind it measures from — to within one crawl step, which is the slack
+/// anything decided BEFORE the crawl has to carry, because the crawl is a move
+/// the decision cannot undo (#51).
+double ramp_origin_rad(double measured_rad, const SafetyLimits& limits) {
+  if (measured_rad > limits.red_max_rad) {
+    return limits.red_max_rad;
+  }
+  if (measured_rad < limits.red_min_rad) {
+    return limits.red_min_rad;
+  }
+  return measured_rad;
+}
+
 /// Python's round() is half-to-even; nearbyint matches it. Ratios this large
 /// would overflow int (Python's int cannot) — clamped, because such a
 /// schedule is unreachable anyway. The 1e9 cap keeps every sum below INT_MAX.
@@ -366,19 +383,20 @@ int MotionEngine::release(double pos, const char* source) {
 // latched fault / no progress within recovery.timeout_s all throw, and not a
 // frame is sent in doubt.
 
-void MotionEngine::recover_to_interior(const char* source) {
+GripperState MotionEngine::recover_to_interior(const char* source,
+                                               const GripperState& measured) {
   const SafetyLimits& limits = safety_.limits();
   const TemporaryParams& p = limits.params;
   const double red_min = limits.red_min_rad;
   const double red_max = limits.red_max_rad;
 
-  GripperState st = io_.get_state(true);
+  GripperState st = measured;
   if (!st.has_data()) {
     throw SafetyFault(std::string(source) +
                       ": no valid feedback — motion is refused");
   }
   if (red_min <= st.position_rad && st.position_rad <= red_max) {
-    return;  // legal start; the engine takes over untouched
+    return st;  // legal start; the engine takes over untouched
   }
 
   const MotionConfig::RecoveryConfig& rec = config_.recovery;
@@ -455,7 +473,7 @@ void MotionEngine::recover_to_interior(const char* source) {
                         ": no valid feedback — recovery is refused");
     }
     if (red_min <= st.position_rad && st.position_rad <= red_max) {
-      return;  // back inside; hand over to the engine
+      return st;  // back inside; hand over to the engine
     }
   }
   throw SafetyFault(std::string(source) +
@@ -550,17 +568,47 @@ MoveResult MotionEngine::move_to_limit(
     speed_mm_s = speed_rad_s * gcfg.rad_to_mm;
   }
 
-  recover_to_interior(source);
+  // The caller's own reading, taken BEFORE the drive-in below. That drive-in is
+  // a move too, so every refusal that depends on where the jaws are has to be
+  // decided from this reading — a call that throws has not moved the hardware
+  // (#51). The reading is handed to the drive-in rather than read again, and
+  // what comes back is the position the ramp measures from.
+  GripperState before = io_.get_state(true);
+  if (!before.has_data()) {
+    throw SafetyFault(std::string(source) +
+                      ": no valid feedback — motion is refused");
+  }
+
+  // A duration is a speed once divided by the distance — and that distance is
+  // the RAMP's, which starts where the drive-in leaves the jaws, not where the
+  // caller's were. Sizing the check on the measured start alone would let the
+  // drive-in push the distance, and the speed the duration implies, up after
+  // the check had already passed. So: the ramp's own origin, plus one crawl
+  // step of slack for the drive-in stopping just inside the red line rather
+  // than on it.
+  if (duration_s.has_value()) {
+    const SafetyLimits& limits = safety_.limits();
+    double cruise_rad =
+        std::fabs(target - ramp_origin_rad(before.position_rad, limits));
+    if (!limits.contains_red(before.position_rad)) {
+      cruise_rad += std::max(0.0, config_.recovery.speed_rad_s) *
+                    config_.frame_interval;
+    }
+    if (cruise_rad / *duration_s > kMaxCommandVelocityCeilingRadS) {
+      throw LimitViolation(
+          std::string(source) +
+          ": duration_s implies a speed beyond the commanded-velocity ceiling");
+    }
+  }
+
+  // Outside the red lines, drive the jaws back inside first, at the recovery
+  // ceilings. Inside, this is a no-op returning the reading it was given.
+  before = recover_to_interior(source, before);
 
   auto scope = safety_.maintenance_scope(
       std::string(source) +
       (press ? " (press onto the stop)" : " (stop inside the limit)"));
 
-  const GripperState before = io_.get_state(true);
-  if (!before.has_data()) {
-    throw SafetyFault(std::string(source) +
-                      ": no valid feedback — motion is refused");
-  }
 
   // The schedule, verbatim from the Python engine: absolute positions from
   // the reading taken before the move (not incremental commands), so a
@@ -573,16 +621,17 @@ MoveResult MotionEngine::move_to_limit(
   // "How long this leg lasts": the distance is only known now, so that is
   // where the speed is derived. dist_mm == 0 gives speed 0 -> ramp_s 0 ->
   // ramp_steps 1, i.e. "already there" as the degenerate ramp rather than a
-  // special case. The ceiling is re-checked because the top-of-function check
-  // saw speed_mm_s == 0.
+  // special case.
+  //
+  // No ceiling check here. The pre-flight above already refused anything this
+  // duration cannot pay for over this distance, sized on where this reading
+  // lands, so this speed is under the ceiling — and re-deciding it here could
+  // only throw a call that has already moved (#51). Should the drive-in ever
+  // land further past the red line than one step, send_frame() refuses the
+  // frame rather than sending it.
   if (duration_s.has_value()) {
-    speed_mm_s = *duration_s > 0.0 ? dist_mm / *duration_s : 0.0;
+    speed_mm_s = dist_mm / *duration_s;
     speed_rad_s = speed_mm_s / gcfg.rad_to_mm;
-    if (std::fabs(speed_rad_s) > kMaxCommandVelocityCeilingRadS) {
-      throw LimitViolation(
-          std::string(source) +
-          ": duration_s implies a speed beyond the commanded-velocity ceiling");
-    }
   }
 
   const double ramp_s = speed_mm_s > 0.0 ? dist_mm / speed_mm_s : 0.0;
