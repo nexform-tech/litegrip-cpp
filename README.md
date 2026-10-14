@@ -325,6 +325,20 @@ because that is the side the feed-forward pushes. This is a **runaway detector, 
 raise `hold_runaway_rad` only if a jaw that is genuinely holding something is
 being released. The guard is off until the config is calibrated.
 
+**An empty `grasp()` can leave a jaw you have to free by hand.** With nothing
+between them the closing leg walks the jaws onto the mechanical stop and the
+hold keeps pressing there. If the calibrated closed limit is not where that stop
+actually is — a stale calibration, a drifted zero — the press carries the
+measured position past `hold_runaway_rad` beyond that limit, and the runaway
+watch ends the hold with `travel_guard` set. A hold never runs the recovery
+crawl: driving inward while squeezing would open the grip. So the jaws can be
+left past the window the next move is willing to start from, and that move then
+refuses with `SafetyFault: ... the measured position is outside the unit's own
+validated travel — automatic recovery refused, inspect the mechanism`. Freeing
+them is a manual step: `disable()` so the jaws are back-drivable, push them back
+inside the red lines, `enable()`, and carry on. That refusal is about where the
+jaws are, not about a damaged mechanism.
+
 ### Calibration
 
 See [Measure the travel](#4-measure-the-travel) for the workflow and
@@ -907,7 +921,7 @@ allows:
 | `[litegrip] MIT mode switch could not be verified; continuing anyway`, the first `init()` | Not a fault. `init()` disables the motor, asks it to switch to MIT mode, then reads the mode register back to confirm; a unit that is already in MIT, or that answers that read late, produces this line on a healthy link. The enable-and-hold that follows is what actually proves the link, so `init()` prints it and carries on — an `init()` that returns `true` after this line has done its job. |
 | `open()` or `close()` returns `ok = false` with the jaw far from the stop | Something blocked the travel. `protection_tripped` set means the travel-leg torque protection ended the move and let go on purpose. |
 | A `goto` returns `ok = false` with `released = true` | The move fell short and the engine took the force off rather than leaving the drive pressing. Check what is in the travel. |
-| `GraspResult::travel_guard` is set | The runaway watch tripped: the measured position walked past the closed-side calibrated limit. See [Gripping and force](#gripping-and-force). |
+| `GraspResult::travel_guard` is set | The runaway watch tripped: the measured position walked past the closed-side calibrated limit. See [Gripping and force](#gripping-and-force). An empty `grasp()` can leave the jaws there, and if they are past the recovery window the next move refuses with `... outside the unit's own validated travel` until you `disable()`, push them back inside the red lines by hand, and `enable()`. |
 | `open()` stops short of the full travel | A work stroke is configured — that is what it is for. See [The work stroke](#the-work-stroke). |
 | `CommError: CAN send timeout ...` | The send buffer stayed full for the whole retry window, so a frame did **not** go out. High bus load or a wedged interface; the SDK reports it instead of dropping the frame quietly. |
 | `SafetyFault: ...: no valid feedback — motion is refused` | No fresh status frame. A disabled motor does not stream them; `refresh_status()` asks for one. |
