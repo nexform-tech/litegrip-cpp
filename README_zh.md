@@ -293,6 +293,17 @@ MotionConfig::press_safety`（0.9，于是压出的力矩落在设定值之下�
 这是**失控探测，不是精度约束**：只有确实夹着东西的夹爪被放开时，才该调大
 `hold_runaway_rad`。未标定时护栏不启用。
 
+**空载的 `grasp()` 可能留下一个得用手弄出来的夹爪。** 两指之间什么都没有时，
+闭合段会把夹爪顶到机械限位上，保力段继续压在那里。如果标定出来的闭合限位不在
+那个止挡实际所在的位置 —— 标定过期、零点漂移 —— 这一压就会把实测位置推到该限位
+之外 `hold_runaway_rad` 以上，越位护栏随即截断保力、`travel_guard` 置位。保力段
+从不走回收爬行：一边夹着一边朝内爬会把夹住的东西松开。于是夹爪可能被留在下一次
+运动愿意出发的窗口之外，下一次运动随即抛 `SafetyFault: ... the measured position
+is outside the unit's own validated travel — automatic recovery refused, inspect
+the mechanism`。把它弄出来是个手动步骤：`disable()` 让夹爪能被手掰动，用手把夹爪
+推回红线之内，再 `enable()`，然后照常继续。这个拒绝说的是夹爪现在的位置，不是机构
+坏了。
+
 ### 标定
 
 工作流见 [量出行程](#4-量出行程)，其它方式见 [其它标定方式](#其它标定方式)。
@@ -791,7 +802,7 @@ gripper.close();                                         // 应该是合上，�
 | 第一次 `init()` 打 `[litegrip] MIT mode switch could not be verified; continuing anyway` | 不是故障。`init()` 先失能电机、再让它切到 MIT 模式，然后回读模式寄存器确认；电机本来就在 MIT 模式、或者这次回读答得晚，链路正常时也会出这一行。真正证明链路的是紧接着的使能并持位，所以 `init()` 打完这行照常继续 —— 这行之后 `init()` 返回 `true`，说明它该做的都做了。 |
 | `open()` 或 `close()` 返回 `ok = false`，而夹爪离止点很远 | 有东西挡住了行程。`protection_tripped` 置位说明是行进段力矩保护有意失力的。 |
 | 某个 `goto` 返回 `ok = false` 且 `released = true` | 没到位，引擎把力撤了，而不是留在那里压着。查行程里有什么。 |
-| `GraspResult::travel_guard` 置位 | 越位护栏触发：实测位置越过了闭合侧标定限位。见 [夹取与力控](#夹取与力控)。 |
+| `GraspResult::travel_guard` 置位 | 越位护栏触发：实测位置越过了闭合侧标定限位。见 [夹取与力控](#夹取与力控)。空载的 `grasp()` 会把夹爪留在那里，位置若在回收窗口之外，下一次运动就抛 `... outside the unit's own validated travel`，直到你 `disable()`、用手把夹爪推回红线内、再 `enable()`。 |
 | `open()` 没走满行程 | 配置了工作行程 —— 那正是它的用途。见 [工作行程](#工作行程)。 |
 | `CommError: CAN send timeout ...` | 发送缓冲在整个重试窗口里一直是满的，所以有一帧**没有**发出去。总线负载过高，或接口卡死；SDK 报出来而不是悄悄丢掉。 |
 | `SafetyFault: ...: no valid feedback — motion is refused` | 没有新的状态帧。未使能的电机不流状态帧；`refresh_status()` 可以要一帧。 |
