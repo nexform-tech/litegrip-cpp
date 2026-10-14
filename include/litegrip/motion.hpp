@@ -592,6 +592,11 @@ class MotionEngine {
   /// positive `speed_mm_s` nor a `force_n` (a force-carrying approach's speed
   /// budget comes from the setpoint). `kp`/`kd` override the config gains for
   /// every frame this leg emits. Mirrors _move_to_limit.
+  ///
+  /// The ceiling a `duration_s` implies is refused before the recovery drive-in
+  /// can move the jaws, sized on where the ramp will start — the red line, when
+  /// the caller's start is outside it (#51). A call that throws has not moved
+  /// the hardware.
   MoveResult move_to_limit(Toward toward, double speed_mm_s, bool press,
                            std::optional<double> target_rad,
                            std::optional<double> force_n, const char* source,
@@ -644,9 +649,18 @@ class MotionEngine {
   int release(double pos, const char* source);
 
   /// The recovery channel, engine-side (see the header comment). No-op when
-  /// the measured position is already inside the red lines; otherwise drives
-  /// inward under the recovery_scope mode until it is, or throws.
-  void recover_to_interior(const char* source);
+  /// `measured` is already inside the red lines; otherwise drives inward under
+  /// the recovery_scope mode until it is, or throws.
+  ///
+  /// `measured` is the caller's own fresh reading, handed in rather than read
+  /// here, and the return value is the reading the ramp behind this must
+  /// measure from: the same one when no crawl was needed, the post-crawl one
+  /// otherwise. Handing it in is also what lets move_to_limit() decide its
+  /// refusals first — they depend on where the jaws are, and this function
+  /// MOVES them, so a refusal decided afterwards has already driven the
+  /// hardware (#51).
+  GripperState recover_to_interior(const char* source,
+                                   const GripperState& measured);
 
   /// Enabled + guard latch, shared by every motion entry.
   void check_entry(const char* source);
