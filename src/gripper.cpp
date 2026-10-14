@@ -917,8 +917,15 @@ GripperState LiteGrip::get_state(bool wait) {
   }
 
   if (wait) {
-    bus_->update_state(0.05);
+    // Waits the staleness horizon, not something shorter: a miss then means the
+    // snapshot is past kStaleAfterS, so the reading is one is_stale() reports
+    // as stale rather than a cached value returned as fresh. See
+    // await_fresh_state.
+    await_fresh_state(
+        [this](double budget) { return bus_->update_state(budget); });
   } else {
+    // wait = false asks for the cached snapshot by design, so there is nothing
+    // to make honest here.
     bus_->poll(0.0);
   }
 

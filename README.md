@@ -192,7 +192,7 @@ moved-from object is left disconnected and inert.
 | `connect()` → `bool` | Opens the bus and registers the motor; `mst_id` is auto-detected when unset. |
 | `disconnect()` → `void` | Closes the bus, disabling the motor first unless `disable_on_disconnect()` is false. |
 | `poll(timeout_s=0.0)` → `bool` | Reads one frame; `true` if one arrived. |
-| `get_state(wait=true)` → `GripperState` | Position, velocity, torque, temperature, error bits. `wait=true` asks for a fresh frame. |
+| `get_state(wait=true)` → `GripperState` | Position, velocity, torque, temperature, error bits. `wait=true` waits for a fresh frame for up to `kStaleAfterS` (0.5 s). |
 | `get_position_mm()` / `get_position_rad()` → `double` | Measured opening. |
 | `get_force()` → `double` | `get_torque()` × 10, in N (not force-calibrated — see [Gripping and force](#gripping-and-force)). |
 | `get_torque()` → `double` | Measured torque, Nm. |
@@ -206,6 +206,13 @@ moved-from object is left disconnected and inert.
 A disabled motor does not stream status frames, so a cached snapshot may hold
 constructor defaults — check `GripperState::is_stale()` / `data_age_s` before
 trusting it, or call `refresh_status()` first.
+
+`wait=true` waits the staleness horizon and not less, so a miss and
+`is_stale()` cannot disagree: if no frame arrived while the call waited, the
+snapshot is older than `kStaleAfterS`, `is_stale()` is true, and the call warns
+on stderr. On a gripper that is not streaming, `get_state()` therefore takes
+the full 0.5 s before reporting that — use `wait=false` for the cached read by
+design, and `refresh_status()` to force a frame rather than wait for one.
 
 ### Enable and faults
 

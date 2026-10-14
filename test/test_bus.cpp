@@ -190,6 +190,30 @@ int main() {
           "refresh: an attempt gets half the caller's budget");
   }
 
+  // ── a wait = true state read waits the staleness horizon ───────────────
+  //
+  // #50: the wait and is_stale() have to describe the same thing. A wait
+  // shorter than kStaleAfterS can come back empty-handed while the snapshot it
+  // returns is still younger than the horizon — is_stale() false — so a cached
+  // read is handed back as a measurement and the guard the README documents
+  // misses it. Waiting the horizon is what makes a miss mean "stale".
+  {
+    double budget = -1.0;
+    const bool fresh =
+        litegrip::await_fresh_state([&](double b) { budget = b; return true; });
+    check(budget == litegrip::kStaleAfterS,
+          "state wait: the budget handed to the wait is the staleness horizon");
+    check(fresh, "state wait: an arriving frame is reported fresh");
+  }
+  {
+    double budget = -1.0;
+    const bool miss =
+        litegrip::await_fresh_state([&](double b) { budget = b; return false; });
+    check(budget == litegrip::kStaleAfterS,
+          "state wait: a miss waits the whole horizon before answering");
+    check(!miss, "state wait: a miss is reported as not fresh");
+  }
+
   if (g_failures != 0) {
     std::cerr << g_failures << " bus check(s) failed\n";
     return 1;
