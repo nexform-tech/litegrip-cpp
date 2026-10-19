@@ -3,7 +3,7 @@
 **C++ SDK** for the LiteGrip adaptive two-finger gripper, and the interface
 reference for it: what each call is, what it returns, and what it refuses.
 
-**English** · [简体中文](README_zh.md)
+**English** · [简体中文](README.zh-CN.md)
 
 The bottom layer of the litegrip stack. Read this to build the SDK, bring a
 gripper up, and drive it from your own program. It speaks SocketCAN and the
