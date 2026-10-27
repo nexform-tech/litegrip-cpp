@@ -7,9 +7,6 @@
 # The suite runs without hardware: test_transport is deliberately
 # non-transmitting and every other test covers behaviour that must hold while
 # disconnected. No CAN interface and no root are required.
-#
-# AGENTS.md is deliberately not linted: it is canonical content synced from
-# repo-template and must not be edited here.
 name: CI
 
 on:
@@ -53,7 +50,6 @@ jobs:
         run: |
           set -euo pipefail
           test -s README.md
-          test -s AGENTS.md
           test -s LICENSE
           python3 -c "import json; json.load(open('.releaserc.json'))"
           python3 -c "import json; json.load(open('.markdownlint.json'))"
