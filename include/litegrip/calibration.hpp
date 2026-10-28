@@ -16,9 +16,10 @@
 // every LiteGrip ships at CAN id 0x08, so on a two-gripper machine the channel
 // is the only identity key (see LiteGrip::load_calibration).
 //
-// Mount templates (normal.json / reverse.json) declare a direction by name and
-// never fall back to the factory file — the fallback would be a *normal*
-// mount, which is exactly what a "reverse" request must not silently become.
+// Mount templates (normal.json / reverse.json) are deprecated and kept for
+// backward compatibility: shipped units are normal mount and the factory
+// calibration already describes them. A template declares a direction by name
+// and never falls back to the factory file.
 
 #pragma once
 
@@ -93,12 +94,15 @@ std::vector<std::string> ignored_local_calibrations(
 /// error message can name a path to act on. Mirrors gripper._FACTORY_CALIB.
 std::string factory_calibration_path();
 
-/// Names of the packaged mount templates, in declaration order.
+/// Deprecated: names of the packaged mount templates, in declaration order.
 ///
-/// A template declares a *direction* — which end of the travel is closed — and
-/// nothing else. It deliberately carries no channel, CAN ids or gains: adopting
-/// a device identity or a tuning from a file that exists to state a direction
-/// would silently rewrite what the caller set. Mirrors gripper.list_templates().
+/// Kept for backward compatibility. Shipped units are normal mount and the
+/// factory calibration already describes them, so a caller does not select a
+/// mount. A template declares a *direction* — which end of the travel is
+/// closed — and nothing else. It deliberately carries no channel, CAN ids or
+/// gains: adopting a device identity or a tuning from a file that exists to
+/// state a direction would silently rewrite what the caller set. Mirrors
+/// gripper.list_templates().
 std::vector<std::string> list_calibration_templates();
 
 /// The locations searched for a packaged data file, strongest first, for a
@@ -117,12 +121,12 @@ std::vector<std::string> calibration_data_candidates(
 std::string resolve_calibration_data_file(const std::string& relative,
                                           const std::string& program_dir);
 
-/// Path of a packaged mount template.
+/// Deprecated: path of a packaged mount template, kept for compatibility.
 ///
-/// Found by the same search as factory_calibration_path(). Throws CommandError
-/// for an unknown name — never falls back to the factory file. The factory file
-/// is a *normal* mount, so answering a request for "reverse" with "normal" is
-/// precisely the failure the template name exists to prevent. Mirrors
+/// Shipped units are normal mount and the factory calibration already
+/// describes them, so new code should not select a template. Found by the same
+/// search as factory_calibration_path(). Throws CommandError for an unknown
+/// name — never falls back to the factory file. Mirrors
 /// gripper._resolve_template().
 std::string calibration_template_path(const std::string& name);
 

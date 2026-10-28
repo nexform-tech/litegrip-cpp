@@ -136,8 +136,8 @@ int main() {
 往下走之前先知道两件事：
 
 - **出厂标定就是默认。** 不带参数的 `load_calibration()` 读的是 SDK 里随包的
-  标定文件，它描述的是出货的那批机器（正装）。只有当你手上有别的标定文件时才
-  需要指名它 —— 见 [标定](#标定)。
+  标定文件，它描述的就是出货的那批机器。只有当你手上有别的标定文件时才需要
+  指名它 —— 见 [标定](#标定)。
 - **标定载入之前什么都不会动。** 在未标定的配置上，每个运动方法都抛
   `CommandError`，因为占位限位描述的不是任何真实行程。
 
@@ -163,7 +163,7 @@ static LiteGrip connect_raii(GripperConfig config = GripperConfig{});
 | --- | --- |
 | `channel()`、`can_id()`、`mst_id()` | 这个实例驱动的身份 |
 | `config()` | `GripperConfig` —— 限位、比例、增益（const 重载读它） |
-| `mount()` | 配置上的：`"normal"`、`"reverse"`，标定之前是 `nullopt` |
+| `mount()` | **已弃用**，保留只为兼容；从限位读回的旧标签 —— 已标定的出货机器恒为 `"normal"`，标定之前是 `nullopt` |
 | `is_connected()`、`is_enabled()` | 会话状态 |
 | `disable_on_disconnect()` | `disconnect()` 是否先失能电机（默认是） |
 | `safety()` | 当前生效的 `SafetyGuard`，供诊断 |
@@ -223,8 +223,8 @@ stderr 报警。对不流状态帧的夹爪，`get_state()` 会先耗满这 0.5 
 | `enter_zero_gravity(duration_s=0.0)` / `exit_zero_gravity()` → `void` | 电机仍使能但不输出力矩，可被手掰动。任何运动指令都会恢复常规控制。 |
 
 凡是接受 `kp` / `kd` 的调用，留空都会回落到 `GripperConfig::kp`（`100.0` ——
-占位默认值与出货标定在这一点上一致，安装模板则根本不带增益，所以三个入口描述
-的是同一台机器）与 `.kd`（`2.0`）。
+占位默认值与出货标定在这一点上一致，所以两者描述的是同一台机器）与 `.kd`
+（`2.0`）。
 
 **同一条斜坡，三种说法。** 每一个定位调用 —— `goto` 一族和 `move_at_speed`
 一族一样 —— 跑的都是同一条斜坡，每帧一个 `MotionConfig::frame_interval`，
@@ -320,9 +320,9 @@ the mechanism`。把它弄出来是个手动步骤：`disable()` 让夹爪能被
 | `calibrate_guided(kp=60.0, kd=2.0, step_rad=0.08, stall_delta=0.0004, stall_cycles=6, max_iter=40, tau_limit=2.0)` → `CalibrationData` | 引导式两步探测，先探张开侧，护栏同前。 |
 | `calibrate_manual(duration=30.0, settle_time=2.0, sample_interval=0.01)` → `CalibrationData` | 手把手教：进入零重力模式，由人推动两爪走满行程，采样两个极值。 |
 | `save_calibration(path=None)` → `std::string` | 持久化当前标定；返回写入的路径。不给 `path` 就写本通道自己的文件。 |
-| `load_calibration(path=None)` → `bool` | 把标定载入配置 —— 见 [长期可用](#长期可用)。 |
-| `load_template(name)` → `bool` | 按名字载入随包安装模板（`"normal"` / `"reverse"`），它**声明**安装方向。严格：名字不认识就抛 `CommandError`，绝不回退。 |
-| `list_calibration_templates()` | `load_template()` 接受的全部名字，供 UI 列举。 |
+| `load_calibration(path=None)` → `bool` | 把标定载入配置 —— 见 [长期可用](#长期可用) 与 [使用自己标定出来的文件](#使用自己标定出来的文件)。 |
+| `load_template(name)` → `bool` | **已弃用**，保留只为兼容旧调用；出货机器只有一种装法，出厂标定已经描述了它。 |
+| `list_calibration_templates()` | **已弃用**，保留只为兼容；仍返回 `["normal", "reverse"]`。 |
 
 ### 读结果
 
@@ -514,9 +514,9 @@ rad_to_mm = (max_stroke_mm + GripperGeometry::kStopInsetMm) / 探到的跨度_ra
 ### 方向只能沿用，探不出来
 
 堵转只说明「有东西挡住了」，而两端都是硬限位，读数里没有「撞的是哪一端」这条
-信息。探测器从 `GripperConfig::close_sign()` 取方向，所以反装的机器必须先
-[声明自己](#反装)；`calibrate_manual()` 同样按这条规则给两个极值定性，而不是按
-哪个数值更大。
+信息。探测器从标定限位取方向（`GripperConfig::close_sign()`）；`calibrate_manual()`
+同样按这条规则给两个极值定性，而不是按哪个数值更大。出货机器的方向已经写在
+出厂标定里，不需要你来选。
 
 ### 工作行程
 
@@ -556,8 +556,8 @@ Python SDK 那份还会在操作员按回车时提前返回，这里暂无对应
 
 `save_calibration()` 把当前配置写进本通道自己的文件
 （`~/.litegrip/<channel>_calibration.json`）。不带参数的加载**不会**把它读回来
-—— 写的时候它会说明这一点 —— 想让下次运行用上它，要么把 `LITEGRIP_CALIB`
-指过去，要么把它作为路径传给 `load_calibration()`。
+—— 写的时候它会说明这一点 —— 想让下次运行用上它，按
+[使用自己标定出来的文件](#使用自己标定出来的文件) 的步骤做。
 
 ### 长期可用
 
@@ -572,17 +572,81 @@ Python SDK 那份还会在操作员按回车时提前返回，这里暂无对应
 还丢掉工作行程。
 
 出厂文件声明的是 `channel: can0`，所以一台没有自己标定的 `can1` 机器会**大声
-失败**，而不是悄悄采用 `can0` 的方向：声明了别的通道的候选文件会被**跳过**。
-给 `can1` 一台自己的标定，要么 `load_template("normal")` —— 模板按名字载入、
-不看通道 —— 要么自己跑一次 `zero()`，然后把那份文件指名给 `load_calibration()`，
-或用 `LITEGRIP_CALIB` 钉住它。
+失败**，而不是悄悄采用 `can0` 的标定：声明了别的通道的候选文件会被**跳过**。
+给 `can1` 一台自己的标定：自己跑一次 `zero()`，然后把那份文件指名给
+`load_calibration()`，或用 `LITEGRIP_CALIB` 钉住它 —— 见
+[使用自己标定出来的文件](#使用自己标定出来的文件)。
 
-SDK 从不猜方向：标定或模板载入之前，每个运动入口都抛 `CommandError`（见
+SDK 从不猜方向：标定载入之前，每个运动入口都抛 `CommandError`（见
 [排错](#排错)）。
+
+### 使用自己标定出来的文件
+
+`zero()` 把结果写进本通道自己的文件 `~/.litegrip/<channel>_calibration.json`，
+也就是 `default_calibration_path(channel)` 的返回值（设了 `$LITEGRIP_CALIB` 时
+是它）。`calibrate()`、`calibrate_guided()`、`calibrate_manual()` 只返回结果，
+要用它们的结果落盘得自己调 `save_calibration()`。
+
+不带参数的 `load_calibration()` 只读 `$LITEGRIP_CALIB`（设了的话），再读随包的
+出厂标定，别的都不读。它**不会**自动读 `zero()` 刚存下的那份文件；下次运行必须
+显式指名。
+
+最直接的方式，是把 `save_calibration()` 的落点再传回 `load_calibration()`：
+
+```cpp
+#include <cstdio>
+#include <string>
+#include <litegrip/litegrip.hpp>
+
+int main() {
+  litegrip::GripperConfig cfg;
+  auto gripper = litegrip::LiteGrip::connect_raii(cfg);
+  const std::string path =
+      litegrip::default_calibration_path(gripper.channel());
+  if (!gripper.load_calibration(path)) return 1;
+  if (!gripper.init()) return 1;
+  gripper.open();
+  return 0;
+}
+```
+
+多台夹爪、或者不想在每个程序里写路径时，用环境变量指向它：
+
+```bash
+export LITEGRIP_CALIB="$HOME/.litegrip/can0_calibration.json"
+```
+
+```cpp
+if (!gripper.load_calibration()) return 1;  // 先读 LITEGRIP_CALIB，再读出厂文件
+```
+
+四条规则决定那份文件会不会被读：
+
+- **`path` 能读任意路径的 JSON。** 它不限于 `<channel>_calibration.json`；那个名字只是 `save_calibration()` 的默认落点。不带参数的加载既不扫 `~/.litegrip/`，也不猜文件名，所以不要把标定文件改名后指望它被自动接上。
+- **`LITEGRIP_CALIB` 里的 `channel` 必须与本实例一致。** 不一致时，不带参数的加载会跳过它、转而读出厂文件，而出厂文件也要过同一道检查；在 `can1` 上这意味着一份都载入不了，调用返回 `false`。显式 `path` 不做这个跳过，只在通道不一致时告警。
+- **`path` 读不到那个文件时会回落到出厂标定，而且仍可能返回 `true`。** 只要随包的出厂文件读得出来，显式路径缺失或格式不对都不会让加载失败。
+- **加载总会打印实际用了哪份文件。** 日志里的 `[litegrip] calibration loaded from <路径>` 就是赢家。不要只看返回值，看这一行。
+
+加载后、让夹爪运动之前，核对一遍：
+
+```cpp
+#include <cmath>
+#include <cstdio>
+#include <litegrip/litegrip.hpp>
+
+const litegrip::GripperConfig& cfg = gripper.config();
+std::printf("calibrated=%d travel=%.2f mm\n", cfg.calibrated,
+            std::abs(cfg.pos_open_rad - cfg.pos_closed_rad) * cfg.rad_to_mm);
+```
+
+`calibrated` 必须是 `true`；为 `false` 时每个运动方法都抛 `CommandError`，所以
+这项检查同时也是运动前的闸门。行程数应当对得上你量出的卡尺读数，而不是出厂的
+85 mm。
 
 ### 随包文件在哪里找
 
-出厂标定和安装模板都是**随包**文件。SDK 先到**运行中的程序旁边**找，所以装好
+出厂标定是**随包**文件。已弃用的安装模板同样随包发布，只为让旧调用继续能跑。
+SDK 先到**运行中的程序旁边**找，所以装好
 之后的 SDK 不管从哪个工作目录运行，都能找到自己的基线：
 
 ```text
@@ -602,38 +666,23 @@ SDK 从不猜方向：标定或模板载入之前，每个运动入口都抛 `Co
 `litegrip_cpp_DATA_DIR`。什么都找不到时 `load_calibration()` **返回 `false`**，
 并先把它试过的路径打出来 —— 记得检查返回值。
 
-## 反装
+## 已弃用的安装方向选择
 
 **出货的机器都是正装** —— 闭合时电机读数增大 —— SDK 随包的出厂标定描述的就是
-这种机器。正装什么都不用声明：上面的 `load_calibration()` 就会给到正确的方向，
-快速上手那步再确认一次。`load_template("normal")` 是有的，但用出厂硬件的人不
-需要调它。
+这种机器。不带参数的 `load_calibration()` 因此会给出正确的方向，你不需要选装法。
 
-电机反着装的机器是**反装**，对它来说闭合意味着读数*减小*。SDK 不假定任何一边，
-方向由两个标定限位的先后顺序推出。若你的是反装，按名字声明：
+下面这些符号只为让旧代码继续编译、继续运行而保留，均已弃用：
 
-```cpp
-litegrip::GripperConfig cfg;
-auto gripper = litegrip::LiteGrip::connect_raii(cfg);
-gripper.load_template("reverse");
-gripper.init();
-std::printf("%s\n", gripper.config().mount()->c_str());  // "reverse" —— 读回来的
-gripper.close();                                         // 应该是合上，不是张开
-```
+- `load_template(name)` —— 按名字载入随包安装模板。名字不在
+  `list_calibration_templates()` 里就抛 `CommandError`；模板读不出来时绝不回退
+  到出厂文件。
+- `list_calibration_templates()` / `calibration_template_path(name)` —— 模板的
+  名字与路径，保留只为兼容。
+- `GripperConfig::mount()` —— 从限位读回的旧标签（`"normal"`、`"reverse"`，或
+  标定之前的 `nullopt`）。
 
-若它反而张开，说明这台其实是正装 —— 去掉那一行即可。
-
-`list_calibration_templates()` 返回 SDK 接受的全部名字，供 UI 列举。名单之外的
-名字抛 `CommandError` 并列出合法值；模板读不出来时**绝不**回退出厂文件 ——
-出厂文件是正装，把「反装」静默地答成「正装」正是这个名单要防的那件事。
-
-`GripperConfig::mount()` 读回 `"normal"`、`"reverse"`，或者在标定/模板载入
-之前返回 `nullopt` —— 在那之前报「正装」会是一个声明，而不是一个读数（见
-[长期可用](#长期可用)）。
-
-即便模板的几何还不是你这台，拿它跑一个动作也是安全的：`open()` / `close()`
-从不把指令发到标定行程之外，所以方向搞反也不会把夹爪开出止点，只会朝反方向
-走，一眼就能看出来。
+新代码用不带参数的 `load_calibration()` 或显式路径；见
+[使用自己标定出来的文件](#使用自己标定出来的文件)。
 
 **方向是怎么表示的。** 两个标定限位本身就携带方向：数值大的那一端是闭合侧，
 所有 mm / 力的换算符号都由这个顺序推出（`GripperConfig::close_sign()`）。方向
@@ -795,14 +844,13 @@ gripper.close();                                         // 应该是合上，�
 | 现象 | 原因与处理 |
 | --- | --- |
 | `ConnectError: CAN interface 'can0' not found` | 接口没起，或适配器没加载。跑第 2 步；用 `ip link show can0` 查。 |
-| `CommandError: not calibrated: pos_closed_rad / pos_open_rad are still the placeholder defaults ...` | 没有载入标定也没有载入模板，哪一端是闭合侧无从判断。跑 `load_calibration()`、`load_template(...)` 或第 4 步的 `zero()`。 |
+| `CommandError: not calibrated: pos_closed_rad / pos_open_rad are still the placeholder defaults ...` | 没有载入标定，哪一端是闭合侧无从判断。跑不带参数的 `load_calibration()`，或第 4 步的 `zero()`。 |
 | `load_calibration()` 打印 "no calibration found" 并返回 `false` | `$LITEGRIP_CALIB` 和随包的出厂文件都读不到。出厂文件那个把 `$LITEGRIP_DATA_DIR` 指向放着 `calibration/` 的目录即可 —— [安装](#安装)之后是 `$HOME/.local/share/litegrip_cpp`。 |
 | `local calibration not read: ...`，每次不带参数的 `load_calibration()` | 本机存着一份你没指名的标定时的正常提示。不带参数的加载只读出厂文件，所以这次跑用的是随包基线。把那份文件指名，或把 `LITEGRIP_CALIB` 设成它。 |
-| `GripperConfig::mount()` 返回 `nullopt` | 同一件事，只是还没走到报错：标定或模板载入之前不报方向。 |
+| `GripperConfig::mount()` 返回 `nullopt` | 同一件事，只是还没走到报错：这个已弃用的旧标签在标定载入之前不报方向。 |
 | 随包文件上 `goto_mm()` 不动，或 `home()` 抛异常 | 用了定位一族还没搬上引擎斜坡之前的旧二进制。重新构建；`home()` 的目标在闭侧红线之外，那正是旧闸门拒绝的东西。 |
 | `CommandError: ... is not a finite number ...`，或 `LimitViolation: ... speed ... exceeds the commanded-velocity ceiling` | 目标值/速率是 NaN、inf，或者斜坡的速度超过 1.5 rad/s —— 无论是直接给的还是由 `duration_s` 蕴含的。刻意在入口拒绝 —— 一帧都没发。 |
 | `CommandError: goto_rad: dq_target is not accepted ...` | 传 0。斜坡自己排速度前馈，调用方给的值会跟它打架。 |
-| 夹爪朝反方向动 | 安装方向问题。见 [反装](#反装)：正装什么都不用声明，反装调 `load_template("reverse")`。 |
 | 每次运动都打 `[litegrip] entering a safety mode: ... recovering from outside the red lines` | 随包文件下这是预期行为，不是故障。开/闭循环的两个停驻位置都在红线之外，所以每次运动先把爪子爬回红线内 —— 见 [每轮都报回收是正常的](#每轮都报回收是正常的)。 |
 | 第一次 `init()` 打 `[litegrip] MIT mode switch could not be verified; continuing anyway` | 不是故障。`init()` 先失能电机、再让它切到 MIT 模式，然后回读模式寄存器确认；电机本来就在 MIT 模式、或者这次回读答得晚，链路正常时也会出这一行。真正证明链路的是紧接着的使能并持位，所以 `init()` 打完这行照常继续 —— 这行之后 `init()` 返回 `true`，说明它该做的都做了。 |
 | `open()` 或 `close()` 返回 `ok = false`，而夹爪离止点很远 | 有东西挡住了行程。`protection_tripped` 置位说明是行进段力矩保护有意失力的。 |

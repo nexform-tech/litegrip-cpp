@@ -111,9 +111,9 @@ struct ProbeCalibration {
 ///
 /// `close_sign` says which end is closed. It is never discovered here — a stall
 /// only says "something stopped me", and both ends are hard stops — so it is
-/// taken from the config and preserved; a reverse-mounted unit must have loaded
-/// a template (or a calibration) first. The order the two probes run in is the
-/// order LiteGrip assigns the limits in, which is what `close_sign` reads back.
+/// taken from the config and preserved; load a calibration first. The order the
+/// two probes run in is the order LiteGrip assigns the limits in, which is what
+/// `close_sign` reads back.
 ///
 /// @throws CommError the two stops coincided, so no scale could be derived.
 ProbeCalibration probe_calibrate(ProbeIo& io, const ProbeConfig& config,

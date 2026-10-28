@@ -127,7 +127,7 @@ class LiteGrip : private MotionIo {
   // ── motion ────────────────────────────────────────────────────────────
 
   /// Move to the closed (zero) position: this instance's calibrated closed
-  /// limit, so a reverse-mounted gripper homes to the correct end.
+  /// limit, so the target follows the direction the calibration declares.
   ///
   /// An ordinary positioning ramp (see goto_rad), so `ok` is reached &&
   /// !stalled. Not a press: close() aims past the calibrated limit to press the
@@ -245,8 +245,8 @@ class LiteGrip : private MotionIo {
   ///
   /// The direction is NOT discovered — a stall only says something stopped the
   /// jaws, and both ends are hard stops. It comes from the config's close_sign,
-  /// so a reverse-mounted unit must have loaded a template (or a calibration)
-  /// first, and the result preserves that declaration.
+  /// so load a calibration first; the result preserves the direction it
+  /// declares. On shipped units the factory calibration already supplies it.
   ///
   /// Two independent guards keep the probe from pressing the structure apart
   /// (see probe.hpp): the command lead is re-derived from the measured position
@@ -292,8 +292,8 @@ class LiteGrip : private MotionIo {
   /// Calibrate by hand-moving the gripper while it is in zero-torque mode.
   ///
   /// Which of the two extremes the hand reaches is the closed limit follows the
-  /// mount's declared direction (close_sign), not which reading is numerically
-  /// larger — so this is the routine to use on a reverse-mounted unit.
+  /// direction the calibration declares (close_sign), not which reading is
+  /// numerically larger.
   CalibrationData calibrate_manual(double duration = 30.0,
                                    double settle_time = 2.0,
                                    double sample_interval = 0.01);
@@ -310,11 +310,12 @@ class LiteGrip : private MotionIo {
   /// warning on stderr says so at save time.
   std::string save_calibration(std::optional<std::string> path = std::nullopt);
 
-  /// Load calibration into config. Two of the three ways to say which file:
+  /// Load calibration into config. Two ways to say which file:
   ///
-  ///  * `path` — an explicit file, which may be anywhere (including a
-  ///    template's path). Falls back to the packaged factory calibration when
-  ///    that file cannot be read.
+  ///  * `path` — an explicit file, which may be anywhere. Falls back to the
+  ///    packaged factory calibration when that file cannot be read, and may
+  ///    still return true when it does. A channel mismatch is only warned
+  ///    about, not skipped.
   ///  * no argument — `$LITEGRIP_CALIB` when it is set, then the packaged
   ///    factory calibration, and nothing else. A calibration measured on this
   ///    machine is never picked up by accident: name it with `path`, or point
@@ -325,21 +326,21 @@ class LiteGrip : private MotionIo {
   ///    calibration — every LiteGrip ships at CAN id 0x08, so the channel is
   ///    the only identity key.
   ///
-  /// load_template() is the third way: declaring the mount by name.
-  ///
   /// The limits in the file decide the direction: whichever of the two is
   /// numerically larger is the closed side (see GripperConfig::close_sign()).
   /// Call after connect() and before enable().
   bool load_calibration(std::optional<std::string> path = std::nullopt);
 
-  /// Load a packaged mount template by name — see
-  /// list_calibration_templates(): "normal" / "reverse" — which *declares* the
-  /// mount direction.
+  /// Deprecated: load a packaged mount template by name. Kept for backward
+  /// compatibility only.
+  ///
+  /// Shipped units are normal mount and the factory calibration already
+  /// describes them, so new code uses a no-argument load_calibration() or an
+  /// explicit path instead of selecting a mount. Names come from
+  /// list_calibration_templates().
   ///
   /// Strict: an unknown name or an unreadable template throws CommandError
-  /// instead of falling back. The fallback would be the factory file, and
-  /// that file is a *normal* mount, so answering a request for reverse with
-  /// normal is the one failure the name exists to prevent.
+  /// instead of falling back to the factory file.
   bool load_template(const std::string& name);
 
   // ── state ─────────────────────────────────────────────────────────────
