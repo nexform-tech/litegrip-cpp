@@ -502,13 +502,11 @@ CalibrationData LiteGrip::calibrate(double kp, double kd, double step_rad,
   const double initial = bus_->get_position();
   // The direction is NOT discovered here: a stall only says something stopped
   // the jaws, never which end was hit — both ends are hard stops. It comes from
-  // close_sign (load a template or a calibration first for a reverse mount) and
-  // this routine preserves it.
+  // close_sign (from the loaded calibration), and this routine preserves it.
   const double s = config_.close_sign();
   std::printf(
-      "[litegrip] calibrate: initial position %.4f rad (%s mount, close_sign "
-      "%+.0f)\n",
-      initial, s > 0.0 ? "normal" : "reverse", s);
+      "[litegrip] calibrate: initial position %.4f rad (close_sign %+.0f)\n",
+      initial, s);
 
   const ProbeConfig probe{kp, kd, step_rad, stall_delta, stall_cycles, max_iter,
                           tau_limit};
@@ -566,8 +564,7 @@ CalibrationData LiteGrip::calibrate_guided(double kp, double kd,
 
   // Same direction rule as calibrate(): taken from the config, never guessed.
   const double s = config_.close_sign();
-  std::printf("[litegrip] calibrate_guided: %s mount (close_sign %+.0f)\n",
-              s > 0.0 ? "normal" : "reverse", s);
+  std::printf("[litegrip] calibrate_guided: close_sign %+.0f\n", s);
 
   const ProbeConfig probe{kp, kd, step_rad, stall_delta, stall_cycles, max_iter,
                           tau_limit};
@@ -871,8 +868,8 @@ bool LiteGrip::load_calibration(std::optional<std::string> path) {
   if (!calibration.has_value()) {
     std::fprintf(stderr,
                  "[litegrip] no calibration found (tried: %s); run a "
-                 "calibration first, load a mount template (normal / reverse), "
-                 "or point %s at the directory holding calibration/\n",
+                 "calibration first, load the factory calibration, or point %s "
+                 "at the directory holding calibration/\n",
                  join_paths(sources).c_str(), kDataDirEnvVar);
     return false;
   }
@@ -897,9 +894,9 @@ bool LiteGrip::load_template(const std::string& name) {
     throw CommandError(
         "calibration template '" + name + "' cannot be read (" +
         template_path +
-        "); refusing to fall back to the factory calibration, which declares "
-        "a normal mount — that fallback is exactly the silent direction swap "
-        "the template name exists to prevent");
+        "); refusing to fall back to the factory calibration — that fallback "
+        "would silently replace the direction the template name exists to "
+        "declare");
   }
 
   apply_calibration(*calibration, config_.can_channel);
