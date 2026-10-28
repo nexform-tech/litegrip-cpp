@@ -147,8 +147,8 @@ Two things to know before going further:
 
 - **The factory calibration is the default.** A no-argument
   `load_calibration()` reads the calibration file shipped inside the SDK, which
-  describes the shipped units (normal mount). You name a different file only
-  when you have one — see [Calibration](#calibration).
+  describes the shipped units. You name a different file only when you have
+  one — see [Calibration](#calibration).
 - **Nothing moves before a calibration is loaded.** Every motion method throws
   `CommandError` on an uncalibrated config, because the placeholder limits
   describe no real travel.
@@ -177,7 +177,7 @@ disconnects on destruction.
 | --- | --- |
 | `channel()`, `can_id()`, `mst_id()` | The identity this instance drives |
 | `config()` | `GripperConfig` — limits, scale, gains (the const overload reads it) |
-| `mount()` | On the config: `"normal"`, `"reverse"`, or `nullopt` until calibrated |
+| `mount()` | **Deprecated**, kept for compatibility; the legacy label read back from the limits — always `"normal"` on a calibrated shipped unit, `nullopt` until calibrated |
 | `is_connected()`, `is_enabled()` | Session state |
 | `disable_on_disconnect()` | Whether `disconnect()` disables the motor first (default true) |
 | `safety()` | The `SafetyGuard` in effect, for diagnostics |
@@ -240,9 +240,8 @@ design, and `refresh_status()` to force a frame rather than wait for one.
 | `enter_zero_gravity(duration_s=0.0)` / `exit_zero_gravity()` → `void` | The motor stays enabled but exerts no torque, so it can be back-driven by hand. Any motion command resumes normal control. |
 
 `kp` and `kd` fall back to `GripperConfig::kp` (`100.0` — the placeholder
-defaults and the shipped calibration agree on it, and the mount templates carry
-no gains at all, so all three entry points describe the same unit) and `.kd`
-(`2.0`) on every call that takes them.
+defaults and the shipped calibration agree on it, so both describe the same
+unit) and `.kd` (`2.0`) on every call that takes them.
 
 **One ramp, three ways to say the speed.** Every positioning call — the `goto`
 family and the `move_at_speed` family alike — runs one ramp of one frame per
@@ -358,9 +357,9 @@ See [Measure the travel](#4-measure-the-travel) for the workflow and
 | `calibrate_guided(kp=60.0, kd=2.0, step_rad=0.08, stall_delta=0.0004, stall_cycles=6, max_iter=40, tau_limit=2.0)` → `CalibrationData` | Guided two-step probe, opening leg first, same guards. |
 | `calibrate_manual(duration=30.0, settle_time=2.0, sample_interval=0.01)` → `CalibrationData` | Hand-teach: goes slack, you push the jaws through the full stroke, it samples the extremes. |
 | `save_calibration(path=None)` → `std::string` | Persist the current calibration; returns the path written. Without `path`, writes this channel's own file. |
-| `load_calibration(path=None)` → `bool` | Load calibration into the config — see [Keep it working](#keep-it-working). |
-| `load_template(name)` → `bool` | Load a packaged mount template by name (`"normal"` / `"reverse"`), which *declares* the mount direction. Strict: an unknown name throws `CommandError` instead of falling back. |
-| `list_calibration_templates()` | Every name `load_template()` accepts, for a UI to offer. |
+| `load_calibration(path=None)` → `bool` | Load calibration into the config — see [Keep it working](#keep-it-working) and [Using your own calibration file](#using-your-own-calibration-file). |
+| `load_template(name)` → `bool` | **Deprecated**, kept only for backward compatibility; shipped units are normal mount and the factory calibration already describes them. |
+| `list_calibration_templates()` | **Deprecated**, kept for compatibility; still returns `["normal", "reverse"]`. |
 
 ### Reading the results
 
@@ -568,10 +567,11 @@ no scale to derive and says so (`CommError`) instead of writing the nominal one.
 ### The direction is preserved, not discovered
 
 A stall says something stopped the jaws; both ends are hard stops, so the
-reading does not say which one was hit. The probes take the direction from
-`GripperConfig::close_sign()`, so a reverse-mounted unit must have
-[declared itself](#reverse-mounts) first, and `calibrate_manual()` assigns its
-two extremes by that same rule rather than by which is numerically larger.
+reading does not say which one was hit. The probes take the direction from the
+calibrated limits (`GripperConfig::close_sign()`), and `calibrate_manual()`
+assigns its two extremes by that same rule rather than by which is numerically
+larger. On the shipped units the factory calibration already states the
+direction, so you do not select it.
 
 ### The work stroke
 
@@ -619,8 +619,8 @@ as soon as the operator presses Enter; there is no equivalent here yet.
 
 `save_calibration()` writes the current config to this channel's own file,
 `~/.litegrip/<channel>_calibration.json`. A no-argument load does **not** read it
-back — it says so as it writes — so make the next run use it by pointing
-`LITEGRIP_CALIB` at it, or by passing the path to `load_calibration()`.
+back — it says so as it writes — so make the next run use it with the steps in
+[Using your own calibration file](#using-your-own-calibration-file).
 
 ### Keep it working
 
@@ -637,18 +637,86 @@ prints the file it used. A stale file used to outrank the factory one silently,
 which drove with the wrong scale and no work stroke.
 
 The factory file declares `channel: can0`, so a `can1` unit with no calibration
-of its own fails loudly rather than silently adopting `can0`'s direction: a
+of its own fails loudly rather than silently adopting `can0`'s calibration: a
 candidate whose `channel` field names a different interface is *skipped*. Give a
-`can1` unit its own with either `load_template("normal")` — a template loads by
-name and ignores the channel — or a `zero()` of its own, and then name that file
-or point `LITEGRIP_CALIB` at it.
+`can1` unit its own with `zero()`, then name that file or point `LITEGRIP_CALIB`
+at it; see [Using your own calibration file](#using-your-own-calibration-file).
 
-The SDK never guesses a direction: until a calibration or a template is loaded,
-every motion entry throws `CommandError` (see [Troubleshooting](#troubleshooting)).
+The SDK never guesses a direction: until a calibration is loaded, every motion
+entry throws `CommandError` (see [Troubleshooting](#troubleshooting)).
+
+### Using your own calibration file
+
+`zero()` writes its result to this channel's own file,
+`~/.litegrip/<channel>_calibration.json`, which is what
+`default_calibration_path(channel)` returns (or `$LITEGRIP_CALIB` when that is
+set). `calibrate()`, `calibrate_guided()`, and `calibrate_manual()` only return
+their result; call `save_calibration()` to persist one of those.
+
+A no-argument `load_calibration()` reads `$LITEGRIP_CALIB` when it is set, then
+the packaged factory calibration, and nothing else. It **does not** read the file
+`zero()` saved on its own; the next run must name it explicitly.
+
+The most direct way is to pass the save location back to `load_calibration()`:
+
+```cpp
+#include <cstdio>
+#include <string>
+#include <litegrip/litegrip.hpp>
+
+int main() {
+  litegrip::GripperConfig cfg;
+  auto gripper = litegrip::LiteGrip::connect_raii(cfg);
+  const std::string path =
+      litegrip::default_calibration_path(gripper.channel());
+  if (!gripper.load_calibration(path)) return 1;
+  if (!gripper.init()) return 1;
+  gripper.open();
+  return 0;
+}
+```
+
+To avoid repeating the path in every program, point `LITEGRIP_CALIB` at it:
+
+```bash
+export LITEGRIP_CALIB="$HOME/.litegrip/can0_calibration.json"
+```
+
+```cpp
+if (!gripper.load_calibration()) return 1;  // LITEGRIP_CALIB, then the factory file
+```
+
+Four rules decide whether the file is read:
+
+- **`path` accepts any JSON path.** `<channel>_calibration.json` is only the save default; a no-argument load never scans for it.
+- **`LITEGRIP_CALIB` must name this instance's `channel`.** A no-argument load skips a mismatch; an explicit `path` only warns.
+- **An unreadable `path` falls back to the factory file and may still return `true`.** Check which file loaded.
+- **The load prints the file it used.** `[litegrip] calibration loaded from <path>` names the winner.
+
+The factory file itself declares `channel: can0`, and a no-argument load applies
+the same channel check to it. A `can1` unit that names no file of its own
+therefore loads nothing and the call returns `false`.
+
+Check the loaded values before commanding motion:
+
+```cpp
+#include <cmath>
+#include <cstdio>
+#include <litegrip/litegrip.hpp>
+
+const litegrip::GripperConfig& cfg = gripper.config();
+std::printf("calibrated=%d travel=%.2f mm\n", cfg.calibrated,
+            std::abs(cfg.pos_open_rad - cfg.pos_closed_rad) * cfg.rad_to_mm);
+```
+
+`calibrated` must be `true`; with `false`, every motion method throws
+`CommandError`, so this check is also the gate before motion. The travel figure
+should match the caliper measurement you started from, not the factory 85 mm.
 
 ### Where the packaged files are found
 
-The factory calibration and the mount templates are *packaged* files. The SDK
+The factory calibration is a *packaged* file. The deprecated mount templates are
+packaged the same way so existing callers keep working. The SDK
 looks for them beside the running program first, so an installed SDK finds its
 own baseline from any working directory:
 
@@ -672,44 +740,26 @@ path to `load_calibration()`. `litegrip_cpp_DATA_DIR` in the CMake package
 reports the installed location. `load_calibration()` **returns `false`** when
 nothing was found, having printed what it tried; check it.
 
-## Reverse mounts
+## Deprecated mount selection
 
 **The shipped units are normal mount** — closing increases the motor's rad count
-— and the factory calibration the SDK ships describes them. A normal-mount
-gripper declares nothing: the `load_calibration()` above gives it the right
-direction, and the quick start confirms it. `load_template("normal")` exists,
-but nobody on shipped hardware has to call it.
+— and the factory calibration the SDK ships describes them. A no-argument
+`load_calibration()` therefore gives the correct direction, so you do not select
+a mount.
 
-A gripper whose motor is mounted the other way round is a **reverse mount**, and
-for it closing means *decreasing* radians. The SDK assumes neither direction; it
-derives one from the ordering of the two calibrated limits. If yours is reverse,
-say so by name:
+These symbols remain only so existing code compiles and runs, and are
+deprecated:
 
-```cpp
-litegrip::GripperConfig cfg;
-auto gripper = litegrip::LiteGrip::connect_raii(cfg);
-gripper.load_template("reverse");
-gripper.init();
-std::printf("%s\n", gripper.config().mount()->c_str());  // "reverse" — read back
-gripper.close();                                         // should shut, not open
-```
+- `load_template(name)` — loads a packaged mount template by name. A name
+  outside `list_calibration_templates()` throws `CommandError`, and an
+  unreadable template never falls back to the factory file.
+- `list_calibration_templates()` / `calibration_template_path(name)` — the
+  template names and paths, for compatibility.
+- `GripperConfig::mount()` — the legacy label read back from the limits
+  (`"normal"`, `"reverse"`, or `nullopt` until calibrated).
 
-If the jaws open instead, the unit is normal after all — drop the call.
-
-`list_calibration_templates()` returns every name the SDK accepts, for a UI to
-offer. A name outside that list throws `CommandError` listing the valid ones,
-and an unreadable template never falls back to the factory file: that file is a
-*normal* mount, and quietly answering "reverse" with "normal" is the one failure
-the name exists to prevent.
-
-`GripperConfig::mount()` reads back `"normal"`, `"reverse"` — or `nullopt` until
-a calibration or a template is loaded, because "normal" before that would be a
-claim, not a reading (see [Keep it working](#keep-it-working)).
-
-Running a move under a template is safe even though the geometry is not yours
-yet: `open()` and `close()` never send a command outside the calibrated travel,
-so a wrong direction cannot drive the jaws past a stop. It only sends them the
-wrong way, which you see immediately.
+New code uses a no-argument `load_calibration()` or an explicit path; see
+[Using your own calibration file](#using-your-own-calibration-file).
 
 **How the direction is represented.** The two calibrated limits carry it:
 whichever is numerically larger is the closed side, and every mm / force
@@ -916,14 +966,13 @@ allows:
 | Symptom | Cause and fix |
 | --- | --- |
 | `ConnectError: CAN interface 'can0' not found` | The interface is down or the adapter is not loaded. Run step 2; check `ip link show can0`. |
-| `CommandError: not calibrated: pos_closed_rad / pos_open_rad are still the placeholder defaults ...` | No calibration or template is loaded, so which end is closed is a guess. Run `load_calibration()`, `load_template(...)`, or `zero()` from step 4. |
+| `CommandError: not calibrated: pos_closed_rad / pos_open_rad are still the placeholder defaults ...` | No calibration is loaded, so which end is closed is a guess. Run a no-argument `load_calibration()` or `zero()` from step 4. |
 | `load_calibration()` prints "no calibration found" and returns `false` | Neither `$LITEGRIP_CALIB` nor the packaged factory file could be read. For the factory file, point `$LITEGRIP_DATA_DIR` at the directory holding `calibration/` — `$HOME/.local/share/litegrip_cpp` after [Install it](#install-it). |
 | `local calibration not read: ...`, every no-argument `load_calibration()` | Expected on a machine that holds a calibration you did not name. A no-argument load reads the factory file only, so this run uses the shipped baseline. Name the file, or set `LITEGRIP_CALIB` to it. |
-| `GripperConfig::mount()` returns `nullopt` | The same thing, before it becomes an error: direction is not reported until a calibration or a template is loaded. |
+| `GripperConfig::mount()` returns `nullopt` | The same thing, before it becomes an error: the deprecated legacy label reports no direction until a calibration is loaded. |
 | `goto_mm()` on the shipped files and nothing moves, or `home()` throws | A stale binary from before the positioning family moved onto the engine ramp. Rebuild; `home()`'s target is outside the closed red line, which is what the old gate refused. |
 | `CommandError: ... is not a finite number ...`, or `LimitViolation: ... speed ... exceeds the commanded-velocity ceiling` | A NaN / inf target or rate, or a ramp past 1.5 rad/s — whether the speed was given or implied by `duration_s`. Refused at the entry, deliberately — nothing was sent. |
 | `CommandError: goto_rad: dq_target is not accepted ...` | Pass 0. The ramp derives its own velocity feed-forward; a caller-supplied one would fight it. |
-| The jaws move the wrong way | The mount direction. See [Reverse mounts](#reverse-mounts) — normal-mount units declare nothing, reverse ones call `load_template("reverse")`. |
 | `[litegrip] entering a safety mode: ... recovering from outside the red lines`, every move | Expected on the shipped files, not a fault. Both rest positions of an open/close cycle lie outside the red lines, so each move crawls back inside first — see [Why a cycle reports it is recovering](#why-a-cycle-reports-it-is-recovering). |
 | `[litegrip] MIT mode switch could not be verified; continuing anyway`, the first `init()` | Not a fault. `init()` disables the motor, asks it to switch to MIT mode, then reads the mode register back to confirm; a unit that is already in MIT, or that answers that read late, produces this line on a healthy link. The enable-and-hold that follows is what actually proves the link, so `init()` prints it and carries on — an `init()` that returns `true` after this line has done its job. |
 | `open()` or `close()` returns `ok = false` with the jaw far from the stop | Something blocked the travel. `protection_tripped` set means the travel-leg torque protection ended the move and let go on purpose. |

@@ -110,9 +110,9 @@ struct GripperConfig {
   double kd = GripperParams::kDefaultKd;
 
   // Position limits (rad), updated by calibrate().
-  // closed (0 mm) is numerically *larger* than open (full stroke) **in the
-  // normal mount**. A reverse-mounted unit has them the other way round, which
-  // is exactly what close_sign() reads back; do not "fix" the ordering here.
+  // closed (0 mm) is numerically *larger* than open (full stroke) on the
+  // shipped units. Limits that run the other way are read back by close_sign()
+  // as the other direction; do not "fix" the ordering here.
   double pos_closed_rad = GripperParams::kPosClosedRad;
   double pos_open_rad = GripperParams::kPosOpenRad;
 
@@ -160,11 +160,15 @@ struct GripperConfig {
     return close_sign_for(pos_closed_rad, pos_open_rad);
   }
 
-  /// Mount name implied by the calibrated limits, or nullopt while
-  /// uncalibrated.
+  /// Deprecated: legacy mount label implied by the calibrated limits, or
+  /// nullopt while uncalibrated.
   ///
-  /// Reporting "normal" before a calibration was loaded would be a claim, not
-  /// a reading. Mirrors models.GripperConfig.mount.
+  /// Kept for backward compatibility. Shipped units are normal mount and the
+  /// factory calibration already describes them, so new code should read
+  /// pos_closed_rad / pos_open_rad directly. On a calibrated shipped unit this
+  /// reports "normal". Reporting a direction before a calibration was loaded
+  /// would be a claim, not a reading, so it returns nullopt until `calibrated`
+  /// is true. Mirrors models.GripperConfig.mount.
   std::optional<std::string> mount() const {
     if (!calibrated) {
       return std::nullopt;
