@@ -353,8 +353,27 @@ MoveResult LiteGrip::close(std::optional<double> speed_mm_s,
 GraspResult LiteGrip::grasp(std::optional<double> force_n, double hold_s,
                             MoveProgressCallback progress) {
   check_connected();
-  MotionEngine engine(*this, *safety_);
+  MotionEngine engine(*this, *safety_, MotionConfig{}, &release_);
   return engine.grasp(force_n, hold_s, std::move(progress));
+}
+
+ReleaseResult LiteGrip::release(double clearance_mm, bool abort,
+                                std::optional<double> timeout_s) {
+  // Python's wrapper checks connectivity before the argument validation
+  // (actions.release validates second), so a disconnected caller gets
+  // NotInitializedError even when the clearance is also bad.
+  check_connected();
+  MotionEngine engine(*this, *safety_, MotionConfig{}, &release_);
+  return engine.release(clearance_mm, abort, timeout_s);
+}
+
+bool LiteGrip::request_release(double clearance_mm, bool abort) {
+  // Deliberately no check_connected(); like the Python wrapper: this is the
+  // non-blocking channel an E-stop callback uses, and "not connected" is
+  // simply "no grasp to release" (false), not an error. The argument check
+  // still runs.
+  MotionEngine engine(*this, *safety_, MotionConfig{}, &release_);
+  return engine.request_release(clearance_mm, abort);
 }
 
 MoveResult LiteGrip::move_at_speed(double target_mm, double speed_mm_s,

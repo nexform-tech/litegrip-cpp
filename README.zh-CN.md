@@ -214,7 +214,9 @@ stderr 报警。对不流状态帧的夹爪，`get_state()` 会先耗满这 0.5 
 | `open(speed_mm_s=None, progress={})` → `MoveResult` | 斜坡走向张开侧标定限位并压住它。`GripperConfig::work_stroke_mm` 严格落在行程之内时改为停在那 个开口，是一次普通定位。 |
 | `close(speed_mm_s=None, progress={})` → `MoveResult` | 同样，朝闭合侧。`work_stroke_mm` 是张开侧的数，不改变闭合停在哪里。 |
 | `home()` → `MoveResult` | 斜坡走到标定闭合位置。不是压紧：它停在零点**上**，而不是压住零点。 |
-| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | 闭合到工件上 —— 空载则闭合到闭合侧标定限位 —— 然后爬到并保持 `force_n` N。闭合段带着 `force_n` 作为力矩预算，所以撞上工件时压出的力不超过设定值。只有夹爪停下来后保力段才接手：`stalled`（两指之间有东西）或 `reached`（空载闭合到位）。`hold_s = 0` 保到故障或越位护栏为止。`force_n` 留空用 `MotionConfig::force_n`（20 N）。 |
+| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | 闭合到工件上 —— 空载则闭合到闭合侧标定限位 —— 然后爬到并保持 `force_n` N。闭合段带着 `force_n` 作为力矩预算，所以撞上工件时压出的力不超过设定值。只有夹爪停下来后保力段才接手：`stalled`（两指之间有东西）或 `reached`（空载闭合到位）。`hold_s = 0` 保到故障或越位护栏为止。`hold_s = 0` 的保力用 `release()` 结束。 |
+| `release(clearance_mm=10.0, abort=false, timeout_s=None)` → `ReleaseResult` | 结束正在进行的 `grasp()` 并张开：撤掉夹持设定力，再让夹爪斜坡走到 `max(当前, 交接点) + clearance_mm`，钳在标定张开限位以内。可在任意线程调用，包括 `grasp(hold_s = 0)` 正阻塞在另一个线程的时候 —— 见 [结束夹持](#结束夹持)。没有夹取在跑时，就在调用方线程里直接张开。`abort = true` 只撤力、不张开。超时是 `ok = false`，不抛异常。 |
+| `request_release(clearance_mm=10.0, abort=false)` → `bool` | `release()` 的非阻塞形式：把请求排给正在跑的 `grasp()` 并返回 `true`，否则返回 `false`。自己绝不发帧 —— UI 线程、信号处理、急停回调里都安全。 |
 | `goto_mm(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | 斜坡走到一个毫米目标（0 = 闭合）。 |
 | `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | 同样，单位是弧度。`dq_target` 与 `tau_feedforward` 必须是 0 —— 见下。 |
 | `move_to(target_rad, kp=None, kd=None, tau_feedforward=0.0, duration=1.0)` → `MoveResult` | 与 `goto_rad` 相同，默认 `duration` 更长。 |
@@ -309,6 +311,43 @@ the mechanism`。把它弄出来是个手动步骤：`disable()` 让夹爪能被
 推回红线之内，再 `enable()`，然后照常继续。这个拒绝说的是夹爪现在的位置，不是机构
 坏了。
 
+### 结束夹持
+
+`grasp(force_n, hold_s = 0)` 会一直保力到故障为止 —— 这正是它适合抓放任务的原因：
+什么时候松手由程序决定。`release()` 就是那个「松手」：
+
+```cpp
+std::thread grasp_thread([&] { gripper.grasp(20.0); });  // 一直保力
+// …… 在别的地方，该放下工件了：
+const litegrip::ReleaseResult drop = gripper.release();   // 结束夹取，张开 10 mm
+```
+
+CAN 帧归夹取线程所有：两个线程同时给同一条总线上斜坡，各自的领先上限都会失效；
+而往无增益的保力帧里插一帧位置指令，会打断它连续的力矩爬升。所以 `release()` 自己
+一帧都不发：它把请求排进去，夹取线程在下一帧之前（5 ms）看到它，撤掉设定力、执行
+张开，`release()` 拿到的就是那个结果。没有夹取在跑时，`release()` 就在调用方线程里
+直接张开。
+
+- **它从交接点起算**，不是从设定力把夹爪压到的位置起算。20 N 的保力会把软工件再
+  推进几个毫米，从那里张开就少松了那么多。目标是
+  `max(当前, 交接点) + clearance_mm`，钳在标定张开限位以内，走的是和其它移动完全
+  相同的**有界斜坡**。
+- **`abort = true` 是急停形式**：只撤力矩，不发张开运动，夹爪停在原地、可以用手
+  掰动。这次 `grasp()` 返回 `ok = false, released = true`，`ReleaseResult` 里
+  `aborted` 置位、`ok` 为假。
+- **一次夹取里的两次调用只张开一次。** 第二次看到请求已经排上，就等同一个结果，
+  参数以第一次为准。唯一的例外是急停：它会顶掉排队中的普通松开 —— 那条请求还
+  没执行，而「立刻停下」不能被换成一次张开。
+- `GraspResult::released` 告诉 `grasp()` 的调用方：这次结束是有人要求松手，不是
+  故障。`ReleaseResult::opened_mm` 是这次松开**瞄准的开口**（从闭合零点算的毫米），
+  不是「又张开了多少」；夹爪实际停在哪里看 `state.position_mm`。
+- `request_release()` 是非阻塞的那一半：它只排请求，返回「当时有没有夹取在跑」。
+  它绝不发帧、也绝不阻塞，急停回调和 UI 线程要的就是这个。
+- `release()` 最多等 `timeout_s`（默认 `MotionConfig::release_wait_s`，10 s）让
+  夹取线程完成。超时报成 `ok = false` 并在 stderr 打一行警告 —— 这个调用自己不发
+  帧，也没有别的办法。`clearance_mm` 必须有限且非负，否则在任何一帧发出之前抛
+  `CommandError`。
+
 ### 标定
 
 工作流见 [量出行程](#4-量出行程)，其它方式见 [其它标定方式](#其它标定方式)。
@@ -329,9 +368,10 @@ the mechanism`。把它弄出来是个手动步骤：`disable()` 让夹爪能被
 | 类型 | 字段 | `bool()` 是 |
 | --- | --- | --- |
 | `MoveResult` | `ok`、`reached`、`stalled`、`protection_tripped`、`released`、`state`、`target_rad`、`limit_rad`、`final_cmd_rad`、`steps` | `ok` |
-| `GraspResult` | `ok`、`reached`、`stalled`、`state`、`target_rad`、`force_n`、`cycles`、`travel_guard` | `ok` |
+| `GraspResult` | `ok`、`reached`、`stalled`、`state`、`target_rad`、`force_n`、`cycles`、`travel_guard`、`released` | `ok` |
+| `ReleaseResult` | `ok`、`state`、`opened_mm`、`target_rad`、`aborted` | `ok` |
 
-两者都定义了返回 `ok` 的 `operator bool`，所以 `if (gripper.close())` 照样能用。
+三者都定义了返回 `ok` 的 `operator bool`，所以 `if (gripper.close())` 照样能用。
 `ok` **意味着什么**取决于目标在哪里：
 
 - **`open()` / `close()`** 有意瞄准标定限位**之外**，所以成功的定义是*在指令被
@@ -360,8 +400,10 @@ the mechanism`。把它弄出来是个手动步骤：`disable()` 让夹爪能被
 
 - `protection_tripped` —— 行进段力矩保护结束了这次移动，是有意失力（见
   [被挡住的压紧会失力](#被挡住的压紧会失力)）。
-- `released` —— 定位移动没到位，引擎把力撤了。它与 `protection_tripped` 不同，
-  后者自己就会失力，所以被保护拦下的移动 `released == false`。
+- `released` —— 力是有意撤掉的：定位移动没到位，或者 `grasp()` 因为另一个线程
+  调了 `release()` 而结束（此时 `ok` 跟着松开走：正常张开为真，急停为假）。它与
+  `protection_tripped` 不同，后者自己就会失力，所以被保护拦下的移动
+  `released == false`。
 - `travel_guard`（`GraspResult` 上）—— 越位护栏截断了一次保力（见
   [夹取与力控](#夹取与力控)）。
 
@@ -419,6 +461,7 @@ const litegrip::MoveResult res = gripper.goto_mm(
 | `stop_release_s` | `0.2` | 被保护拦下或失力之后那段无力的尾巴 |
 | `force_n` / `force_ramp_n_s` | `20.0` / `20.0` | 默认夹持力，以及保力的爬升速率（N/s） |
 | `hold_interval` | `0.2` | 保力切片长度，s |
+| `release_wait_s` | `10.0` | 没给 `timeout_s` 时，`release()` 等夹取线程多久 |
 | `hold_runaway_rad` | `0.05` | 越位护栏的阈值 |
 | `press_safety` | `0.9` | 预算余量：压出的力落在设定值之下 |
 | `sleep_fn` / `monotonic_fn` | 真实时间 | 引擎的时钟接缝；测试把 sleep 置空，于是斜坡瞬间跑完 |
@@ -835,7 +878,8 @@ SDK 先到**运行中的程序旁边**找，所以装好
 | `can::MotorController` | 一条总线上的多电机派发 | `can/controller.py` |
 | `GripperBus` | 单爪总线 API（`init` = 持位） | `protocols/can_bus.py` |
 | `LiteGrip` | 高层 API | `gripper.py` |
-| `MotionEngine` | 动作引擎：open/close/grasp/定位斜坡/零重力 | `actions.py` + `gripper.py` |
+| `MotionEngine` | 动作引擎：open/close/grasp/release/定位斜坡/零重力 | `actions.py` + `gripper.py` |
+| `ReleaseCoordinator` | 跨线程的松开请求/结果交接 | `actions.py` 的松开状态 |
 | `SafetyGuard` + `SafetyLimits` | 红线、力矩预算、看门狗、模式 | `safety_limits.py`（核心） |
 | `ControlLoop` | 后台 200 Hz 流式发送 + 限速 + 闸门 | 旧的 Python 侧守护进程 |
 
@@ -857,6 +901,7 @@ SDK 先到**运行中的程序旁边**找，所以装好
 | 某个 `goto` 返回 `ok = false` 且 `released = true` | 没到位，引擎把力撤了，而不是留在那里压着。查行程里有什么。 |
 | `GraspResult::travel_guard` 置位 | 越位护栏触发：实测位置越过了闭合侧标定限位。见 [夹取与力控](#夹取与力控)。空载的 `grasp()` 会把夹爪留在那里，位置若在回收窗口之外，下一次运动就抛 `... outside the unit's own validated travel`，直到你 `disable()`、用手把夹爪推回红线内、再 `enable()`。 |
 | `open()` 没走满行程 | 配置了工作行程 —— 那正是它的用途。见 [工作行程](#工作行程)。 |
+| `release()` 返回 `ok = false` 并警告 “the grasp thread did not finish the release within ... s” | 超时之前夹取线程没来得及消费请求。这个调用自己不发帧，所以先确认另一个线程上确实有 `grasp()` 在跑（没有时 `request_release()` 返回 `false`），张开斜坡比 `timeout_s` 长的话就把它调大。 |
 | `CommError: CAN send timeout ...` | 发送缓冲在整个重试窗口里一直是满的，所以有一帧**没有**发出去。总线负载过高，或接口卡死；SDK 报出来而不是悄悄丢掉。 |
 | `SafetyFault: ...: no valid feedback — motion is refused` | 没有新的状态帧。未使能的电机不流状态帧；`refresh_status()` 可以要一帧。 |
 

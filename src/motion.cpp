@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iostream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -243,8 +244,8 @@ ApproachTerms force_approach_terms(double kp, double kd, double speed_rad_s,
 // ── construction / seams ─────────────────────────────────────────────────
 
 MotionEngine::MotionEngine(MotionIo& io, SafetyGuard& safety,
-                           MotionConfig config)
-    : io_(io), safety_(safety), config_(std::move(config)) {
+                           MotionConfig config, ReleaseCoordinator* release)
+    : io_(io), safety_(safety), config_(std::move(config)), release_(release) {
   // Structural checks only — the things every move divides by or builds a
   // target from. The per-frame ceilings are re-checked in send_frame against
   // the guard's TemporaryParams, and the recovery parameters against the
@@ -342,7 +343,7 @@ double MotionEngine::emit(double q, double dq, double tau,
   return sent;
 }
 
-int MotionEngine::release(double pos, const char* source) {
+int MotionEngine::drop_torque(double pos, const char* source) {
   // Trip means let go: kp=kd=tau=0 frames so the gripper can be pushed by hand
   // rather than still pressed. `pos` is the reading taken at the trip — with
   // zero gain it produces no force, it only hands the driver a command that is
@@ -687,6 +688,7 @@ MoveResult MotionEngine::move_to_limit(
   hist.push_back(before.position_rad);
   bool stalled = false;
   bool protection_tripped = false;
+  bool release_requested = false;  // a release request ended the approach
   int over_torque = 0;  // consecutive samples over the stop_torque_nm threshold
   double prev_sample_pos = before.position_rad;
   double last_sample_pos = before.position_rad;
@@ -695,6 +697,16 @@ MoveResult MotionEngine::move_to_limit(
   int arrived_at = -1;  // first frame of the press-after-arrival phase
 
   for (int i = 1; i <= ceiling; ++i) {
+    // A release request is checked before EVERY frame, not per sample or per
+    // slice: one frame is 5 ms, so a request is seen within a frame of
+    // arriving. Only a force-carrying leg is interruptible — its endpoint is
+    // the grip the caller asked for, and "release" means "do not grip" — while
+    // open/close/ramp_to have endpoints of their own that a release must not
+    // cut short.
+    if (force_n.has_value() && release_ && release_->pending()) {
+      release_requested = true;
+      break;
+    }
     const GripperState st = io_.get_state(false);
     const double pos = st.position_rad;
 
@@ -811,7 +823,7 @@ MoveResult MotionEngine::move_to_limit(
     // Let go the moment it fires, so the gripper can be pushed by hand instead
     // of holding on to whatever it hit. Shared with the force hold's position
     // guard so the two release paths cannot drift apart.
-    release(last_sample_pos, source);
+    drop_torque(last_sample_pos, source);
   }
 
   const GripperState st = io_.get_state(true);
@@ -829,6 +841,7 @@ MoveResult MotionEngine::move_to_limit(
   result.reached = reached;
   result.stalled = stalled;
   result.protection_tripped = protection_tripped;
+  result.release_requested = release_requested;
   result.state = st;
   result.target_rad = target;
   result.limit_rad = limit;
@@ -864,6 +877,97 @@ MoveResult MotionEngine::close(std::optional<double> speed_mm_s,
                        std::nullopt, "close", progress);
 }
 
+// ── the release coordinator ──────────────────────────────────────────────
+//
+// Field-for-field port of the coordination state in actions.GripperActions
+// (Python): a request channel the grasp thread drains before every frame, a
+// "done" event release() waits on, and the hand-over pose the opening is
+// measured from. The rules live at the declarations in motion.hpp.
+
+void ReleaseCoordinator::begin_grasp() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  request_.reset();
+  result_.reset();
+  grip_rad_.reset();
+  active_ = true;
+}
+
+void ReleaseCoordinator::end_grasp() {
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    request_.reset();
+    grip_rad_.reset();
+    active_ = false;
+  }
+  done_.notify_all();
+}
+
+bool ReleaseCoordinator::pending() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return request_.has_value();
+}
+
+std::optional<ReleaseCoordinator::Request> ReleaseCoordinator::take() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::optional<Request> request = request_;
+  request_.reset();
+  return request;
+}
+
+std::optional<ReleaseCoordinator::Request>
+ReleaseCoordinator::record_grip_or_take(double grip_rad) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // The pose and the request are read in ONE critical section: a request
+  // landing between "record the pose" and "check for a request" would
+  // otherwise be missed by this grasp.
+  if (request_.has_value()) {
+    std::optional<Request> request = request_;
+    request_.reset();
+    return request;
+  }
+  grip_rad_ = grip_rad;
+  return std::nullopt;
+}
+
+std::optional<double> ReleaseCoordinator::grip_rad() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return grip_rad_;
+}
+
+void ReleaseCoordinator::publish(const ReleaseResult& result) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  result_ = result;
+}
+
+bool ReleaseCoordinator::submit(const Request& request) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!active_) {
+    return false;
+  }
+  if (!request_.has_value()) {
+    request_ = request;
+  } else if (request.abort && !request_->abort) {
+    // An abort overrides a queued NORMAL release: it has not run yet, and
+    // "stop now" must not be turned into an opening. The reverse is not
+    // allowed — an abort already asked for is never replaced by an opening.
+    request_ = request;
+  }
+  // Otherwise the queued request keeps ITS parameters: a second call is just
+  // "hurry up", and must never open twice.
+  return true;
+}
+
+bool ReleaseCoordinator::wait_done(double timeout_s) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  return done_.wait_for(lock, std::chrono::duration<double>(timeout_s),
+                        [this] { return !active_; });
+}
+
+std::optional<ReleaseResult> ReleaseCoordinator::result() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return result_;
+}
+
 // ── grasp / force hold ───────────────────────────────────────────────────
 
 GraspResult MotionEngine::grasp(std::optional<double> force_n, double hold_s,
@@ -885,6 +989,21 @@ GraspResult MotionEngine::grasp(std::optional<double> force_n, double hold_s,
   const GripperConfig& gcfg = io_.config();
   check_calibrated(gcfg);
 
+  // A new grasp starts from a clean slate (actions.grasp does the same): a
+  // request left over from the previous grasp must not kill this one, and the
+  // previous result must not be handed to this grasp's release() caller. The
+  // guard marks the coordinator idle on EVERY exit, including an exception, so
+  // a release() waiting on this grasp is never left waiting.
+  if (release_) {
+    release_->begin_grasp();
+  }
+  struct DoneOnExit {
+    ReleaseCoordinator* coordinator;
+    ~DoneOnExit() {
+      if (coordinator) coordinator->end_grasp();
+    }
+  } done_on_exit{release_};
+
   // The closing leg aims at the closed-side calibrated limit ITSELF, not at
   // limit_target's 5% inside it. The reserved travel was free travel: the jaw
   // arrived with nothing ahead of it and the hold then had to push it the last
@@ -904,6 +1023,14 @@ GraspResult MotionEngine::grasp(std::optional<double> force_n, double hold_s,
 GraspResult MotionEngine::hand_over(const MoveResult& move, double force,
                                     double hold_s,
                                     const MoveProgressCallback& progress) {
+  // A release asked for during the closing leg: there is no hand-over pose yet,
+  // so the opening measures from the current position. The request was left
+  // queued by move_to_limit (it only CHECKS), and is consumed here.
+  if (release_) {
+    if (const auto request = release_->take()) {
+      return grasp_ends_with_release(*request, move, force, /*cycles=*/0);
+    }
+  }
   if (!(move.reached || move.stalled)) {
     // Neither arrived nor on something — the jaw is still in free travel, and
     // the position loop (kp x lead + kd x velocity error) is the only thing
@@ -912,7 +1039,7 @@ GraspResult MotionEngine::hand_over(const MoveResult& move, double force,
     // that is still rolling: measured speed jumped from the velocity loop's
     // 0.82 rad/s to 5.12 rad/s on 2026-10-13, still accelerating when hold_s
     // ran out. Report the failure honestly instead of handing over.
-    release(move.state.position_rad, "grasp");
+    drop_torque(move.state.position_rad, "grasp");
     GraspResult result;
     result.ok = false;
     result.reached = move.reached;
@@ -924,7 +1051,28 @@ GraspResult MotionEngine::hand_over(const MoveResult& move, double force,
     result.travel_guard = false;
     return result;
   }
+  // The hand-over pose and the request are read in ONE critical section: a
+  // request landing between the two would otherwise be missed, and the hold
+  // below would start even though the caller asked to let go.
+  if (release_) {
+    if (const auto request =
+            release_->record_grip_or_take(move.state.position_rad)) {
+      return grasp_ends_with_release(*request, move, force, /*cycles=*/0);
+    }
+  }
   const HoldOutcome hold = hold_force(force, hold_s, progress);
+  if (hold.release_requested) {
+    // The hold stopped without consuming the request (actions._hold_force does
+    // the same): the opening semantics belong to grasp(). The fallback cannot
+    // fire in practice — a set flag means the request was seen — but a release
+    // must never be lost if it does.
+    std::optional<ReleaseCoordinator::Request> request =
+        release_ ? release_->take() : std::nullopt;
+    if (!request) {
+      request = ReleaseCoordinator::Request{10.0, false};
+    }
+    return grasp_ends_with_release(*request, move, force, hold.cycles);
+  }
   GraspResult result;
   result.ok = hold.ok;
   result.reached = move.reached;
@@ -934,6 +1082,170 @@ GraspResult MotionEngine::hand_over(const MoveResult& move, double force,
   result.force_n = force;
   result.cycles = hold.cycles;
   result.travel_guard = hold.guarded;
+  return result;
+}
+
+GraspResult MotionEngine::grasp_ends_with_release(
+    const ReleaseCoordinator::Request& request, const MoveResult& move,
+    double force, int cycles) {
+  const ReleaseResult released = release_now(request);
+  // Published BEFORE grasp()'s guard marks the coordinator idle, so a waiter
+  // that wakes up always finds the result (actions publishes first too).
+  if (release_) {
+    release_->publish(released);
+  }
+  GraspResult result;
+  result.ok = released.ok;
+  result.reached = move.reached;
+  result.stalled = move.stalled;
+  result.state = released.state;
+  result.target_rad = move.target_rad;
+  result.force_n = force;
+  result.cycles = cycles;
+  result.travel_guard = false;
+  result.released = true;
+  return result;
+}
+
+// ── release ──────────────────────────────────────────────────────────────
+
+namespace {
+
+/// Validate a release request's parameters. NaN / negative clearance is
+/// refused here rather than clamped: a negative clearance is "close a little
+/// more", not a release, and a NaN target poisons the position arithmetic.
+ReleaseCoordinator::Request check_release_args(double clearance_mm, bool abort) {
+  if (!std::isfinite(clearance_mm) || clearance_mm < 0.0) {
+    throw CommandError(
+        "release: clearance_mm must be a non-negative finite number (got " +
+        std::to_string(clearance_mm) +
+        ") — a negative clearance means 'close further', not release");
+  }
+  ReleaseCoordinator::Request request;
+  request.clearance_mm = clearance_mm;
+  request.abort = abort;
+  return request;
+}
+
+}  // namespace
+
+ReleaseResult MotionEngine::release(double clearance_mm, bool abort,
+                                    std::optional<double> timeout_s) {
+  // Python (actions.release) refuses a non-finite timeout before anything is
+  // queued: a NaN deadline has no meaning. A NEGATIVE timeout is not an error
+  // there — it just expires at once — and that is kept.
+  if (timeout_s.has_value() && !std::isfinite(*timeout_s)) {
+    throw CommandError(
+        "release: timeout_s must be a finite number of seconds (got " +
+        std::to_string(*timeout_s) + ") — a NaN deadline has no meaning");
+  }
+  const ReleaseCoordinator::Request request =
+      check_release_args(clearance_mm, abort);
+
+  // No coordinator, or no grasp running: there is nothing to wait for, so the
+  // release runs here. That is also the path a caller takes when it knows no
+  // grasp is in flight.
+  if (!release_ || !release_->submit(request)) {
+    return release_now(request);
+  }
+
+  const double wait_s = timeout_s.value_or(config_.release_wait_s);
+  if (!(wait_s > 0.0) || !release_->wait_done(wait_s)) {
+    std::cerr << "release: the grasp thread did not finish the release within "
+              << wait_s << " s (abort=" << (request.abort ? "true" : "false")
+              << ") — returning ok=false; this call never sends frames\n";
+    return release_timeout_result(request);
+  }
+  if (const auto outcome = release_->result()) {
+    // Two waiters on one grasp both land here and both get the first release's
+    // result; the opening ran once.
+    return *outcome;
+  }
+  // The grasp ended on its own before it consumed the request (hold_s expired,
+  // say). It is over, so perform this release here rather than dropping it.
+  return release_now(request);
+}
+
+bool MotionEngine::request_release(double clearance_mm, bool abort) {
+  const ReleaseCoordinator::Request request =
+      check_release_args(clearance_mm, abort);
+  return release_ && release_->submit(request);
+}
+
+ReleaseResult MotionEngine::release_now(
+    const ReleaseCoordinator::Request& request) {
+  const GripperConfig& gcfg = io_.config();
+  // The E-stop form must work with a broken or missing calibration — a bad
+  // calibration file must not stop a torque-off. A normal release IS a
+  // position move whose direction comes from the calibration, so it refuses
+  // an uncalibrated config.
+  if (!request.abort) {
+    check_calibrated(gcfg);
+  }
+  const GripperState st = io_.get_state(true);
+  const double pos = st.position_rad;
+
+  if (request.abort) {
+    // One zero-gain frame is enough to stop the torque, then return at once.
+    // Not drop_torque()'s full stop_release_s burst: that is 0.2 s, and an
+    // E-stop's every millisecond counts. No opening move — the caller asked
+    // for "stop", not "open to somewhere".
+    emit(pos, 0.0, 0.0, 0.0, 0.0, "release-abort");
+    ReleaseResult result;
+    result.ok = false;
+    result.state = io_.get_state(false);
+    result.opened_mm = st.position_mm;
+    result.target_rad = pos;
+    result.aborted = true;
+    return result;
+  }
+
+  const double s = gcfg.close_sign();
+  const double current_mm = (gcfg.pos_closed_rad - pos) * s * gcfg.rad_to_mm;
+  double base_mm = current_mm;
+  if (release_) {
+    if (const auto grip_rad = release_->grip_rad()) {
+      // Open from where the grip was DECLARED, not from where the set force
+      // pressed the jaws to: a 20 N grip drives a few millimetres further in,
+      // and opening from there would free that much less. max(current, grip)
+      // because the jaws can also be pushed further out by the workpiece.
+      const double grip_mm =
+          (gcfg.pos_closed_rad - *grip_rad) * s * gcfg.rad_to_mm;
+      base_mm = std::max(current_mm, grip_mm);
+    }
+  }
+  const double target_mm = base_mm + request.clearance_mm;
+  double target_rad = gcfg.pos_closed_rad - s * target_mm / gcfg.rad_to_mm;
+  target_rad = clamp_to_travel(gcfg, target_rad);
+  // Reported after the clamp: against a calibrated open stop, opening "10 mm
+  // further" can only reach the stop.
+  const double opened_mm = (gcfg.pos_closed_rad - target_rad) * s * gcfg.rad_to_mm;
+
+  const MoveResult move =
+      move_to_limit(Toward::kOpen, config_.grasp_speed_mm_s, /*press=*/false,
+                    target_rad, std::nullopt, "release", {});
+  ReleaseResult result;
+  result.ok = move.ok;
+  result.state = move.state;
+  result.opened_mm = opened_mm;
+  result.target_rad = move.target_rad;
+  result.aborted = false;
+  return result;
+}
+
+ReleaseResult MotionEngine::release_timeout_result(
+    const ReleaseCoordinator::Request& request) {
+  // The failure path asks for a reading, not for a fresh frame.
+  ReleaseResult result;
+  try {
+    result.state = io_.get_state(false);
+  } catch (const LiteGripError&) {
+    result.state = GripperState{};
+  }
+  result.ok = false;
+  result.opened_mm = result.state.position_mm;
+  result.target_rad = result.state.position_rad;
+  result.aborted = request.abort;
   return result;
 }
 
@@ -986,7 +1298,7 @@ MotionEngine::HoldOutcome MotionEngine::hold_force(
   // late — that slice's frames_per_slice frames have gone out, which is exactly
   // what this exists to stop.
   if (guarded && closing_travel_excursion_rad(gcfg, pos) > guard_rad) {
-    release(pos, "grasp-hold");
+    drop_torque(pos, "grasp-hold");
     outcome.ok = false;
     outcome.guarded = true;
     outcome.state = st;
@@ -995,6 +1307,16 @@ MotionEngine::HoldOutcome MotionEngine::hold_force(
 
   while (!bounded || now_s() < deadline) {
     for (int f = 0; f < frames_per_slice; ++f) {
+      // Checked before EVERY frame, not once per 0.2 s slice: a release then
+      // takes effect within a frame (5 ms) instead of up to 200 ms. The
+      // request is NOT consumed here — grasp() takes it and performs the
+      // opening (or the abort); this layer only stops the squeeze.
+      if (release_ && release_->pending()) {
+        outcome.ok = false;
+        outcome.state = st;
+        outcome.release_requested = true;
+        return outcome;
+      }
       tau_cmd = toward(tau_cmd, target_nm, step_nm);
       // kp=kd=0: a pure torque source, so the force does not follow the jaws.
       emit(pos, 0.0, tau_cmd, 0.0, 0.0, "grasp-hold");
@@ -1013,7 +1335,7 @@ MotionEngine::HoldOutcome MotionEngine::hold_force(
     // frame carries no position error, so there is no command to clamp and
     // releasing the torque is the only lever there is.
     if (guarded && closing_travel_excursion_rad(gcfg, pos) > guard_rad) {
-      release(pos, "grasp-hold");
+      drop_torque(pos, "grasp-hold");
       outcome.ok = false;
       outcome.guarded = true;
       outcome.state = st;
@@ -1080,7 +1402,7 @@ MoveResult MotionEngine::ramp_to(double target_rad, double speed_mm_s,
     // against a blocked jaw is a standing torque: leave it on the bus and the
     // drive presses the part for as long as it stays enabled. Pressing is
     // open()/close()'s job, not a positioning move's.
-    release(res.state.position_rad, "ramp_to");
+    drop_torque(res.state.position_rad, "ramp_to");
     res.released = true;
   }
   return res;

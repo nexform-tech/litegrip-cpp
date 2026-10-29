@@ -17,10 +17,15 @@
 // outside the red lines back inside (see recover_to_interior tests below).
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdio>
 #include <functional>
+#include <mutex>
+#include <thread>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -2144,6 +2149,361 @@ void test_grasp_refuses_a_non_finite_force_or_hold() {
   check(io.frames.empty(), "non-finite: the config setpoint sent no frame");
 }
 
+// ── release (Python suite: TestRelease) ──────────────────────────────────
+//
+// The C++ counterpart of actions' release(). The coordination state lives in
+// ReleaseCoordinator; these tests drive it through MotionEngine the same way
+// the Python suite drives actions.GripperActions.
+
+/// A full ramp plus a hold, on real threads: `sleep_fn` yields the CPU instead
+/// of sleeping so the grasp thread does not hog the core (Python uses
+/// `time.sleep(0)` for the same reason).
+MotionConfig yielding_config() {
+  MotionConfig m;
+  m.sleep_fn = [](double) { std::this_thread::yield(); };
+  m.monotonic_fn = tick_clock(0.1);
+  return m;
+}
+
+bool wait_for_flag(const std::atomic<bool>& flag, int timeout_ms = 2000) {
+  for (int i = 0; i < timeout_ms && !flag.load(); ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return flag.load();
+}
+
+void test_release_from_another_thread_ends_a_zero_hold() {
+  // The workpiece is the Python suite's yielding one: the hold keeps pressing
+  // it further in, so the pose at release time is NOT the hand-over pose. The
+  // opening must be measured from the hand-over pose anyway.
+  const double object_rad = (kPosOpenRad + kPosClosedRad) / 2.0;
+  // stops = true, unlike the Python case: the workpiece yields for as long as
+  // the hold presses, and the hold is unbounded here (hold_s = 0). Without the
+  // closed-side stop the drift has no end, and if the main thread is starved
+  // for the few milliseconds it takes to walk `hold_runaway_rad` past the
+  // calibrated limit, the runaway watch ends the grasp before the release
+  // arrives — the test then fails on timing, not on behaviour. With the stop
+  // the fake clamps the workpiece at the calibrated limit, which is short of
+  // the guard's threshold, so the guard cannot fire. Everything the test is
+  // about — the grip pose is recorded before the setpoint presses the jaws
+  // further in — is unchanged, because the jaws still yield past it.
+  FakeIo io(test_config(), -1.0, object_rad, 0.0, /*stops=*/true,
+            /*yield_rad_s=*/0.05, /*yield_tau_nm=*/0.5);
+  SafetyGuard guard = make_guard();
+  ReleaseCoordinator coord;
+  MotionEngine engine(io, guard, yielding_config(), &coord);
+
+  std::atomic<bool> started{false};
+  std::atomic<double> hold_pos{kNaN};
+  GraspResult grasped;
+  std::thread grasp_thread([&] {
+    grasped = engine.grasp(20.0, 0.0, [&](const MoveProgress& p) {
+      if (p.phase == MovePhase::kHold) {
+        started.store(true);
+        hold_pos.store(p.pos_rad);
+      }
+    });
+  });
+  check(wait_for_flag(started), "release: the hold started");
+  const std::optional<double> grip = coord.grip_rad();
+  check(grip.has_value(), "release: the hand-over pose was recorded");
+
+  // Wait until the workpiece has yielded past the hand-over pose — otherwise
+  // "grip pose" and "current pose" are the same number and the assertion
+  // below could not tell which one the opening used.
+  if (grip.has_value()) {
+    for (int i = 0; i < 2000; ++i) {
+      if (hold_pos.load() - *grip > 0.01) break;
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    check(hold_pos.load() - *grip > 0.01,
+          "release: the workpiece did not yield — the basis is untested");
+  }
+
+  const ReleaseResult result = engine.release(10.0, false, 5.0);
+  grasp_thread.join();
+
+  check(grasped.released, "release: grasp reports released");
+  check(grasped.ok, "release: a normal release leaves the grasp ok");
+  check(result.ok, "release: the release completed");
+  check(!result.aborted, "release: not an abort");
+
+  if (grip.has_value()) {
+    const GripperConfig& gcfg = io.config();
+    const double s = gcfg.close_sign();
+    const double grip_mm =
+        (gcfg.pos_closed_rad - *grip) * s * gcfg.rad_to_mm;
+    const double expected_mm = grip_mm + 10.0;
+    const double expected_rad =
+        gcfg.pos_closed_rad - s * expected_mm / gcfg.rad_to_mm;
+    check_near(result.target_rad, expected_rad, 1e-6,
+               "release: target measured from the hand-over pose");
+    check_near(result.opened_mm, expected_mm, 1e-3,
+               "release: opened_mm is the target opening");
+    check_near(result.state.position_rad, expected_rad,
+               MotionConfig{}.reach_tol,
+               "release: the jaws arrived at the target");
+  }
+
+  // The opening is a ramp after the hold, not a step: the hold frames are the
+  // only ones carrying a feed-forward torque.
+  std::size_t last_hold = 0;
+  for (std::size_t i = 0; i < io.frames.size(); ++i) {
+    if (io.frames[i].tau_ff != 0.0) last_hold = i;
+  }
+  std::vector<const Frame*> opens;
+  for (std::size_t i = last_hold + 1; i < io.frames.size(); ++i) {
+    if (io.frames[i].kp != 0.0) opens.push_back(&io.frames[i]);
+  }
+  check(opens.size() > 5, "release: the opening is a ramp, not a step");
+  if (opens.size() > 1) {
+    const double first_pos = opens.front()->pos_after;
+    check(std::fabs(opens.front()->q - first_pos) <
+              std::fabs(result.target_rad - first_pos) / 2.0,
+          "release: the first opening frame is not the target");
+    bool monotone = true;
+    for (std::size_t i = 1; i < opens.size(); ++i) {
+      if (opens[i]->q > opens[i - 1]->q + 1e-9) monotone = false;
+    }
+    check(monotone, "release: the opening ramp is monotone");
+  }
+}
+
+void test_release_during_the_approach_aborts_it() {
+  FakeIo io(test_config(), -1.0, std::nullopt, 0.0, /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  ReleaseCoordinator coord;
+  MotionEngine engine(io, guard, yielding_config(), &coord);
+
+  std::atomic<bool> asked{false};
+  const GraspResult res = engine.grasp(20.0, 0.0, [&](const MoveProgress& p) {
+    if (p.phase == MovePhase::kMove && !asked.exchange(true)) {
+      check(engine.request_release(5.0),
+            "release-approach: the request was queued");
+    }
+  });
+
+  check(asked.load(), "release-approach: the progress callback ran");
+  check(res.released, "release-approach: the grasp reports released");
+  check(res.ok, "release-approach: a normal release is ok");
+  check(res.cycles == 0, "release-approach: the hold never took over");
+  // No hold frame may have gone out: those are the only ones with tau_ff.
+  bool hold_frame = false;
+  for (const Frame& f : io.frames) {
+    if (f.tau_ff != 0.0) hold_frame = true;
+  }
+  check(!hold_frame, "release-approach: no hold frame was sent");
+}
+
+void test_abort_sends_no_open_ramp() {
+  const double object_rad = (kPosOpenRad + kPosClosedRad) / 2.0;
+  FakeIo io(test_config(), -1.0, object_rad, 0.0, /*stops=*/false);
+  SafetyGuard guard = make_guard();
+  ReleaseCoordinator coord;
+  MotionEngine engine(io, guard, yielding_config(), &coord);
+
+  std::atomic<bool> started{false};
+  GraspResult grasped;
+  std::thread grasp_thread([&] {
+    grasped = engine.grasp(20.0, 0.0, [&](const MoveProgress& p) {
+      if (p.phase == MovePhase::kHold) started.store(true);
+    });
+  });
+  check(wait_for_flag(started), "abort: the hold started");
+
+  const auto t0 = std::chrono::steady_clock::now();
+  const ReleaseResult result = engine.release(10.0, true, 5.0);
+  const double elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count();
+  grasp_thread.join();
+
+  check(result.aborted, "abort: the result says aborted");
+  check(!result.ok, "abort: ok is false");
+  check(!grasped.ok, "abort: the grasp is not ok");
+  check(grasped.released, "abort: the grasp reports released");
+  check(elapsed < 1.0, "abort: returned promptly");
+
+  // After the last hold frame, nothing with gains: no opening ramp.
+  std::size_t last_hold = 0;
+  for (std::size_t i = 0; i < io.frames.size(); ++i) {
+    if (io.frames[i].tau_ff != 0.0) last_hold = i;
+  }
+  for (std::size_t i = last_hold; i < io.frames.size(); ++i) {
+    check(io.frames[i].kp == 0.0, "abort: a gain-carrying frame was sent");
+  }
+}
+
+void test_release_without_a_grasp_opens_from_the_current_position() {
+  FakeIo io(test_config(), kPosClosedRad, std::nullopt, 0.0, /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  ReleaseCoordinator coord;
+  MotionEngine engine(io, guard, instant_config(), &coord);
+
+  const ReleaseResult result = engine.release(5.0);
+
+  const GripperConfig& gcfg = io.config();
+  const double expected_rad =
+      gcfg.pos_closed_rad - gcfg.close_sign() * 5.0 / gcfg.rad_to_mm;
+  check(result.ok, "release-current: the release completed");
+  check(!result.aborted, "release-current: not an abort");
+  check_near(result.target_rad, expected_rad, 1e-6,
+             "release-current: target from the current position");
+  check_near(result.opened_mm, 5.0, 1e-4,
+             "release-current: opened_mm");
+  check(!io.frames.empty(), "release-current: the opening ramp ran");
+  check_near(result.state.position_rad, expected_rad,
+             MotionConfig{}.reach_tol, "release-current: arrived");
+}
+
+void test_request_queue_rules() {
+  // The rules that make "two release() calls, one opening" true: a request
+  // already queued keeps ITS parameters, and the grasp thread consumes the
+  // queue exactly once. One exception, ported from Python: an abort overrides
+  // a queued normal release, because that request has not run yet.
+  ReleaseCoordinator coord;
+  check(!coord.submit(ReleaseCoordinator::Request{3.0, false}),
+        "request-queue: idle means nothing to queue");
+
+  coord.begin_grasp();
+  check(coord.submit(ReleaseCoordinator::Request{3.0, false}),
+        "request-queue: queued while a grasp runs");
+  check(coord.submit(ReleaseCoordinator::Request{9.0, false}),
+        "request-queue: the second call is not refused");
+  auto request = coord.take();
+  check(request.has_value(), "request-queue: the request is consumable");
+  if (request.has_value()) {
+    check_near(request->clearance_mm, 3.0, 0.0,
+               "request-queue: the first parameters win");
+    check(!request->abort, "request-queue: the first abort flag wins");
+  }
+  check(!coord.take().has_value(), "request-queue: consumed exactly once");
+
+  check(coord.submit(ReleaseCoordinator::Request{3.0, false}),
+        "abort-override: a normal release is queued");
+  check(coord.submit(ReleaseCoordinator::Request{9.0, true}),
+        "abort-override: the abort is accepted");
+  request = coord.take();
+  check(request.has_value(), "abort-override: the request is consumable");
+  if (request.has_value()) {
+    check(request->abort, "abort-override: abort replaced the normal release");
+    check_near(request->clearance_mm, 9.0, 0.0,
+               "abort-override: the abort's parameters are used");
+  }
+
+  check(coord.submit(ReleaseCoordinator::Request{1.0, true}),
+        "abort-kept: the abort is queued");
+  check(coord.submit(ReleaseCoordinator::Request{7.0, false}),
+        "abort-kept: the normal release is accepted");
+  request = coord.take();
+  check(request.has_value(), "abort-kept: the request is consumable");
+  if (request.has_value()) {
+    check(request->abort, "abort-kept: an abort is never replaced by an opening");
+    check_near(request->clearance_mm, 1.0, 0.0,
+               "abort-kept: the abort's parameters are kept");
+  }
+  coord.end_grasp();
+}
+
+void test_request_release_alone_does_not_send_frames() {
+  FakeIo io(test_config(), -1.0, std::nullopt, 0.0, /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  ReleaseCoordinator coord;
+  MotionEngine engine(io, guard, yielding_config(), &coord);
+
+  check(!engine.request_release(3.0),
+        "request-only: no grasp means nothing to release");
+  check(io.frames.empty(), "request-only: no frame without a grasp");
+
+  // Park the grasp thread inside its hold progress callback, so the frame
+  // count cannot move while the request is queued.
+  std::mutex mutex;
+  std::condition_variable cv;
+  bool parked = false;
+  bool let_go = false;
+  std::thread grasp_thread([&] {
+    (void)engine.grasp(20.0, 0.0, [&](const MoveProgress& p) {
+      if (p.phase != MovePhase::kHold) return;
+      std::unique_lock<std::mutex> lock(mutex);
+      if (!parked) {
+        parked = true;
+        cv.notify_all();
+        cv.wait(lock, [&] { return let_go; });
+      }
+    });
+  });
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait_for(lock, std::chrono::seconds(2), [&] { return parked; });
+  }
+  check(parked, "request-only: the grasp thread parked in the hold");
+  const std::size_t before = io.frames.size();
+  check(engine.request_release(3.0), "request-only: active grasp -> true");
+  check(io.frames.size() == before,
+        "request-only: request_release sent no frame itself");
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    let_go = true;
+  }
+  cv.notify_all();
+  grasp_thread.join();
+}
+
+void test_release_times_out_without_frames() {
+  FakeIo io(test_config(), -1.0, std::nullopt, 0.0, /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  ReleaseCoordinator coord;
+  MotionEngine engine(io, guard, instant_config(), &coord);
+
+  coord.begin_grasp();  // a "grasp" that never consumes the request
+  const auto t0 = std::chrono::steady_clock::now();
+  const ReleaseResult result = engine.release(10.0, false, 0.05);
+  const double elapsed =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+          .count();
+  coord.end_grasp();
+
+  check(!result.ok, "release-timeout: ok is false");
+  check(elapsed < 1.0, "release-timeout: it returned after the timeout");
+  check(io.frames.empty(), "release-timeout: it sent no frame");
+
+  // A negative timeout is not an argument error in Python: it simply expires
+  // at once. Keep that (and still send nothing).
+  coord.begin_grasp();
+  const ReleaseResult negative = engine.release(10.0, false, -1.0);
+  coord.end_grasp();
+  check(!negative.ok, "release-timeout: negative timeout is ok=false");
+  check(io.frames.empty(), "release-timeout: negative timeout sends nothing");
+}
+
+void test_release_refuses_a_bad_clearance() {
+  for (double bad : {kNaN, kInf, -1.0}) {
+    FakeIo io(test_config(), -1.0, std::nullopt, 0.0, /*stops=*/true);
+    SafetyGuard guard = make_guard();
+    MotionEngine engine(io, guard, instant_config());
+
+    check_throws<CommandError>([&] { engine.release(bad); },
+                               "release-args: bad clearance refused");
+    check_throws<CommandError>([&] { engine.request_release(bad); },
+                               "release-args: request_release refuses it too");
+    check(io.frames.empty(), "release-args: no frame sent");
+  }
+
+  // A non-finite timeout is refused before anything is queued, like Python.
+  for (double bad : {kNaN, kInf}) {
+    FakeIo io(test_config(), -1.0, std::nullopt, 0.0, /*stops=*/true);
+    SafetyGuard guard = make_guard();
+    ReleaseCoordinator coord;
+    MotionEngine engine(io, guard, instant_config(), &coord);
+    coord.begin_grasp();
+    check_throws<CommandError>(
+        [&] { engine.release(10.0, false, bad); },
+        "release-args: non-finite timeout refused");
+    coord.end_grasp();
+    check(io.frames.empty(), "release-args: no frame for a bad timeout");
+  }
+}
+
 // ── zero-gravity (Python dump S7) ────────────────────────────────────────
 //
 // The sustain loop is wall-clock driven in both SDKs (0.005 s per frame), so
@@ -2680,6 +3040,14 @@ int main() {
   test_a_hold_entered_outside_the_travel_pushes_nothing();
   test_an_uncalibrated_config_gets_no_hold_guard();
   test_grasp_refuses_a_non_finite_force_or_hold();
+  test_release_from_another_thread_ends_a_zero_hold();
+  test_release_during_the_approach_aborts_it();
+  test_abort_sends_no_open_ramp();
+  test_release_without_a_grasp_opens_from_the_current_position();
+  test_request_queue_rules();
+  test_request_release_alone_does_not_send_frames();
+  test_release_times_out_without_frames();
+  test_release_refuses_a_bad_clearance();
   test_zero_gravity();
   test_ceilings_and_refusals();
   test_recovery_from_open_stop();

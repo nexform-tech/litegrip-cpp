@@ -180,6 +180,20 @@ class LiteGrip : private MotionIo {
   GraspResult grasp(std::optional<double> force_n = std::nullopt,
                     double hold_s = 0.0, MoveProgressCallback progress = {});
 
+  /// End an in-progress grasp() and open the jaws — callable from any thread,
+  /// including while grasp(0) is blocked in another one. With no grasp running
+  /// it opens in the calling thread. `clearance_mm` is how much further than
+  /// the declared grip pose the jaws open; `abort = true` is the E-stop form
+  /// (torque off, no opening move). See MotionEngine::release for the full
+  /// rules.
+  ReleaseResult release(double clearance_mm = 10.0, bool abort = false,
+                        std::optional<double> timeout_s = std::nullopt);
+
+  /// Non-blocking form of release(): queue the request if a grasp is running
+  /// and return true. Never sends a frame — safe for a UI thread or an E-stop
+  /// callback (not async-signal-safe). See MotionEngine::request_release.
+  bool request_release(double clearance_mm = 10.0, bool abort = false);
+
   /// Positioning move to an absolute opening in mm (0 = closed) at a constant
   /// speed. The same bounded ramp as goto_mm, so the same MoveResult reading
   /// (`ok` = reached && !stalled) and the same 4 mm lead cap. A speed of zero
@@ -400,6 +414,11 @@ class LiteGrip : private MotionIo {
                          const std::string& instance_channel);
 
   GripperConfig config_;
+  /// Shared with every MotionEngine this gripper constructs, so a grasp
+  /// running on one thread can be ended by release()/request_release() on
+  /// another. Deliberately not moved: a moved-to gripper starts with an idle
+  /// one, and a grasp in flight during a move is not a legal state anyway.
+  ReleaseCoordinator release_;
   std::unique_ptr<GripperBus> bus_;
   std::unique_ptr<SafetyGuard> safety_;
   std::optional<int> mst_id_;
