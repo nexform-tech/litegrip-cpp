@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate test/test_golden_generated.cpp from the PYTHON SDK.
+"""Generate test/golden_generated.hpp from the PYTHON SDK.
 
 This is the port's parity harness. Rather than hand-copying expected values
 (which is how a port drifts), it drives the real Python implementation and
@@ -7,6 +7,9 @@ emits the exact bytes it produces; the C++ test then has to reproduce them.
 
 Deterministic: fixed seed, so regenerating without changing the Python SDK
 produces a byte-identical file.
+
+The Python SDK is taken from a sibling checkout of `litegrip-python` when one
+exists (the usual development layout), otherwise from an installed copy.
 
 Usage (from litegrip_cpp/):
 
@@ -21,10 +24,23 @@ import struct
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SDK_ROOT = os.path.normpath(os.path.join(HERE, "..", "..", "litegrip_driver"))
-sys.path.insert(0, SDK_ROOT)
+# Both layouts are supported: litegrip-cpp/../litegrip-python/src (the checkout
+# this port lives next to) and an installed `litegrip-python`. The sibling comes
+# first: it is the source this repo is ported from, so a stale installed copy
+# must not silently decide what "parity" means.
+SIBLING_SRC = os.path.normpath(
+    os.path.join(HERE, "..", "..", "litegrip-python", "src"))
+if os.path.isdir(os.path.join(SIBLING_SRC, "litegrip")):
+    sys.path.insert(0, SIBLING_SRC)
 
-from litegrip.can import protocol as P  # noqa: E402
+try:
+    from litegrip.can import protocol as P  # noqa: E402
+except ModuleNotFoundError as error:  # pragma: no cover - setup error
+    raise SystemExit(
+        "generate_golden.py drives the Python SDK and could not import "
+        "`litegrip`. Install it (`pip install litegrip-python`) or check out "
+        "litegrip-python next to litegrip-cpp (expected at "
+        f"{SIBLING_SRC}).") from error
 
 SEED = 20260928
 N_QUANT = 64
