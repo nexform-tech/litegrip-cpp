@@ -13,8 +13,8 @@
     Declared as a plain-cmake package (build_type cmake); the library itself is
     built and installed like any ordinary CMake project.
   </description>
-  <maintainer email="TODO@email.com">TODO</maintainer>
-  <license>MIT</license>
+  <maintainer email="127832643+cao-xiao-hao@users.noreply.github.com">cao-xiao-hao</maintainer>
+  <license>Apache-2.0</license>
 
   <buildtool_depend>cmake</buildtool_depend>
   <export>

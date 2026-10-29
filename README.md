@@ -231,7 +231,9 @@ design, and `refresh_status()` to force a frame rather than wait for one.
 | `open(speed_mm_s=None, progress={})` → `MoveResult` | Ramps toward the calibrated open-side stop, pressing onto it. With `GripperConfig::work_stroke_mm` strictly inside the travel it stops at that opening instead, as an ordinary positioning move. |
 | `close(speed_mm_s=None, progress={})` → `MoveResult` | The same, toward the closed side. `work_stroke_mm` is an open-side number and does not change where a close ends. |
 | `home()` → `MoveResult` | Ramps to the calibrated closed position. Not a press: it stops *on* the zero instead of loading it. |
-| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | Closes onto the object — or onto the closed-side calibrated stop if there is nothing there — then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. The hold takes over only once the jaw is stopped: `stalled` (something is between the jaws) or `reached` (the jaws closed empty). `hold_s = 0` holds until a fault or the runaway watch. `force_n` empty uses `MotionConfig::force_n` (20 N). |
+| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | Closes onto the object — or onto the closed-side calibrated stop if there is nothing there — then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. The hold takes over only once the jaw is stopped: `stalled` (something is between the jaws) or `reached` (the jaws closed empty). `hold_s = 0` holds until a fault or the runaway watch. `force_n` empty uses `MotionConfig::force_n` (20 N). End a `hold_s = 0` grip with `release()`. |
+| `release(clearance_mm=10.0, abort=false, timeout_s=None)` → `ReleaseResult` | Ends an in-progress `grasp()` and opens the jaws: the grip setpoint is dropped, then the jaws ramp to `max(current, hand-over pose) + clearance_mm`, clamped to the calibrated open stop. Callable from any thread, including while `grasp(hold_s = 0)` is blocked in another one — see [Ending a grip](#ending-a-grip). With no grasp running it opens in the calling thread. `abort = true` drops the torque without opening. A timeout is `ok = false`, not an exception. |
+| `request_release(clearance_mm=10.0, abort=false)` → `bool` | Non-blocking form of `release()`: queues the request for a running `grasp()` and returns `true`, else returns `false`. Never sends a frame — safe from a UI thread or an E-stop callback. |
 | `goto_mm(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | Ramp to a position in millimetres (0 = closed). |
 | `goto_rad(position_rad, kp=None, kd=None, dq_target=0.0, tau_feedforward=0.0, duration=0.5)` → `MoveResult` | The same in radians. `dq_target` and `tau_feedforward` must be 0 — see below. |
 | `move_to(target_rad, kp=None, kd=None, tau_feedforward=0.0, duration=1.0)` → `MoveResult` | The same as `goto_rad`, with a longer default `duration`. |
@@ -345,6 +347,50 @@ them is a manual step: `disable()` so the jaws are back-drivable, push them back
 inside the red lines, `enable()`, and carry on. That refusal is about where the
 jaws are, not about a damaged mechanism.
 
+### Ending a grip
+
+`grasp(force_n, hold_s = 0)` holds until a fault — that is what makes it useful
+for a pick-and-place that decides when to let go. `release()` is how it ends:
+
+```cpp
+std::thread grasp_thread([&] { gripper.grasp(20.0); });  // holds indefinitely
+// ... somewhere else, when the part should be dropped:
+const litegrip::ReleaseResult drop = gripper.release();   // ends the grasp, opens 10 mm
+```
+
+The grasp thread owns the CAN frames — two threads ramping the same bus would
+each lose their own lead cap, and a position frame injected into the gainless
+hold would break its continuous climb. So `release()` sends nothing itself: it
+queues the request, the grasp thread sees it before its next frame (5 ms),
+drops the setpoint, performs the opening, and `release()` returns that outcome.
+With no grasp running, `release()` opens in the calling thread instead.
+
+- **It opens from the hand-over pose**, not from wherever the setpoint pressed
+  the jaws to. The 20 N hold drives a few millimetres further in on a compliant
+  part; opening from there would free that much less. The target is
+  `max(current, hand-over pose) + clearance_mm`, clamped to the calibrated open
+  stop and reached by the same bounded ramp as every other move.
+- **`abort = true` is the E-stop form**: it drops the torque and sends no
+  opening move, so the jaws stay where they are and can be back-driven by hand.
+  The grasp returns `ok = false, released = true`, and the `ReleaseResult` has
+  `aborted` set and `ok` false.
+- **Two calls during one grasp open once.** The second sees a request already
+  queued and waits for the same result, keeping the first call's parameters.
+  The one exception is an abort: it replaces a queued normal release, because
+  that request has not run yet and "stop now" must not become an opening.
+- `GraspResult::released` tells the grasp's own caller that it ended because it
+  was asked to, not because of a fault. `ReleaseResult::opened_mm` is the
+  opening the release aimed at (mm from the closed zero), not "how much further
+  it opened"; `state.position_mm` says where the jaws really ended up.
+- `request_release()` is the non-blocking twin: it only queues the request and
+  returns whether a grasp was running. It never sends a frame and never blocks,
+  which is what an E-stop callback or a UI thread needs.
+- `release()` waits `timeout_s` (default `MotionConfig::release_wait_s`, 10 s)
+  for the grasp thread. A timeout is reported as `ok = false` with a warning on
+  stderr — the call never sends frames, so there is nothing else it could do.
+  `clearance_mm` must be finite and non-negative; anything else throws
+  `CommandError` before a frame is sent.
+
 ### Calibration
 
 See [Measure the travel](#4-measure-the-travel) for the workflow and
@@ -366,9 +412,10 @@ See [Measure the travel](#4-measure-the-travel) for the workflow and
 | Type | Fields | `bool()` is |
 | --- | --- | --- |
 | `MoveResult` | `ok`, `reached`, `stalled`, `protection_tripped`, `released`, `state`, `target_rad`, `limit_rad`, `final_cmd_rad`, `steps` | `ok` |
-| `GraspResult` | `ok`, `reached`, `stalled`, `state`, `target_rad`, `force_n`, `cycles`, `travel_guard` | `ok` |
+| `GraspResult` | `ok`, `reached`, `stalled`, `state`, `target_rad`, `force_n`, `cycles`, `travel_guard`, `released` | `ok` |
+| `ReleaseResult` | `ok`, `state`, `opened_mm`, `target_rad`, `aborted` | `ok` |
 
-Both define `operator bool` returning `ok`, so `if (gripper.close())` works. What
+All three define `operator bool` returning `ok`, so `if (gripper.close())` works. What
 `ok` **means** depends on where the target sits:
 
 - **`open()` / `close()`** aim *past* the calibrated limit, on purpose, so
@@ -404,7 +451,9 @@ Three flags explain a failure:
 
 - `protection_tripped` — the travel-leg torque protection ended the move and
   let go on purpose (see [A blocked press lets go](#a-blocked-press-lets-go)).
-- `released` — a positioning move fell short and the engine took the force off.
+- `released` — the force was taken off on purpose: a positioning move fell
+  short, or `grasp()` ended because another thread called `release()` (then
+  `ok` follows the release: `true` for a normal opening, `false` for an abort).
   Distinct from `protection_tripped`, which releases on its own, so a protected
   move leaves `released == false`.
 - `travel_guard` (on `GraspResult`) — the runaway watch cut a hold short (see
@@ -466,6 +515,7 @@ tuned-on-hardware values, so changing nothing is a supported configuration.
 | `stop_release_s` | `0.2` | Limp tail after a trip or a released shortfall |
 | `force_n` / `force_ramp_n_s` | `20.0` / `20.0` | Default grip force, and the hold's ramp rate in N/s |
 | `hold_interval` | `0.2` | Hold slice length, s |
+| `release_wait_s` | `10.0` | How long `release()` waits for the grasp thread when `timeout_s` is not given |
 | `hold_runaway_rad` | `0.05` | The runaway watch's threshold |
 | `press_safety` | `0.9` | Budget margin: the press lands just under the setpoint |
 | `sleep_fn` / `monotonic_fn` | real time | The engine's clock seams; tests no-op the sleep to run a ramp instantly |
@@ -957,7 +1007,8 @@ allows:
 | `can::MotorController` | multi-motor dispatch on one bus | `can/controller.py` |
 | `GripperBus` | single-gripper bus API (init = hold) | `protocols/can_bus.py` |
 | `LiteGrip` | high-level API | `gripper.py` |
-| `MotionEngine` | action engine: open/close/grasp/positioning ramps/zero-gravity | `actions.py` + `gripper.py` |
+| `MotionEngine` | action engine: open/close/grasp/release/positioning ramps/zero-gravity | `actions.py` + `gripper.py` |
+| `ReleaseCoordinator` | cross-thread release request/result hand-off | `actions.py` release state |
 | `SafetyGuard` + `SafetyLimits` | red lines, torque budget, watchdog, modes | `safety_limits.py` (core) |
 | `ControlLoop` | background 200 Hz streaming + rate limit + gate | old Python-side daemon |
 
@@ -979,6 +1030,7 @@ allows:
 | A `goto` returns `ok = false` with `released = true` | The move fell short and the engine took the force off rather than leaving the drive pressing. Check what is in the travel. |
 | `GraspResult::travel_guard` is set | The runaway watch tripped: the measured position walked past the closed-side calibrated limit. See [Gripping and force](#gripping-and-force). An empty `grasp()` can leave the jaws there, and if they are past the recovery window the next move refuses with `... outside the unit's own validated travel` until you `disable()`, push them back inside the red lines by hand, and `enable()`. |
 | `open()` stops short of the full travel | A work stroke is configured — that is what it is for. See [The work stroke](#the-work-stroke). |
+| `release()` returns `ok = false` and warns "the grasp thread did not finish the release within ... s" | The timeout expired before the grasp thread consumed the request. It sends no frames itself, so check that a `grasp()` really is running on another thread (`request_release()` returns `false` when none is) and raise `timeout_s` if the opening ramp is longer than it allows. |
 | `CommError: CAN send timeout ...` | The send buffer stayed full for the whole retry window, so a frame did **not** go out. High bus load or a wedged interface; the SDK reports it instead of dropping the frame quietly. |
 | `SafetyFault: ...: no valid feedback — motion is refused` | No fresh status frame. A disabled motor does not stream them; `refresh_status()` asks for one. |
 

@@ -33,8 +33,10 @@
 
 #pragma once
 
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
 
 #include "litegrip/models.hpp"
@@ -159,6 +161,12 @@ struct MotionConfig {
   // actions.MotionConfig.force_ramp_n_s.
   double force_ramp_n_s = 20.0;    // hold ramp rate, N/s
   double hold_interval = 0.2;      // hold slice length, s
+  // How long release() waits for the grasp thread to finish the release when
+  // the caller gives no timeout. One opening ramp is 0.2 s at the default
+  // speed; 10 s covers a slow mount plus the hold slice in flight, and still
+  // returns instead of blocking a UI thread or an E-stop path forever.
+  // Mirrors actions.MotionConfig.release_wait_s.
+  double release_wait_s = 10.0;
   // Runaway detection for the force hold, rad: once the measured position has
   // run this far PAST the closed-side calibrated limit, the torque is dropped
   // and the hold ends.
@@ -285,6 +293,13 @@ struct MoveResult {
   /// Distinct from protection_tripped: that protection releases on its own, so
   /// a protected move leaves `released == false`.
   bool released = false;
+  /// The force-carrying approach was stopped by a release request (release() /
+  /// request_release()) rather than finishing its leg. Only grasp()'s
+  /// force-carrying approach sets it: that leg's endpoint is the grip the
+  /// caller asked for, and a release request means "do not grip". Ordinary
+  /// moves have their own endpoint and are never interrupted. Mirrors
+  /// actions.MoveResult.release_requested.
+  bool release_requested = false;
   GripperState state;
   double target_rad = 0.0;     // where the ramp aimed
   double limit_rad = 0.0;      // this end's calibrated limit
@@ -310,8 +325,99 @@ struct GraspResult {
   /// torque, this one the HOLD's excursion. A normal grasp never sets it: the
   /// jaws stop on the workpiece, or on the real stop at the calibrated limit.
   bool travel_guard = false;
+  /// The grasp was ended by release() / request_release(): the grasp thread
+  /// finished the release (or the abort) before returning. A normal release
+  /// leaves `ok == true`; an abort (`abort = true`) leaves it false. Distinct
+  /// from travel_guard, which is a fault; a release is the caller's own end.
+  /// Mirrors actions.GraspResult.released.
+  bool released = false;
 
   explicit operator bool() const noexcept { return ok; }
+};
+
+/// One release() outcome. Mirrors actions.ReleaseResult.
+///
+/// `opened_mm` is the OPENING THIS RELEASE AIMED AT (mm from the closed zero,
+/// the same convention as GripperState::position_mm), not "how much further it
+/// opened"; where the jaws really ended up is `state.position_mm`.
+/// `aborted == true` means the E-stop form: the torque was dropped and no
+/// opening move was sent, so `opened_mm` is the opening at that moment and
+/// `target_rad` the position it was dropped at.
+struct ReleaseResult {
+  bool ok = false;
+  GripperState state;
+  double opened_mm = 0.0;
+  double target_rad = 0.0;
+  bool aborted = false;
+
+  explicit operator bool() const noexcept { return ok; }
+};
+
+/// The cross-thread coordination behind release(), mirroring the fields and
+/// the rules of actions.GripperActions' release state.
+///
+/// Why it exists: frames may only be sent by the thread running grasp() — two
+/// threads ramping the same bus each lose their own lead cap, and a position
+/// frame injected into the gainless hold breaks its continuous climb. So a
+/// release from another thread (a UI thread, an E-stop callback) records a
+/// request here, the grasp thread consumes it before its next frame, performs
+/// the opening, and publishes the result; the caller waits on the condition
+/// variable and returns it.
+///
+/// The mutex guards only these few fields and **never** the bus: no method
+/// here sends a frame or blocks on IO. request_release() takes it for a few
+/// assignments, the grasp thread once per frame (5 ms). It is thread-safe but
+/// **not async-signal-safe** — a POSIX signal handler must not take a mutex.
+class ReleaseCoordinator {
+ public:
+  struct Request {
+    double clearance_mm = 10.0;
+    bool abort = false;
+  };
+
+  // ── the grasp thread ────────────────────────────────────────────────
+  /// Start a grasp from a clean slate: a request left over from the previous
+  /// grasp must not kill this one, and the previous result must not be handed
+  /// to this grasp's release() caller.
+  void begin_grasp();
+  /// The grasp is over: clear any unconsumed request, mark the coordinator
+  /// idle and wake every waiter.
+  void end_grasp();
+  /// Is a request waiting? Read before every frame by the force hold and the
+  /// force-carrying approach.
+  bool pending() const;
+  /// Consume the waiting request, if any.
+  std::optional<Request> take();
+  /// Record the hand-over pose and consume a request in ONE critical section,
+  /// so a request that lands exactly at the hand-over cannot be missed. Returns
+  /// the request when one was waiting (and does not record the pose then).
+  std::optional<Request> record_grip_or_take(double grip_rad);
+  std::optional<double> grip_rad() const;
+  /// Store the release outcome. Written before end_grasp(), so a waiter that
+  /// wakes always sees it.
+  void publish(const ReleaseResult& result);
+
+  // ── any thread ──────────────────────────────────────────────────────
+  /// Queue `request` if a grasp is running; returns "was a grasp running?".
+  /// When one is already queued, the FIRST one's parameters win (a second
+  /// call is just "hurry up"), so two requests never open twice — with one
+  /// exception: an abort overrides a queued normal release, because that
+  /// request has not run yet and "stop now" must not become an opening. The
+  /// reverse never happens.
+  bool submit(const Request& request);
+  /// Wait until the grasp finishes (end_grasp). False on timeout.
+  bool wait_done(double timeout_s);
+  /// The last published result; keeps its value until the next grasp begins,
+  /// so two waiters on one grasp both see it.
+  std::optional<ReleaseResult> result() const;
+
+ private:
+  mutable std::mutex mutex_;
+  std::condition_variable done_;
+  bool active_ = false;
+  std::optional<Request> request_;
+  std::optional<ReleaseResult> result_;
+  std::optional<double> grip_rad_;
 };
 
 // ── the calibrated travel ────────────────────────────────────────────────
@@ -461,7 +567,12 @@ ApproachTerms force_approach_terms(double kp, double kd, double speed_rad_s,
 /// checks "enabled" and the guard latch itself, before anything moves.
 class MotionEngine {
  public:
-  MotionEngine(MotionIo& io, SafetyGuard& safety, MotionConfig config = {});
+  /// `release` is the shared coordinator release()/request_release() use to
+  /// reach a grasp running on another thread. Leave it null and the engine
+  /// behaves as before: a grasp cannot be ended from outside, and release()
+  /// opens in the calling thread. LiteGrip passes its own coordinator.
+  MotionEngine(MotionIo& io, SafetyGuard& safety, MotionConfig config = {},
+               ReleaseCoordinator* release = nullptr);
 
   /// Full open / full close: drive until the stop stalls the motor (light
   /// press past the calibrated limit — the endpoint is the physical stop).
@@ -496,6 +607,41 @@ class MotionEngine {
   /// physical.
   GraspResult grasp(std::optional<double> force_n = std::nullopt,
                     double hold_s = 0.0, MoveProgressCallback progress = {});
+
+  /// End an in-progress grasp() and open the jaws — callable from any thread,
+  /// including while grasp(hold_s = 0) is blocked in another one.
+  ///
+  /// The grasp thread owns the CAN frames, so this never sends any itself
+  /// while a grasp is running: it queues the request, the grasp thread sees it
+  /// before its next frame (5 ms) and performs the opening, and this call
+  /// returns that outcome. With no grasp running it opens in the calling
+  /// thread.
+  ///
+  /// The jaws open from where the grip was DECLARED (the end of the
+  /// force-carrying approach), not from where the set force pressed them to: a
+  /// 20 N grip drives a few millimetres further in, and opening from there
+  /// would free that much less. The target is
+  /// max(current, grip) + clearance_mm, clamped to the calibrated open stop,
+  /// and it is reached by the same bounded ramp as every other move — never a
+  /// step command.
+  ///
+  /// `abort = true` is the E-stop form: drop the torque, send no opening move.
+  /// Two calls during one grasp join and open once; an abort, however,
+  /// replaces a release request that is still queued (see
+  /// ReleaseCoordinator::submit).
+  ///
+  /// Throws CommandError for a non-finite or negative `clearance_mm`; a
+  /// timeout is reported as ok == false, not thrown. Mirrors
+  /// actions.GripperActions.release.
+  ReleaseResult release(double clearance_mm = 10.0, bool abort = false,
+                        std::optional<double> timeout_s = std::nullopt);
+
+  /// Non-blocking form of release(): queue the request if a grasp is running
+  /// and return true, else return false. Never sends a frame — safe for a UI
+  /// thread or an E-stop callback (thread-safe, not async-signal-safe: it
+  /// takes the coordinator's mutex briefly). The grasp thread acts on it
+  /// before its next frame. Mirrors actions.GripperActions.request_release.
+  bool request_release(double clearance_mm = 10.0, bool abort = false);
 
   /// Positioning ramp to an absolute target: the SAME bounded ramp
   /// open()/close() run, with press = false. Mirrors
@@ -612,6 +758,9 @@ class MotionEngine {
     /// The position guard tripped — see GraspResult::travel_guard. Mirrors
     /// actions.HoldResult.guarded.
     bool guarded = false;
+    /// A release request ended the hold. The request is NOT consumed here —
+    /// grasp() takes it and performs the opening (or the abort).
+    bool release_requested = false;
   };
   /// Push force_n for hold_s: slices of frames_per_slice hold frames, then a
   /// blocking state readback (verbatim port of actions._hold_force), with the
@@ -646,7 +795,28 @@ class MotionEngine {
   /// apart (Python's actions._release). A zero-gain frame produces no force
   /// whatever `pos` is; it only hands the driver a command that is not a stale
   /// target. Returns the number of frames sent.
-  int release(double pos, const char* source);
+  ///
+  /// Named drop_torque rather than release so it cannot be confused with the
+  /// public release(), which is a different operation (open the jaws).
+  int drop_torque(double pos, const char* source);
+
+  /// Execute one release request in the CALLING thread: the abort form sends a
+  /// single zero-gain frame; the normal form computes
+  /// max(current, grip pose) + clearance_mm, clamps it into the calibrated
+  /// travel and runs the bounded opening ramp. Used when no grasp is running
+  /// (and by the grasp thread when one is).
+  ReleaseResult release_now(const ReleaseCoordinator::Request& request);
+
+  /// Fold a release performed by the grasp thread into the GraspResult the
+  /// caller's grasp() will return, publishing the ReleaseResult first so a
+  /// waiting release() sees it.
+  GraspResult grasp_ends_with_release(const ReleaseCoordinator::Request& request,
+                                      const MoveResult& move, double force,
+                                      int cycles);
+
+  /// The result of release() waiting on a grasp that did not finish in time.
+  ReleaseResult release_timeout_result(
+      const ReleaseCoordinator::Request& request);
 
   /// The recovery channel, engine-side (see the header comment). No-op when
   /// `measured` is already inside the red lines; otherwise drives inward under
@@ -671,6 +841,9 @@ class MotionEngine {
   MotionIo& io_;
   SafetyGuard& safety_;
   MotionConfig config_;
+  /// Shared with the caller's release()/request_release(); null = standalone
+  /// engine (tests, and every entry that does not run a grasp).
+  ReleaseCoordinator* release_;
 };
 
 }  // namespace litegrip
