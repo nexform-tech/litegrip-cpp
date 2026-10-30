@@ -177,6 +177,14 @@ class LiteGrip : private MotionIo {
   /// The hold is bounded by MotionConfig::hold_runaway_rad: a measured position
   /// that walks that far past the closed-side calibrated limit ends the hold
   /// with GraspResult::travel_guard set and ok false.
+  ///
+  /// The hand-over also never happens for an approach that stopped without
+  /// ever leaving its start pose while its budget was below
+  /// MotionConfig::breakaway_nm: the budget could not break static friction,
+  /// and handing that jaw to the torque-only hold would power it across the
+  /// free stroke. That outcome is GraspResult::no_bite with ok false and
+  /// cycles 0, and not one hold frame is sent. Above the breakaway a zero
+  /// displacement is contact and is held normally.
   GraspResult grasp(std::optional<double> force_n = std::nullopt,
                     double hold_s = 0.0, MoveProgressCallback progress = {});
 

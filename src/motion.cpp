@@ -682,11 +682,18 @@ MoveResult MotionEngine::move_to_limit(
   // merely parked would read as a stall. The press path is unaffected: its
   // target lies beyond the stop, where "arrived on the stop and not moving" IS
   // the stall worth reporting. Mirrors actions._move_to_limit.
+  // A force-carrying approach leaves one small hole here too: a start within
+  // reach_tol (0.02 rad ~= 0.9 mm) of the closed stop is not stall-judged, so
+  // no_bite cannot be set there — but `reached` is then true and the jaws are
+  // already within reach_tol of the end stop, so the hold has no free stroke
+  // to run. The README states the refusal as "the approach never moved from
+  // its start", not as "no hand-over ever".
   const bool judge_stall = press || dist_mm > config_.reach_tol * gcfg.rad_to_mm;
 
   std::vector<double> hist;
   hist.push_back(before.position_rad);
   bool stalled = false;
+  bool no_bite = false;            // force approach never left its start
   bool protection_tripped = false;
   bool release_requested = false;  // a release request ended the approach
   int over_torque = 0;  // consecutive samples over the stop_torque_nm threshold
@@ -794,7 +801,31 @@ MoveResult MotionEngine::move_to_limit(
     }
     if (judge_stall && win_delta.has_value() && (press || in_ramp) &&
         *win_delta < win_thresh_rad) {
-      stalled = true;
+      // "Not moving" is not "on the workpiece": with a force setpoint, a stop
+      // that never left the leg's start can also mean the budget could not
+      // break static friction. Counting that as contact hands a jaw with a
+      // free stroke ahead of it to the torque-only hold — a powered stroke
+      // (see MotionConfig::no_bite_mm). Refuse instead — but only when the
+      // budget really is below the breakaway: above it, moving nothing means
+      // something is there, which is contact and should be held
+      // (MotionConfig::breakaway_nm).
+      if (force_n.has_value() &&
+          *force_n * UnitConversion::kNToNm * config_.press_safety <
+              config_.breakaway_nm &&
+          std::fabs(pos - before.position_rad) <
+              config_.no_bite_mm / gcfg.rad_to_mm) {
+        no_bite = true;
+        std::fprintf(stderr,
+                     "[litegrip] %s: the approach never broke away — %.3f Nm "
+                     "moved the jaws %.2f mm from %+.5f rad before stopping "
+                     "(target %+.5f rad). Not contact; no hand-over.\n",
+                     source, *force_n * UnitConversion::kNToNm *
+                                          config_.press_safety,
+                     std::fabs(pos - before.position_rad) * gcfg.rad_to_mm,
+                     before.position_rad, target);
+      } else {
+        stalled = true;
+      }
       break;
     }
 
@@ -842,6 +873,7 @@ MoveResult MotionEngine::move_to_limit(
   result.stalled = stalled;
   result.protection_tripped = protection_tripped;
   result.release_requested = release_requested;
+  result.no_bite = no_bite;
   result.state = st;
   result.target_rad = target;
   result.limit_rad = limit;
@@ -1031,15 +1063,11 @@ GraspResult MotionEngine::hand_over(const MoveResult& move, double force,
       return grasp_ends_with_release(*request, move, force, /*cycles=*/0);
     }
   }
-  if (!(move.reached || move.stalled)) {
-    // Neither arrived nor on something — the jaw is still in free travel, and
-    // the position loop (kp x lead + kd x velocity error) is the only thing
-    // holding it back right now. The hold frames carry neither term, so handing
-    // a moving jaw over means wiring the setpoint torque straight onto a jaw
-    // that is still rolling: measured speed jumped from the velocity loop's
-    // 0.82 rad/s to 5.12 rad/s on 2026-10-13, still accelerating when hold_s
-    // ran out. Report the failure honestly instead of handing over.
-    drop_torque(move.state.position_rad, "grasp");
+  // The two refusals — "never left its start pose" (no_bite) and "neither
+  // arrived nor stalled" — differ only in the flag: both drop the force and
+  // report cycles = 0. Built in one place so a new field cannot reach only one
+  // of them (actions.GripperActions._refused_handover does the same).
+  const auto refused = [&](bool no_bite) {
     GraspResult result;
     result.ok = false;
     result.reached = move.reached;
@@ -1049,7 +1077,37 @@ GraspResult MotionEngine::hand_over(const MoveResult& move, double force,
     result.force_n = force;
     result.cycles = 0;
     result.travel_guard = false;
+    result.no_bite = no_bite;
     return result;
+  };
+
+  if (move.no_bite) {
+    // The approach never left its start pose: either a workpiece sits right
+    // there, or the setpoint's 0.9x budget cannot break static friction. The
+    // two look identical to the motor, and what would take over is the
+    // torque-only hold — no position term, no speed limit, and 1.0x of the
+    // setpoint, a tenth more than the approach. Guessing wrong costs a powered
+    // stroke; refusing costs one failed grasp. Refuse.
+    drop_torque(move.state.position_rad, "grasp");
+    std::fprintf(stderr,
+                 "[litegrip] grasp: handed back, not held — the approach never "
+                 "broke away (%.1f N setpoint, %.3f Nm budget, stopped at "
+                 "%.1f mm). The hold would push a free stroke; the torque is "
+                 "dropped instead.\n",
+                 force, force * UnitConversion::kNToNm * config_.press_safety,
+                 move.state.position_mm);
+    return refused(/*no_bite=*/true);
+  }
+  if (!(move.reached || move.stalled)) {
+    // Neither arrived nor on something — the jaw is still in free travel, and
+    // the position loop (kp x lead + kd x velocity error) is the only thing
+    // holding it back right now. The hold frames carry neither term, so handing
+    // a moving jaw over means wiring the setpoint torque straight onto a jaw
+    // that is still rolling: measured speed jumped from the velocity loop's
+    // 0.82 rad/s to 5.12 rad/s on 2026-10-13, still accelerating when hold_s
+    // ran out. Report the failure honestly instead of handing over.
+    drop_torque(move.state.position_rad, "grasp");
+    return refused(/*no_bite=*/false);
   }
   // The hand-over pose and the request are read in ONE critical section: a
   // request landing between the two would otherwise be missed, and the hold

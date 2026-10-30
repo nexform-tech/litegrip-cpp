@@ -126,6 +126,46 @@ struct MotionConfig {
   // force anyway.
   double press_safety = 0.9;       // budget margin: the press lands under the setpoint
 
+  // ── a force-carrying approach that never moved from its start ──────────
+  // The position window only sees "not moving", and "not moving" has three
+  // causes: the workpiece, the calibrated stop, and — the dangerous one — a
+  // budget below static friction, so the jaws never broke away at all. That
+  // third case used to be read as contact and handed to the torque-only hold,
+  // whose torque is the setpoint's full 1.0x while the approach only spends
+  // 0.9x: the extra tenth is exactly what breaks away, and the jaws accelerate
+  // across the free stroke under the setpoint (2026-10-29 bench: a 2 N grasp's
+  // approach pressed 0.18 Nm and moved nothing; the hold took over at 0.20 Nm
+  // and walked 19 mm).
+  // So inside a force-carrying approach, a stop closer than this to the start,
+  // with a budget below breakaway_nm, is NOT contact: it is reported as "never
+  // broke away" (MoveResult::no_bite), the force is dropped and no hand-over
+  // happens. The cost is that a workpiece already touching at the start pose is
+  // refused too when the budget is that small — the motor cannot tell the two
+  // apart, and refusing costs one failed grasp while passing it through costs a
+  // powered stroke.
+  // 0.5 mm sits under the bench's closed-side stick-slip dead band (~0.0103 rad
+  // ~= 0.76 mm): a "press" shorter than that is below what the encoder can
+  // resolve, and a real workpiece cannot hold still in a gap that narrow.
+  double no_bite_mm = 0.5;
+
+  // ── the breakaway torque: which "not moving" a zero displacement is ────
+  // The criterion above only holds when the approach's BUDGET could not break
+  // static friction in the first place. A budget well above the breakaway that
+  // still moves nothing has almost certainly met something — that is contact,
+  // it should be held, and the hold then presses the setpoint with nothing
+  // ahead of it to run into. So the verdict tightens once more: only a budget
+  // (force_n x UnitConversion::kNToNm x press_safety) below this value turns a
+  // zero-displacement stop into no_bite; above it the stop stays `stalled`.
+  // Without that layer, a 20 N grasp of a part already against the open jaw —
+  // or a re-grasp in place after release(abort = true), which sends no opening
+  // move — would be refused.
+  // 0.2 Nm is this unit's measured breakaway (2026-10-29: the approach pressed
+  // 0.18 Nm and did not move; the hold pressed 0.20 Nm and walked 19 mm, so it
+  // lies inside 1.8-2.0 N). In setpoints: up to 2.2 N the budget is under it
+  // and a zero-displacement stop is refused; from 2.5 N the budget is over it
+  // and the stop is read as contact.
+  double breakaway_nm = 0.2;
+
   // ── travel-leg stall protection (~7 N) ────────────────────────────────
   // In the travel leg a press move's lead cap is still max_lead_mm, so a jaw
   // hard-blocked halfway keeps pushing at kp x cap ~= 7.6 Nm. The position
@@ -305,6 +345,16 @@ struct MoveResult {
   double limit_rad = 0.0;      // this end's calibrated limit
   double final_cmd_rad = 0.0;  // last commanded position
   int steps = 0;               // frames actually run
+  /// The force-carrying approach stopped WITHOUT ever leaving its start pose,
+  /// with a budget below MotionConfig::breakaway_nm: the stop is within
+  /// MotionConfig::no_bite_mm of where the leg began. Not contact — the budget
+  /// could not break static friction (see MotionConfig::no_bite_mm). `stalled`
+  /// is false on this path, and grasp() refuses the hand-over. Mirrors
+  /// actions.MoveResult.no_bite.
+  ///
+  /// Last in the struct, like the Python twin's field, so adding it keeps
+  /// positional aggregate initialisation compiling for downstream code.
+  bool no_bite = false;
 
   explicit operator bool() const noexcept { return ok; }
 };
@@ -331,6 +381,14 @@ struct GraspResult {
   /// from travel_guard, which is a fault; a release is the caller's own end.
   /// Mirrors actions.GraspResult.released.
   bool released = false;
+  /// The closing leg never moved off its start pose: the setpoint's 0.9x
+  /// budget was below MotionConfig::breakaway_nm and could not break static
+  /// friction (or a workpiece sat right at the start). NO hand-over happened —
+  /// not one hold frame was sent — so `cycles` is 0 and `stalled` / `reached`
+  /// are both false. Mirrors actions.GraspResult.no_bite and
+  /// MotionConfig::no_bite_mm. Last in the struct, like the Python twin's
+  /// field, so adding it keeps positional aggregate initialisation compiling.
+  bool no_bite = false;
 
   explicit operator bool() const noexcept { return ok; }
 };
