@@ -168,7 +168,7 @@ class FakeMotor {
             int err, std::optional<double> limit_lo,
             std::optional<double> limit_hi, double yield_rad_s = 0.0,
             double yield_tau_nm = 0.0, double creep_rad_s_per_nm = 0.0,
-            int report_lag_ticks = 0)
+            int report_lag_ticks = 0, double breakaway_tau_nm = 0.0)
       : pos(pos),
         err(err),
         block_rad(block_rad),
@@ -179,6 +179,7 @@ class FakeMotor {
         yield_tau_nm(yield_tau_nm),
         creep_rad_s_per_nm(creep_rad_s_per_nm),
         report_lag_ticks(std::max(0, report_lag_ticks)),
+        breakaway_tau_nm(breakaway_tau_nm),
         block_dir(block_rad.has_value()
                       ? (*block_rad > pos ? 1.0 : -1.0)
                       : 0.0) {
@@ -220,6 +221,14 @@ class FakeMotor {
     // Creep under pure feed-forward torque (see the class comment). Zero by
     // default, so it does not enter any other case's arithmetic.
     v += creep_rad_s_per_nm * tau_ff;
+    // Static friction (fake_can.py's breakaway_tau_nm): a jaw at rest does not
+    // move until the frame's net torque reaches the breakaway. Once it is
+    // moving, the drive carries it as before. Zero by default, so no other
+    // case's arithmetic changes.
+    if (breakaway_tau_nm > 0.0 && vel == 0.0 &&
+        std::fabs(kp * (q - pos) + tau_ff) < breakaway_tau_nm) {
+      v = 0.0;
+    }
     v = std::max(-kVmax, std::min(kVmax, v));
     double next = pos + v * dt;
     if (block_rad.has_value()) {
@@ -268,6 +277,7 @@ class FakeMotor {
   double yield_tau_nm = 0.0;
   double creep_rad_s_per_nm = 0.0;
   int report_lag_ticks = 0;
+  double breakaway_tau_nm = 0.0;  // net torque needed to start from rest, Nm
   std::vector<double> pos_hist_;  // last lag+1 positions, newest at the back
   double block_dir = 0.0;
 };
@@ -278,13 +288,14 @@ class FakeIo : public MotionIo {
                   std::optional<double> block_rad = std::nullopt,
                   double sticky_rad = 0.0, bool stops = false,
                   double yield_rad_s = 0.0, double yield_tau_nm = 0.0,
-                  double creep_rad_s_per_nm = 0.0, int report_lag_ticks = 0)
+                  double creep_rad_s_per_nm = 0.0, int report_lag_ticks = 0,
+                  double breakaway_tau_nm = 0.0)
       : cfg_(std::move(cfg)),
         motor_(start_rad, block_rad, sticky_rad, /*err=*/1,
                stops ? std::optional<double>(kLimitLo) : std::nullopt,
                stops ? std::optional<double>(kLimitHi) : std::nullopt,
                yield_rad_s, yield_tau_nm, creep_rad_s_per_nm,
-               report_lag_ticks) {}
+               report_lag_ticks, breakaway_tau_nm) {}
 
   const GripperConfig& config() const noexcept override { return cfg_; }
   GripperConfig& config() noexcept { return cfg_; }
@@ -893,10 +904,11 @@ void test_force_approach_terms() {
 /// Python's TestForceApproachPressBudget._grasp().
 struct GraspBench {
   GraspBench(double start_rad, std::optional<double> block_rad,
-             double speed_mm_s, bool stops = true, int report_lag_ticks = 0)
+             double speed_mm_s, bool stops = true, int report_lag_ticks = 0,
+             double breakaway_tau_nm = 0.0)
       : io(test_config(), start_rad, block_rad, /*sticky_rad=*/0.0, stops,
            /*yield_rad_s=*/0.0, /*yield_tau_nm=*/0.0, /*creep_rad_s_per_nm=*/0.0,
-           report_lag_ticks),
+           report_lag_ticks, breakaway_tau_nm),
         guard(make_guard()),
         config(grasp_config(speed_mm_s)),
         engine(io, guard, config) {}
@@ -1040,6 +1052,80 @@ void test_an_empty_grasp_still_reaches_the_target() {
   }
   check_near(fastest, 50.0 / kRadToMm, 1e-12,
              "FAP: a budget it can afford leaves the speed alone");
+}
+
+// ── an approach that never left its start is not contact ─────────────────
+// Python TestTheApproachRefusesToHandOverWithoutBite. The 2026-10-29 bench: a
+// 2 N grasp's approach pressed 0.18 Nm and moved the jaws 0.0004 rad over the
+// whole 0.25 s stall window. It was read as contact, and the hold took over at
+// 0.20 Nm — the setpoint's full 1.0x, a tenth past the approach's 0.9x and so
+// exactly enough to break away — and the jaws walked 19 mm of free stroke
+// under the setpoint. "Stopped" and "never started" are not the same thing.
+//
+// The criterion is MotionConfig::no_bite_mm: inside a force-carrying approach,
+// a stop closer than that to the leg's start is reported as no_bite, the force
+// is dropped, and no hold frame is sent.
+
+/// The breakaway the 2 N budget (0.18 Nm) cannot clear and the 3 N one (0.27)
+/// does — the bracket measured on the bench, 1.8 to 2.0 N.
+constexpr double kBreakawayNm = 0.22;
+
+double approach_budget(double force_n) {
+  return force_n * UnitConversion::kNToNm * MotionConfig().press_safety;
+}
+
+void test_an_approach_below_the_breakaway_is_refused_not_held() {
+  GraspBench bench(-1.0, std::nullopt, 50.0, /*stops=*/true,
+                   /*report_lag_ticks=*/0, kBreakawayNm);
+  const GraspResult res = bench.engine.grasp(2.0, 0.2);
+
+  check(approach_budget(2.0) < kBreakawayNm,
+        "NB: premise — 2 N cannot break away");
+  check(!res.ok, "NB: refused, not held");
+  check(res.no_bite, "NB: reported as never having broken away");
+  check(!res.stalled, "NB: stopping is not contact");
+  check(!res.reached, "NB: and it did not arrive either");
+  check(res.cycles == 0, "NB: not one hold slice ran");
+  int hold_frames = 0;
+  for (const Frame& f : bench.io.frames) {
+    if (f.tau_ff != 0.0) ++hold_frames;
+  }
+  check(hold_frames == 0,
+        "NB: the hold is torque-only — handing over is a powered stroke");
+  check(!bench.io.frames.empty(), "NB: the approach did send frames");
+  check(bench.io.frames.back().kp == 0.0, "NB: the force is dropped at the end");
+}
+
+void test_an_approach_above_the_breakaway_still_grasps() {
+  GraspBench bench(-1.0, std::nullopt, 50.0, /*stops=*/true,
+                   /*report_lag_ticks=*/0, kBreakawayNm);
+  const GraspResult res = bench.engine.grasp(3.0, 0.2);
+
+  check(approach_budget(3.0) > kBreakawayNm,
+        "NB: premise — 3 N clears the breakaway");
+  check(!res.no_bite, "NB: a budget that breaks away is not refused");
+  check(res.reached, "NB: an empty grip still reaches the stop");
+  check(res.ok, "NB: and reports ok");
+  check(res.cycles > 0, "NB: the hold did run");
+}
+
+void test_a_workpiece_at_the_start_is_refused_as_well() {
+  // The cost is written into the test: a workpiece sitting right at the start
+  // pose is refused too. The motor cannot tell "on the workpiece" from "the
+  // budget cannot break away" — both are zero displacement — and refusing
+  // costs one failed grasp while passing it through costs a powered stroke.
+  const double start = -1.0;
+  const double block = start + 0.001 * (kPosClosedRad - kPosOpenRad);
+  GraspBench bench(start, block, 50.0);
+  const GraspResult res = bench.engine.grasp(20.0, 0.2);
+
+  check(res.no_bite, "NB: a workpiece at the start is refused as well");
+  check(!res.ok, "NB: and reported as a failure");
+  int hold_frames = 0;
+  for (const Frame& f : bench.io.frames) {
+    if (f.tau_ff != 0.0) ++hold_frames;
+  }
+  check(hold_frames == 0, "NB: still no hold frame");
 }
 
 // ── the closing leg hands over only on contact ───────────────────────────
@@ -3007,6 +3093,9 @@ int main() {
   test_an_unbudgeted_close_still_presses_the_travel_cap();
   test_a_low_setpoint_decides_the_speed();
   test_an_empty_grasp_still_reaches_the_target();
+  test_an_approach_below_the_breakaway_is_refused_not_held();
+  test_an_approach_above_the_breakaway_still_grasps();
+  test_a_workpiece_at_the_start_is_refused_as_well();
   test_a_stale_reading_no_longer_strands_the_close_leg();
   test_the_close_leg_is_at_rest_when_the_hold_takes_over();
   test_neither_reached_nor_stalled_is_not_handed_over();

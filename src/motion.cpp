@@ -687,6 +687,7 @@ MoveResult MotionEngine::move_to_limit(
   std::vector<double> hist;
   hist.push_back(before.position_rad);
   bool stalled = false;
+  bool no_bite = false;            // force approach never left its start
   bool protection_tripped = false;
   bool release_requested = false;  // a release request ended the approach
   int over_torque = 0;  // consecutive samples over the stop_torque_nm threshold
@@ -794,7 +795,26 @@ MoveResult MotionEngine::move_to_limit(
     }
     if (judge_stall && win_delta.has_value() && (press || in_ramp) &&
         *win_delta < win_thresh_rad) {
-      stalled = true;
+      // "Not moving" is not "on the workpiece": with a force setpoint, a stop
+      // that never left the leg's start can also mean the budget could not
+      // break static friction. Counting that as contact hands a jaw with a
+      // free stroke ahead of it to the torque-only hold — a powered stroke
+      // (see MotionConfig::no_bite_mm). Refuse instead.
+      if (force_n.has_value() &&
+          std::fabs(pos - before.position_rad) <
+              config_.no_bite_mm / gcfg.rad_to_mm) {
+        no_bite = true;
+        std::fprintf(stderr,
+                     "[litegrip] %s: the approach never broke away — %.3f Nm "
+                     "moved the jaws %.2f mm from %+.5f rad before stopping "
+                     "(target %+.5f rad). Not contact; no hand-over.\n",
+                     source, *force_n * UnitConversion::kNToNm *
+                                          config_.press_safety,
+                     std::fabs(pos - before.position_rad) * gcfg.rad_to_mm,
+                     before.position_rad, target);
+      } else {
+        stalled = true;
+      }
       break;
     }
 
@@ -842,6 +862,7 @@ MoveResult MotionEngine::move_to_limit(
   result.stalled = stalled;
   result.protection_tripped = protection_tripped;
   result.release_requested = release_requested;
+  result.no_bite = no_bite;
   result.state = st;
   result.target_rad = target;
   result.limit_rad = limit;
@@ -1030,6 +1051,33 @@ GraspResult MotionEngine::hand_over(const MoveResult& move, double force,
     if (const auto request = release_->take()) {
       return grasp_ends_with_release(*request, move, force, /*cycles=*/0);
     }
+  }
+  if (move.no_bite) {
+    // The approach never left its start pose: either a workpiece sits right
+    // there, or the setpoint's 0.9x budget cannot break static friction. The
+    // two look identical to the motor, and what would take over is the
+    // torque-only hold — no position term, no speed limit, and 1.0x of the
+    // setpoint, a tenth more than the approach. Guessing wrong costs a powered
+    // stroke; refusing costs one failed grasp. Refuse.
+    drop_torque(move.state.position_rad, "grasp");
+    std::fprintf(stderr,
+                 "[litegrip] grasp: handed back, not held — the approach never "
+                 "broke away (%.1f N setpoint, %.3f Nm budget, stopped at "
+                 "%.1f mm). The hold would push a free stroke; the torque is "
+                 "dropped instead.\n",
+                 force, force * UnitConversion::kNToNm * config_.press_safety,
+                 move.state.position_mm);
+    GraspResult result;
+    result.ok = false;
+    result.reached = move.reached;
+    result.stalled = move.stalled;
+    result.state = move.state;
+    result.target_rad = move.target_rad;
+    result.force_n = force;
+    result.cycles = 0;
+    result.travel_guard = false;
+    result.no_bite = true;
+    return result;
   }
   if (!(move.reached || move.stalled)) {
     // Neither arrived nor on something — the jaw is still in free travel, and

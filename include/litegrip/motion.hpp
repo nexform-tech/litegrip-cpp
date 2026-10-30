@@ -126,6 +126,27 @@ struct MotionConfig {
   // force anyway.
   double press_safety = 0.9;       // budget margin: the press lands under the setpoint
 
+  // ── a force-carrying approach that never moved from its start ──────────
+  // The position window only sees "not moving", and "not moving" has three
+  // causes: the workpiece, the calibrated stop, and — the dangerous one — a
+  // budget below static friction, so the jaws never broke away at all. That
+  // third case used to be read as contact and handed to the torque-only hold,
+  // whose torque is the setpoint's full 1.0x while the approach only spends
+  // 0.9x: the extra tenth is exactly what breaks away, and the jaws accelerate
+  // across the free stroke under the setpoint (2026-10-29 bench: a 2 N grasp's
+  // approach pressed 0.18 Nm and moved nothing; the hold took over at 0.20 Nm
+  // and walked 19 mm).
+  // So inside a force-carrying approach, a stop closer than this to the start
+  // is NOT contact: it is reported as "never broke away" (MoveResult::no_bite),
+  // the force is dropped and no hand-over happens. The cost is that a workpiece
+  // already touching at the start pose is refused too — the motor cannot tell
+  // the two apart, and refusing costs one failed grasp while passing it through
+  // costs a powered stroke.
+  // 0.5 mm sits under the bench's closed-side stick-slip dead band (~0.0103 rad
+  // ~= 0.76 mm): a "press" shorter than that is below what the encoder can
+  // resolve, and a real workpiece cannot hold still in a gap that narrow.
+  double no_bite_mm = 0.5;
+
   // ── travel-leg stall protection (~7 N) ────────────────────────────────
   // In the travel leg a press move's lead cap is still max_lead_mm, so a jaw
   // hard-blocked halfway keeps pushing at kp x cap ~= 7.6 Nm. The position
@@ -300,6 +321,12 @@ struct MoveResult {
   /// moves have their own endpoint and are never interrupted. Mirrors
   /// actions.MoveResult.release_requested.
   bool release_requested = false;
+  /// The force-carrying approach stopped WITHOUT ever leaving its start pose:
+  /// the stop is within MotionConfig::no_bite_mm of where the leg began. Not
+  /// contact — the budget may simply be below static friction (see
+  /// MotionConfig::no_bite_mm). `stalled` is false on this path, and grasp()
+  /// refuses the hand-over. Mirrors actions.MoveResult.no_bite.
+  bool no_bite = false;
   GripperState state;
   double target_rad = 0.0;     // where the ramp aimed
   double limit_rad = 0.0;      // this end's calibrated limit
@@ -325,6 +352,12 @@ struct GraspResult {
   /// torque, this one the HOLD's excursion. A normal grasp never sets it: the
   /// jaws stop on the workpiece, or on the real stop at the calibrated limit.
   bool travel_guard = false;
+  /// The closing leg never moved off its start pose: the setpoint's 0.9x
+  /// budget could not break static friction (or a workpiece sat right at the
+  /// start). NO hand-over happened — not one hold frame was sent — so
+  /// `cycles` is 0 and `stalled` / `reached` are both false. Mirrors
+  /// actions.GraspResult.no_bite and MotionConfig::no_bite_mm.
+  bool no_bite = false;
   /// The grasp was ended by release() / request_release(): the grasp thread
   /// finished the release (or the abort) before returning. A normal release
   /// leaves `ok == true`; an abort (`abort = true`) leaves it false. Distinct

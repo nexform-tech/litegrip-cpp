@@ -214,7 +214,7 @@ stderr 报警。对不流状态帧的夹爪，`get_state()` 会先耗满这 0.5 
 | `open(speed_mm_s=None, progress={})` → `MoveResult` | 斜坡走向张开侧标定限位并压住它。`GripperConfig::work_stroke_mm` 严格落在行程之内时改为停在那 个开口，是一次普通定位。 |
 | `close(speed_mm_s=None, progress={})` → `MoveResult` | 同样，朝闭合侧。`work_stroke_mm` 是张开侧的数，不改变闭合停在哪里。 |
 | `home()` → `MoveResult` | 斜坡走到标定闭合位置。不是压紧：它停在零点**上**，而不是压住零点。 |
-| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | 闭合到工件上 —— 空载则闭合到闭合侧标定限位 —— 然后爬到并保持 `force_n` N。闭合段带着 `force_n` 作为力矩预算，所以撞上工件时压出的力不超过设定值。只有夹爪停下来后保力段才接手：`stalled`（两指之间有东西）或 `reached`（空载闭合到位）。`hold_s = 0` 保到故障或越位护栏为止。`hold_s = 0` 的保力用 `release()` 结束。 |
+| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | 闭合到工件上 —— 空载则闭合到闭合侧标定限位 —— 然后爬到并保持 `force_n` N。闭合段带着 `force_n` 作为力矩预算，所以撞上工件时压出的力不超过设定值。只有夹爪停下来后保力段才接手：`stalled`（两指之间有东西）或 `reached`（空载闭合到位）。但**从起点就没动过**就停下不算接触 —— 也可能是预算低于静摩擦 —— 这种情形调用原地撤力、返回 `no_bite = true`，不进保力段。`hold_s = 0` 保到故障或越位护栏为止。`hold_s = 0` 的保力用 `release()` 结束。 |
 | `release(clearance_mm=10.0, abort=false, timeout_s=None)` → `ReleaseResult` | 结束正在进行的 `grasp()` 并张开：撤掉夹持设定力，再让夹爪斜坡走到 `max(当前, 交接点) + clearance_mm`，钳在标定张开限位以内。可在任意线程调用，包括 `grasp(hold_s = 0)` 正阻塞在另一个线程的时候 —— 见 [结束夹持](#结束夹持)。没有夹取在跑时，就在调用方线程里直接张开。`abort = true` 只撤力、不张开。超时是 `ok = false`，不抛异常。 |
 | `request_release(clearance_mm=10.0, abort=false)` → `bool` | `release()` 的非阻塞形式：把请求排给正在跑的 `grasp()` 并返回 `true`，否则返回 `false`。自己绝不发帧 —— UI 线程、信号处理、急停回调里都安全。 |
 | `goto_mm(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | 斜坡走到一个毫米目标（0 = 闭合）。 |
@@ -367,8 +367,8 @@ CAN 帧归夹取线程所有：两个线程同时给同一条总线上斜坡，�
 
 | 类型 | 字段 | `bool()` 是 |
 | --- | --- | --- |
-| `MoveResult` | `ok`、`reached`、`stalled`、`protection_tripped`、`released`、`state`、`target_rad`、`limit_rad`、`final_cmd_rad`、`steps` | `ok` |
-| `GraspResult` | `ok`、`reached`、`stalled`、`state`、`target_rad`、`force_n`、`cycles`、`travel_guard`、`released` | `ok` |
+| `MoveResult` | `ok`、`reached`、`stalled`、`protection_tripped`、`released`、`no_bite`、`state`、`target_rad`、`limit_rad`、`final_cmd_rad`、`steps` | `ok` |
+| `GraspResult` | `ok`、`reached`、`stalled`、`state`、`target_rad`、`force_n`、`cycles`、`travel_guard`、`released`、`no_bite` | `ok` |
 | `ReleaseResult` | `ok`、`state`、`opened_mm`、`target_rad`、`aborted` | `ok` |
 
 三者都定义了返回 `ok` 的 `operator bool`，所以 `if (gripper.close())` 照样能用。
@@ -396,6 +396,15 @@ CAN 帧归夹取线程所有：两个线程同时给同一条总线上斜坡，�
   没夹住。看到这个结果说明闭合段被拖住了 —— 读数过期，或者机构自身预算顶不过的
   摩擦。
 
+第五种组合是拒夹，本版本新增：
+
+- **`grasp()` 返回 `ok = false, no_bite = true`**，说明接近段带着力，却**从起点
+  就没推动过**夹爪：停住时离起始位置还不到 `MotionConfig::no_bite_mm`（0.5 mm）。
+  这不是接触 —— 更常见的是力矩预算压不出脱离静摩擦需要的力，而不是工件正好摆在
+  起点 —— 而这恰好就是交接会让夹爪带着一整段自由行程冲进纯力矩帧、一路加速的情形。
+  所以保力段一帧都不发，调用原地撤力，`cycles` 为 0；这条路上 `stalled` 与
+  `reached` 都是 `false`。要救它得把设定值抬到静摩擦之上，不是把保力拉长。
+
 三个标志解释失败：
 
 - `protection_tripped` —— 行进段力矩保护结束了这次移动，是有意失力（见
@@ -406,6 +415,7 @@ CAN 帧归夹取线程所有：两个线程同时给同一条总线上斜坡，�
   `released == false`。
 - `travel_guard`（`GraspResult` 上）—— 越位护栏截断了一次保力（见
   [夹取与力控](#夹取与力控)）。
+- `no_bite`（`GraspResult` 上）—— 接近段没能脱离静摩擦，压根没有交接（见上）。
 
 `limit_rad` 报的是**较近那一端**的标定限位，不一定是这次移动瞄准的那一端：一个
 离张开端几毫米的定位目标，报的是张开侧限位。
@@ -464,6 +474,7 @@ const litegrip::MoveResult res = gripper.goto_mm(
 | `release_wait_s` | `10.0` | 没给 `timeout_s` 时，`release()` 等夹取线程多久 |
 | `hold_runaway_rad` | `0.05` | 越位护栏的阈值 |
 | `press_safety` | `0.9` | 预算余量：压出的力落在设定值之下 |
+| `no_bite_mm` | `0.5` | 带力接近段离起点这么近就停住时，判为没咬住、不交接（见上文 `grasp()`） |
 | `sleep_fn` / `monotonic_fn` | 真实时间 | 引擎的时钟接缝；测试把 sleep 置空，于是斜坡瞬间跑完 |
 
 `MotionConfig::hold_kp` / `hold_kd` 已**废弃**：设上也不起作用，因为保力帧是纯
