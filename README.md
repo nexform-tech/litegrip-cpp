@@ -309,6 +309,16 @@ object (or at the closed-side calibrated stop) before the hold takes over.
 - **The jaws stay compliant.** An external push back-drives them while the motor
   keeps pushing with `force_n`, and an empty `grasp()` closes onto the mechanical
   stop at that force.
+- **Below about 2.2 N the jaws may not close at all**, so keep `force_n` at 3 N
+  or more. The closing leg's torque budget *is* the setpoint, and the mechanism
+  needs about 0.2 Nm — 2.2 N of setpoint — to break away from static friction.
+  Under that the approach never moves, and `grasp()` refuses the hand-over
+  rather than reading the stillness as contact: `ok = false`, `no_bite = true`,
+  torque dropped, no hold frames. That refusal is the safe answer to a grip that
+  could not have closed; the alternative, handing over to a hold that presses at
+  a slightly higher torque, walks the jaws across the free stroke. Between 2.2 N
+  and about 3 N it closes, but on this bench the grip is marginal, so 3 N is the
+  number to ask for.
 - **Below about 3.7 N the approach speed becomes the limit**, because one frame
   of travel at `grasp_speed_mm_s` already spends the whole torque budget. Cap the
   travel time with `grasp_speed_mm_s` rather than asking for a force that the
