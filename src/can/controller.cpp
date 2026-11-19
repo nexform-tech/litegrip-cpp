@@ -3,6 +3,7 @@
 
 #include "litegrip/can/controller.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <thread>
@@ -192,19 +193,29 @@ void MotorController::save_params(MotorState& motor) {
   transport_.send(kBroadcastId, data.data(), data.size());
 }
 
-MotorState* MotorController::poll(double timeout_s) {
-  const auto frame = transport_.recv(timeout_s);
-  if (!frame.has_value()) {
-    return nullptr;
+MotorState* MotorController::poll(double timeout_s, int max_frames) {
+  MotorState* updated = nullptr;
+  const int limit = std::max(1, max_frames);
+  for (int i = 0; i < limit; ++i) {
+    const auto frame = transport_.recv(i == 0 ? timeout_s : 0.0);
+    if (!frame.has_value()) {
+      return updated;
+    }
+    if (MotorState* motor = apply_status_frame(*frame)) {
+      updated = motor;
+    }
   }
+  return updated;
+}
 
-  const auto it = motors_.find(frame->can_id);
+MotorState* MotorController::apply_status_frame(const CanFrame& frame) {
+  const auto it = motors_.find(frame.can_id);
   if (it == motors_.end()) {
     return nullptr;
   }
   MotorState& motor = *it->second;
 
-  if (frame->dlc < 8) {
+  if (frame.dlc < 8) {
     return nullptr;
   }
 
@@ -216,22 +227,22 @@ MotorState* MotorController::poll(double timeout_s) {
   // an opcode value (e.g. 0x55), so data[2] alone is NOT a reliable
   // discriminator. Require all three structural matches before discarding, so
   // a normal status frame is never dropped.
-  const std::uint8_t opcode = frame->data[2];
+  const std::uint8_t opcode = frame.data[2];
   if ((opcode == 0x33 || opcode == 0x55 || opcode == 0xAA) &&
-      (frame->data[0] >> 4) == 0 &&
-      frame->data[0] == (motor.can_id() & 0xFF) &&
-      frame->data[1] == ((motor.can_id() >> 8) & 0xFF)) {
+      (frame.data[0] >> 4) == 0 &&
+      frame.data[0] == (motor.can_id() & 0xFF) &&
+      frame.data[1] == ((motor.can_id() >> 8) & 0xFF)) {
     return nullptr;
   }
 
   const auto status =
-      unpack_status_frame(frame->data.data(), frame->dlc, motor.limits());
+      unpack_status_frame(frame.data.data(), frame.dlc, motor.limits());
   if (!status.has_value()) {
     return nullptr;
   }
 
   motor.update_from_status(status->q, status->dq, status->tau, status->err,
-                           status->t_mos, status->t_coil, frame->timestamp);
+                           status->t_mos, status->t_coil, frame.timestamp);
   return &motor;
 }
 
@@ -239,8 +250,8 @@ bool MotorController::poll_until(MotorState& motor, double timeout_s) {
   const std::uint64_t prev_rx = motor.rx_count();
   const double deadline = monotonic_now() + timeout_s;
   while (monotonic_now() < deadline) {
-    MotorState* updated = poll(0.01);
-    if (updated == &motor && motor.rx_count() > prev_rx) {
+    poll(0.01);
+    if (motor.rx_count() > prev_rx) {
       return true;
     }
     sleep_s(0.001);
