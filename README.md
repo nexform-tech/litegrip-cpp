@@ -231,7 +231,7 @@ design, and `refresh_status()` to force a frame rather than wait for one.
 | `open(speed_mm_s=None, progress={})` → `MoveResult` | Ramps toward the calibrated open-side stop, pressing onto it. With `GripperConfig::work_stroke_mm` strictly inside the travel it stops at that opening instead, as an ordinary positioning move. |
 | `close(speed_mm_s=None, progress={})` → `MoveResult` | The same, toward the closed side. `work_stroke_mm` is an open-side number and does not change where a close ends. |
 | `home()` → `MoveResult` | Ramps to the calibrated closed position. Not a press: it stops *on* the zero instead of loading it. |
-| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | Closes onto the object — or onto the closed-side calibrated stop if there is nothing there — then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. The hold takes over only once the jaw is stopped: `stalled` (something is between the jaws) or `reached` (the jaws closed empty). A stop that came **without the jaw ever moving from where the approach began**, with a budget below `MotionConfig::breakaway_nm`, is not treated as contact — the budget simply cannot break static friction — so the call drops the torque and returns `no_bite = true` instead of handing over the hold. `hold_s = 0` holds until a fault or the runaway watch. `force_n` empty uses `MotionConfig::force_n` (20 N). End a `hold_s = 0` grip with `release()`. |
+| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | Closes onto the object — or onto the closed-side calibrated stop if there is nothing there — then ramps to and holds `force_n` N. The closing leg carries `force_n` as its torque budget, so meeting the object presses no harder than the setpoint. The hold takes over only once the jaw is stopped: `stalled` (something is between the jaws) or `reached` (the jaws closed empty). In the force approach `stalled` also requires the window's average speed to be under `MotionConfig::stall_speed_mm_s` (2 mm/s), so a jaw that is still creeping is not mistaken for contact and handed to the torque-only hold. A stop that came **without the jaw ever moving from where the approach began**, with a budget below `MotionConfig::breakaway_nm`, is not treated as contact — the budget simply cannot break static friction — so the call drops the torque and returns `no_bite = true` instead of handing over the hold. `hold_s = 0` holds until a fault or the runaway watch. `force_n` empty uses `MotionConfig::force_n` (20 N). End a `hold_s = 0` grip with `release()`. |
 | `release(clearance_mm=10.0, abort=false, timeout_s=None)` → `ReleaseResult` | Ends an in-progress `grasp()` and opens the jaws: the grip setpoint is dropped, then the jaws ramp to `max(current, hand-over pose) + clearance_mm`, clamped to the calibrated open stop. Callable from any thread, including while `grasp(hold_s = 0)` is blocked in another one — see [Ending a grip](#ending-a-grip). With no grasp running it opens in the calling thread. `abort = true` drops the torque without opening. A timeout is `ok = false`, not an exception. |
 | `request_release(clearance_mm=10.0, abort=false)` → `bool` | Non-blocking form of `release()`: queues the request for a running `grasp()` and returns `true`, else returns `false`. Never sends a frame — safe from a UI thread or an E-stop callback. |
 | `goto_mm(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | Ramp to a position in millimetres (0 = closed). |
@@ -449,7 +449,10 @@ A fourth combination is a failure, and new in this version:
 
 - **`grasp()` with `ok = false, reached = false, stalled = false`** means the
   closing leg ended without reaching the stop and without stalling — the jaw is
-  still in free travel. The hold is *not* entered: its frames carry no position
+  still in free travel. A slow creep lands here too: the window's net
+  displacement is small, but its average speed is still above
+  `MotionConfig::stall_speed_mm_s` (2 mm/s), so it never counts as a stop and
+  the leg runs to its frame ceiling. The hold is *not* entered: its frames carry no position
   term and no velocity term, so handing a moving jaw to them leaves the
   feed-forward torque as the only thing acting on it, and the jaw accelerates
   until the runaway watch releases it. The call releases in place instead and
@@ -546,6 +549,7 @@ tuned-on-hardware values, so changing nothing is a supported configuration.
 | `stop_lead_mm` / `press_zone_mm` | `0.7` / `2.0` | Press-phase lead cap and where it takes over |
 | `stop_tol` | `0.02` rad | "Parked on the stop" tolerance |
 | `stall_cycles` / `stall_ratio` / `stall_delta` | `5` / `0.2` / `0.0015` | The stall window |
+| `stall_speed_mm_s` | `2.0` | True-stop floor for the force approach's hand-over, mm/s — the 20 % window alone reads a slow creep as contact (see `grasp`) |
 | `stop_torque_nm` / `stop_torque_cycles` / `stop_speed_ratio` | `0.7` / `3` / `0.5` | Travel-leg torque protection |
 | `stop_release_s` | `0.2` | Limp tail after a trip or a released shortfall |
 | `force_n` / `force_ramp_n_s` | `20.0` / `20.0` | Default grip force, and the hold's ramp rate in N/s |
