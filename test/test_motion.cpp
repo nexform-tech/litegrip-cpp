@@ -168,7 +168,8 @@ class FakeMotor {
             int err, std::optional<double> limit_lo,
             std::optional<double> limit_hi, double yield_rad_s = 0.0,
             double yield_tau_nm = 0.0, double creep_rad_s_per_nm = 0.0,
-            int report_lag_ticks = 0, double breakaway_tau_nm = 0.0)
+            int report_lag_ticks = 0, double breakaway_tau_nm = 0.0,
+            std::optional<double> speed_cap_rad_s = std::nullopt)
       : pos(pos),
         err(err),
         block_rad(block_rad),
@@ -180,6 +181,7 @@ class FakeMotor {
         creep_rad_s_per_nm(creep_rad_s_per_nm),
         report_lag_ticks(std::max(0, report_lag_ticks)),
         breakaway_tau_nm(breakaway_tau_nm),
+        speed_cap_rad_s(speed_cap_rad_s),
         block_dir(block_rad.has_value()
                       ? (*block_rad > pos ? 1.0 : -1.0)
                       : 0.0) {
@@ -229,7 +231,12 @@ class FakeMotor {
         std::fabs(kp * (q - pos) + tau_ff) < breakaway_tau_nm) {
       v = 0.0;
     }
-    v = std::max(-kVmax, std::min(kVmax, v));
+    // A force-carrying approach's speed can be pressed under its command by
+    // the budget and friction. The cap models that crawl without touching any
+    // other case (unset = only kVmax, bit-for-bit the old fake).
+    const double vmax =
+        speed_cap_rad_s.has_value() ? std::min(kVmax, *speed_cap_rad_s) : kVmax;
+    v = std::max(-vmax, std::min(vmax, v));
     double next = pos + v * dt;
     if (block_rad.has_value()) {
       next = block_dir > 0.0 ? std::min(next, *block_rad)
@@ -278,6 +285,7 @@ class FakeMotor {
   double creep_rad_s_per_nm = 0.0;
   int report_lag_ticks = 0;
   double breakaway_tau_nm = 0.0;  // net torque needed to start from rest, Nm
+  std::optional<double> speed_cap_rad_s;  // unset = only kVmax
   std::vector<double> pos_hist_;  // last lag+1 positions, newest at the back
   double block_dir = 0.0;
 };
@@ -289,13 +297,18 @@ class FakeIo : public MotionIo {
                   double sticky_rad = 0.0, bool stops = false,
                   double yield_rad_s = 0.0, double yield_tau_nm = 0.0,
                   double creep_rad_s_per_nm = 0.0, int report_lag_ticks = 0,
-                  double breakaway_tau_nm = 0.0)
+                  double breakaway_tau_nm = 0.0,
+                  std::optional<double> speed_cap_rad_s = std::nullopt,
+                  bool freeze_position_while_idle = false)
       : cfg_(std::move(cfg)),
         motor_(start_rad, block_rad, sticky_rad, /*err=*/1,
                stops ? std::optional<double>(kLimitLo) : std::nullopt,
                stops ? std::optional<double>(kLimitHi) : std::nullopt,
                yield_rad_s, yield_tau_nm, creep_rad_s_per_nm,
-               report_lag_ticks, breakaway_tau_nm) {}
+               report_lag_ticks, breakaway_tau_nm, speed_cap_rad_s),
+        freeze_position_while_idle(freeze_position_while_idle) {
+    cached_pos_ = motor_.reported_pos();
+  }
 
   const GripperConfig& config() const noexcept override { return cfg_; }
   GripperConfig& config() noexcept { return cfg_; }
@@ -313,8 +326,19 @@ class FakeIo : public MotionIo {
       st.data_age_s = std::numeric_limits<double>::infinity();
       return st;
     }
+    // A status frame arrives when the motor streams on its own, or when a
+    // requested frame is waiting. Otherwise the reading is the cache: the real
+    // get_state() waits the staleness horizon and then reports it stale, which
+    // is what the age below stands in for.
+    bool answered = false;
+    if (delivers || refresh_pending_) {
+      refresh_pending_ = false;
+      answered = true;
+      cached_pos_ = motor_.reported_pos();
+    }
     const double s = cfg_.close_sign();
-    st.position_rad = motor_.reported_pos();
+    st.position_rad =
+        freeze_position_while_idle ? cached_pos_ : motor_.reported_pos();
     st.velocity_rad_s = motor_.vel;
     st.torque_nm = motor_.tau;
     st.temperature_mos = 30;
@@ -325,8 +349,20 @@ class FakeIo : public MotionIo {
     st.position_mm =
         (cfg_.pos_closed_rad - st.position_rad) * s * cfg_.rad_to_mm;
     st.force_n = s * st.torque_nm * cfg_.nm_to_n;
-    st.data_age_s = 0.0;  // fresh
+    st.data_age_s = answered ? 0.0 : kStaleAfterS + 1.0;
     return st;
+  }
+
+  bool refresh_status(double timeout_s) override {
+    (void)timeout_s;
+    ++refresh_calls;
+    if (!refresh_ok) {
+      return false;
+    }
+    if (refresh_answers) {
+      refresh_pending_ = true;
+    }
+    return true;
   }
 
   bool send_mit_frame(double q, double kp, double kd, double dq,
@@ -348,12 +384,22 @@ class FakeIo : public MotionIo {
   std::vector<Frame> frames;
   bool holding = false;
 
+  /// The bus model the freshness tests drive (tests/fake_can.py's `delivers`
+  /// and friends). Defaults keep every other case bit-for-bit unchanged.
+  bool delivers = true;              // status frames arrive on their own
+  bool refresh_ok = true;            // the 0xCC write goes out
+  bool refresh_answers = true;       // ... and the motor answers it
+  int refresh_calls = 0;             // refresh_status() invocations
+  bool freeze_position_while_idle = false;  // cached reads do not follow pos
+
  private:
   GripperConfig cfg_;
   bool connected_ = true;
   bool enabled_ = true;
   bool no_feedback_ = false;
   bool refuse_frames_ = false;
+  bool refresh_pending_ = false;  // a requested frame is waiting
+  double cached_pos_ = 0.0;       // last delivered position
 };
 
 /// `sleep_fn` nooped: the entire ramp runs instantly (Python's
@@ -767,38 +813,55 @@ void test_grasp_onto_object() {
   check(res.cycles == 3, "S3: hold slices (py: 3)");
   check_near(res.target_rad, kPosClosedRad, 1e-12,
              "S3: the closing leg aims at the closed-side stop");
-  check(io.frames.size() == 310, "S3: frame count (py: 310)");
 
-  // Hold frames: index 190 on, q = the blocked position, and NO gains — a hold
-  // frame is a pure torque source (py: kp=kd=0).
-  //
-  // The torque now CLIMBS here, and that is the point of the force-carrying
-  // approach: with the closing leg kept inside the setpoint's budget its press
-  // in flight is only the lead's share of that budget at this speed — 100 x
-  // 0.004521094488 = 0.4521094488 Nm — so the hold hands over BELOW the 2.0 Nm
-  // setpoint and steps up 0.01 Nm a frame. 120 hold frames is not enough to land
-  // (155 are needed), so this scenario pins the climb's shape from below; the
-  // landing is pinned by the S9 ramp tests.
-  for (std::size_t i = 190; i < io.frames.size(); ++i) {
+  // The true-stop gate (stall_speed_mm_s) makes the hand-over wait until the
+  // window's average speed is under 2 mm/s, not merely under the 20 % window
+  // ratio, so it lands a few samples later than the pre-#86 Python dump. The
+  // hold's shape is still pinned from the hand-over, found dynamically.
+  std::size_t hold_start = io.frames.size();
+  for (std::size_t i = 0; i < io.frames.size(); ++i) {
+    if (io.frames[i].kp == 0.0 && io.frames[i].kd == 0.0) {
+      hold_start = i;
+      break;
+    }
+  }
+  check(hold_start < io.frames.size(), "S3: the hold was entered");
+  check(io.frames.size() == hold_start + 120,
+        "S3: 120 hold frames (3 slices x 40)");
+  check(hold_start > 0 && io.frames[hold_start - 1].tau_ff == 0.0,
+        "S3: the frame before the hold is still the approach");
+
+  // Hold frames carry NO gains — a hold frame is a pure torque source. The
+  // torque CLIMBS from the torque in flight: with the closing leg kept inside
+  // the setpoint's budget its press is only the lead's share — 0.4521 Nm — so
+  // the hold hands over below the 2.0 Nm setpoint and steps up 0.01 Nm a frame.
+  const double base_tau = io.frames[hold_start].tau_ff;
+  check_near(base_tau, io.frames[hold_start - 1].tau_nm + 0.01, 1e-9,
+             "S3: the climb starts one step above the torque in flight");
+  for (std::size_t i = hold_start; i < io.frames.size(); ++i) {
     const Frame& f = io.frames[i];
     check(f.kp == 0.0 && f.kd == 0.0 && f.dq == 0.0,
-          "S3: hold frame strictly feed-forward (py: kp=kd=0)");
-    check_near(f.tau_ff, 0.4521094488 + 0.01 * static_cast<double>(i - 189),
+          "S3: hold frame strictly feed-forward");
+    check_near(f.tau_ff, base_tau + 0.01 * static_cast<double>(i - hold_start),
                1e-9, "S3: hold frame climbs one 0.01 Nm step per frame");
     check_near(f.q, -0.5, 1e-12, "S3: hold frame q");
   }
-  check(io.frames[189].tau_ff == 0.0, "S3: frame 189 is still the approach");
 
-  // Progress: 19 approach samples (i = 10..190) + 3 hold snapshots.
-  check(progress.size() == 22, "S3: progress callbacks (19 + 3)");
-  if (progress.size() == 22) {
-    check(progress[0].i == 10 && progress[18].i == 190,
+  // Progress: one approach sample per 10 frames up to the hand-over sample,
+  // then 3 hold snapshots.
+  const std::size_t approach_samples = hold_start / 10;
+  check(progress.size() == approach_samples + 3, "S3: progress callbacks");
+  if (progress.size() == approach_samples + 3 && approach_samples > 0) {
+    check(progress[0].i == 10 &&
+              progress[approach_samples - 1].i == static_cast<int>(hold_start),
           "S3: approach sample stride (sample_interval/frame_interval)");
     check(progress[0].phase == MovePhase::kMove &&
-              progress[19].phase == MovePhase::kHold,
+              progress[approach_samples].phase == MovePhase::kHold,
           "S3: phase switch at the hold");
-    check(progress[18].win_delta_rad.has_value(), "S3: win_delta sampled");
-    check(progress[19].total_steps == 0 && progress[19].delta_rad == 0.0,
+    check(progress[approach_samples - 1].win_delta_rad.has_value(),
+          "S3: win_delta sampled");
+    check(progress[approach_samples].total_steps == 0 &&
+              progress[approach_samples].delta_rad == 0.0,
           "S3: hold snapshot shape");
   }
 }
@@ -2747,10 +2810,12 @@ void test_ceilings_and_refusals() {
     io.set_no_feedback(true);
     SafetyGuard guard = make_guard();
     MotionEngine engine(io, guard, instant_config());
-    check_throws<SafetyFault>([&] { engine.close(); },
-                              "close without feedback refuses");
-    check_throws<SafetyFault>([&] { engine.move_at_speed(40.0, 30.0); },
-                              "move_at_speed without feedback refuses");
+    // A motion never starts from an unanswered status read; fresh_state()
+    // reports that as CommError (the Python PR #86 contract), not SafetyFault.
+    check_throws<CommError>([&] { engine.close(); },
+                            "close without feedback refuses");
+    check_throws<CommError>([&] { engine.move_at_speed(40.0, 30.0); },
+                            "move_at_speed without feedback refuses");
     check(io.frames.empty(), "no feedback: no frame sent");
   }
   {  // A latched fault blocks every motion entry before anything is sent.
@@ -3122,6 +3187,174 @@ void test_litegrip_forwarding() {
   check(true, "LiteGrip::exit_zero_gravity is a silent no-op when disabled");
 }
 
+// ── stale state / true-stop handover (Python PR #86) ─────────────────────
+//
+// Ports of the Python suite's TestForceApproachNeedsATrueStop,
+// TestMotionRefreshesAnIdleBus, TestFreshStateRefusesAnUnansweredCache,
+// TestFinalReachUsesAFreshFrame, TestGraspHoldCommError,
+// TestAbortReleaseNeedsNoFreshFrame and TestMotionConfigValidation.
+
+void test_a_slow_creep_is_not_handed_over_mid_travel() {
+  const double object_rad = (kPosOpenRad + kPosClosedRad) / 2.0;
+  // ~8 mm/s at rad_to_mm 74.19: the 2026-11-18 bench crawl against a 50 mm/s
+  // schedule. The 20 % window alone called this a stall.
+  const double crawl_rad_s = 0.109;
+  FakeIo io(test_config(), /*start_rad=*/-1.0, object_rad, 0.0,
+            /*stops=*/true, 0.0, 0.0, 0.0, 0, 0.0, crawl_rad_s);
+  SafetyGuard guard = make_guard();
+  MotionConfig m = instant_config();
+  m.monotonic_fn = tick_clock(0.1);
+  MotionEngine engine(io, guard, m);
+
+  const GraspResult res = engine.grasp(5.0, 0.2);
+
+  check(res.stalled || res.reached, "true-stop: the grip still completes");
+  std::optional<double> first_hold_pos;
+  for (const Frame& f : io.frames) {
+    if (f.tau_ff != 0.0) {
+      first_hold_pos = f.pos_after;
+      break;
+    }
+  }
+  check(first_hold_pos.has_value(), "true-stop: the hold was entered");
+  if (first_hold_pos.has_value()) {
+    check(std::fabs(*first_hold_pos - object_rad) < m.reach_tol,
+          "true-stop: the hold started on the workpiece, not in free travel");
+  }
+}
+
+void test_a_slow_creep_without_contact_never_enters_the_hold() {
+  // No workpiece: the jaws crawl to the frame ceiling without arriving and
+  // without a true stop. The hold is a pure torque source and must not take
+  // over — the call refuses instead.
+  FakeIo io(test_config(), /*start_rad=*/-1.0, std::nullopt, 0.0,
+            /*stops=*/true, 0.0, 0.0, 0.0, 0, 0.0, 0.109);
+  SafetyGuard guard = make_guard();
+  MotionConfig m = instant_config();
+  m.monotonic_fn = tick_clock(0.1);
+  MotionEngine engine(io, guard, m);
+
+  const GraspResult res = engine.grasp(5.0, 0.2);
+
+  check(!res.ok, "true-stop: the creeping grip is refused");
+  check(!res.stalled, "true-stop: a creep is not a stall");
+  check(!res.reached, "true-stop: and it did not arrive");
+  check(res.cycles == 0, "true-stop: no hold slice ran");
+  for (const Frame& f : io.frames) {
+    check(f.tau_ff == 0.0,
+          "true-stop: a feed-forward hold frame was sent to a moving jaw");
+  }
+}
+
+void test_open_does_not_start_from_a_cached_position_while_idle() {
+  FakeIo io(test_config(), /*start_rad=*/kPosOpenRad, std::nullopt, 0.0,
+            /*stops=*/true, 0.0, 0.0, 0.0, 0, 0.0, std::nullopt,
+            /*freeze_position_while_idle=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  io.get_state(false);                 // the cache is the open-side pose
+  io.delivers = false;                 // the bus goes idle
+  const double actual = kPosClosedRad - 0.4;
+  io.motor_.pos = actual;              // moved by hand while idle
+
+  engine.open();
+
+  check(!io.frames.empty(), "idle-refresh: open sent frames");
+  if (!io.frames.empty()) {
+    check(std::fabs(io.frames[0].q - actual) < 0.01,
+          "idle-refresh: open started from the cached pose, not the real one");
+  }
+}
+
+void test_a_recent_cache_is_not_enough_when_nothing_answers() {
+  FakeIo io(test_config(), /*start_rad=*/-1.0, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+  io.get_state(false);                 // seed a young cache
+  io.delivers = false;                 // the bus goes idle
+  io.refresh_ok = false;               // and 0xCC cannot be sent
+
+  check_throws<CommError>([&] { engine.open(); },
+                          "fresh-state: a cache is not a measurement");
+}
+
+void test_the_end_of_a_move_requests_a_status_frame() {
+  FakeIo io(test_config(), /*start_rad=*/-1.0, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  const MoveResult res = engine.open();
+  check(res.ok, "fresh-reach: the move arrived");
+  check(io.refresh_calls >= 2,
+        "fresh-reach: reached/ok were decided without a fresh frame");
+}
+
+void test_a_mid_hold_comm_error_releases_and_reports_failure() {
+  FakeIo io(test_config(), /*start_rad=*/-1.0, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+
+  MoveResult move;
+  move.reached = true;
+  move.stalled = true;
+  move.target_rad = kPosClosedRad;
+  move.state = io.get_state(true);
+
+  io.delivers = false;      // the hold's refresh gets no answer
+  io.refresh_ok = false;
+
+  const GraspResult res =
+      MotionEngineTestAccess::hand_over(engine, move, 5.0, 0.2);
+
+  check(!res.ok, "hold-error: ok is false");
+  check(res.cycles == 0, "hold-error: no slice completed");
+  bool released = false;
+  for (const Frame& f : io.frames) {
+    if (f.kp == 0.0 && f.kd == 0.0 && f.tau_ff == 0.0) released = true;
+  }
+  check(released,
+        "hold-error: the last torque was left on the bus (no release frame)");
+}
+
+void test_abort_release_needs_no_fresh_frame() {
+  FakeIo io(test_config(), /*start_rad=*/kPosClosedRad, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  MotionEngine engine(io, guard, instant_config());
+  io.get_state(false);
+  io.delivers = false;        // the motor does not speak
+  io.refresh_answers = false; // 0xCC goes out but nothing comes back
+
+  const ReleaseResult result = engine.release(10.0, /*abort=*/true);
+
+  check(result.aborted, "abort: the result says aborted");
+  check(!result.ok, "abort: ok is false");
+  bool zero_frame = false;
+  for (const Frame& f : io.frames) {
+    if (f.kp == 0.0 && f.kd == 0.0 && f.tau_ff == 0.0) zero_frame = true;
+  }
+  check(zero_frame,
+        "abort: no zero-torque frame was sent because no status answered");
+}
+
+void test_stall_speed_validation() {
+  FakeIo io(test_config(), /*start_rad=*/-1.0, std::nullopt, 0.0,
+            /*stops=*/true);
+  SafetyGuard guard = make_guard();
+  for (const double value : {-1.0, std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::infinity()}) {
+    MotionConfig m = instant_config();
+    m.stall_speed_mm_s = value;
+    check_throws<SafetyConfigError>(
+        [&] { MotionEngine engine(io, guard, m); },
+        "stall-speed: a non-finite or negative floor is refused");
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -3201,6 +3434,14 @@ int main() {
   test_recovery_jammed_is_fault();
   test_recovery_config_ceilings();
   test_litegrip_forwarding();
+  test_a_slow_creep_is_not_handed_over_mid_travel();
+  test_a_slow_creep_without_contact_never_enters_the_hold();
+  test_open_does_not_start_from_a_cached_position_while_idle();
+  test_a_recent_cache_is_not_enough_when_nothing_answers();
+  test_the_end_of_a_move_requests_a_status_frame();
+  test_a_mid_hold_comm_error_releases_and_reports_failure();
+  test_abort_release_needs_no_fresh_frame();
+  test_stall_speed_validation();
 
   if (g_failures == 0) {
     std::printf("test_motion: all checks passed\n");

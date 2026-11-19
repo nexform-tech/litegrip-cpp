@@ -383,7 +383,7 @@ class LiteGrip : private MotionIo {
   GripperState get_state(bool wait = true) override;
 
   /// Request a status frame even while disabled (0xCC refresh).
-  bool refresh_status(double timeout_s = 0.5);
+  bool refresh_status(double timeout_s = 0.5) override;
 
   double get_position_mm();
   double get_position_rad();
