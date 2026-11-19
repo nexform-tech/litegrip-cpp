@@ -69,6 +69,11 @@ class MotionIo {
   /// (bounded), false returns the cached one.
   virtual GripperState get_state(bool wait) = 0;
 
+  /// Ask the motor for a status frame (0xCC) and wait for the reply, bounded
+  /// by `timeout_s`. Returns true when a status frame arrived. Sends no motion
+  /// command and changes no motor output. Mirrors LiteGrip::refresh_status.
+  virtual bool refresh_status(double timeout_s) = 0;
+
   /// One MIT frame. Returns false when it was NOT sent (not connected /
   /// not enabled) — the engine turns that into CommandError, never silence.
   virtual bool send_mit_frame(double q, double kp, double kd, double dq,
@@ -105,6 +110,26 @@ struct MotionConfig {
   int stall_cycles = 5;            // window length, samples
   double stall_ratio = 0.2;        // window net displacement / expected
   double stall_delta = 0.0015;     // threshold floor, rad
+
+  // A force-carrying approach's TRUE-STOP floor, mm/s: the window's average
+  // speed must be below this before a hand-over to the torque-only hold is
+  // allowed. The 20 % displacement ratio alone is not enough there — that leg
+  // is a POSITION leg whose actual speed is routinely pressed under 20 % of
+  // its command by the setpoint's torque budget and friction, and "slow" was
+  // being read as "on something". 2026-11-18 bench: a 5 N approach crawled at
+  // ~8 mm/s against a 50 mm/s schedule, 0.25 s moved 2 mm, the 20 % window
+  // called it a stall, and the hold then accelerated the jaws across the free
+  // stroke from 78 mm into the workpiece at 26 mm.
+  //
+  // Known edge: a free creep BELOW this floor can still be mistaken for a
+  // stop. It reproduces at 2.5 N (~1.9 mm/s around the closed stop); 2.5 N is
+  // below the README's 3 N setpoint floor (the jaws may not close below
+  // ~2.2 N and are marginal between 2.2 and 3 N), so that is an out-of-policy
+  // operating point. Inside the supported range the gate keeps at least a 2x
+  // margin (a 5 N approach crawls at ~8 mm/s). Lowering it to 0.5 mm/s would
+  // also delay a genuine contact verdict. Mirrors
+  // actions.MotionConfig.stall_speed_mm_s.
+  double stall_speed_mm_s = 2.0;
 
   // ── torque / command caps ─────────────────────────────────────────────
   double max_lead_mm = 4.0;        // travel-phase lead cap, mm (~= kp x cap)
@@ -892,6 +917,20 @@ class MotionEngine {
 
   /// Enabled + guard latch, shared by every motion entry.
   void check_entry(const char* source);
+
+  /// A status snapshot an arriving frame actually answered, or CommError.
+  ///
+  /// A DM motor answers control frames; when nothing is being sent it says
+  /// nothing, and get_state(true) returns the cache after the staleness
+  /// horizon. Planning a ramp from that cache is how a jaw moved while the bus
+  /// was idle made the first frame demand the whole error (2026-11-18: the
+  /// cache said 78 mm, the jaws were at 26 mm, open() left at 23 rad/s out of a
+  /// 20 mm/s move).
+  ///
+  /// Sends 0xCC (which an idle motor answers) and refuses if no frame answers.
+  /// A cached snapshot — even one younger than kStaleAfterS — is not enough:
+  /// at 20 mm/s, half a second of silence is 10 mm of unknown.
+  GripperState fresh_state(const char* source);
 
   double now_s() const;           // monotonic_fn, or steady_clock
   void sleep_s(double seconds);   // sleep_fn, or this_thread

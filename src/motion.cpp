@@ -263,6 +263,18 @@ MotionEngine::MotionEngine(MotionIo& io, SafetyGuard& safety,
   if (!(config_.press_overshoot >= 0.0)) {
     throw SafetyConfigError("MotionConfig: press_overshoot must be >= 0");
   }
+  // A negative or NaN floor makes the hand-over's speed comparison either
+  // always true (negative) or always false (NaN): in neither case does the
+  // "true stop" gate do what it says, and the failure is silent. Refuse at
+  // construction, like the Python dataclass's __post_init__.
+  if (!std::isfinite(config_.stall_speed_mm_s) ||
+      config_.stall_speed_mm_s < 0.0) {
+    throw SafetyConfigError(
+        "MotionConfig: stall_speed_mm_s must be a non-negative finite number "
+        "(got " + std::to_string(config_.stall_speed_mm_s) +
+        ") — the force-approach hand-over compares the window's average speed "
+        "against it");
+  }
 }
 
 double MotionEngine::now_s() const {
@@ -292,6 +304,26 @@ void MotionEngine::check_entry(const char* source) {
                       ") — motion is refused until the cause is cleared and "
                       "the latch is cleared");
   }
+}
+
+GripperState MotionEngine::fresh_state(const char* source) {
+  // refresh_status() sends 0xCC and waits for the reply, bounded by the
+  // staleness horizon. Its own retry policy (await_refresh_reply) already
+  // covers one lost request on a healthy link, so one call is the equivalent
+  // of Python's small retry loop.
+  const bool requested = io_.refresh_status(kStaleAfterS);
+  const GripperState st = io_.get_state(true);
+  if (st.has_data() && !st.is_stale()) {
+    return st;
+  }
+  throw CommError(
+      std::string(source) + ": the status-frame request " +
+      (requested ? "went out but no status frame answered"
+                 : "could not be sent") +
+      " (cache age " +
+      (st.has_data() ? std::to_string(st.data_age_s) + " s" : "none") +
+      ") — refusing to plan motion from a cached position; check the CAN link "
+      "and motor power");
 }
 
 void MotionEngine::send_frame(double q, std::optional<double> kp,
@@ -574,11 +606,11 @@ MoveResult MotionEngine::move_to_limit(
   // decided from this reading — a call that throws has not moved the hardware
   // (#51). The reading is handed to the drive-in rather than read again, and
   // what comes back is the position the ramp measures from.
-  GripperState before = io_.get_state(true);
-  if (!before.has_data()) {
-    throw SafetyFault(std::string(source) +
-                      ": no valid feedback — motion is refused");
-  }
+  //
+  // fresh_state() refuses a cached reading: an idle bus answers control
+  // frames but nothing else, so get_state(true) alone can hand a ramp a pose
+  // from before the jaws were last moved.
+  GripperState before = fresh_state(source);
 
   // A duration is a speed once divided by the distance — and that distance is
   // the RAMP's, which starts where the drive-in leaves the jaws, not where the
@@ -647,6 +679,10 @@ MoveResult MotionEngine::move_to_limit(
   const double win_thresh_rad =
       std::max(config_.stall_delta,
                config_.stall_ratio * speed_rad_s * win_s);
+  // The force-carrying approach's TRUE-STOP floor: the window's average speed
+  // must be under this before a hand-over is allowed. The ratio threshold
+  // alone reads "slow" as "on something", which that leg is not.
+  const double stall_speed_rad_s = config_.stall_speed_mm_s / gcfg.rad_to_mm;
   const double min_cap_rad = speed_rad_s * interval;
   const double travel_cap_rad = std::max(lead_ceiling_rad, min_cap_rad);
   const double stop_cap_rad =
@@ -661,8 +697,11 @@ MoveResult MotionEngine::move_to_limit(
   // by friction and read lag. ramp_steps arriving says the schedule is done,
   // not the jaw. So here the frame count is only a backstop, sized at the
   // SLOWEST speed that still counts as progress: any slower and the stall
-  // window has already fired inside win_s, so this bound cannot be reached
-  // first. Mirrors actions._move_to_limit's `ceiling`.
+  // window has already fired inside win_s. A creep slower than this but with a
+  // window average still above stall_speed_mm_s reaches the bound without
+  // arriving and without stalling, so the call refuses the hand-over — only
+  // motion under stall_speed_mm_s counts as a true stop. Mirrors
+  // actions._move_to_limit's `ceiling`.
   int ceiling = total_steps;
   if (force_n.has_value()) {
     const double floor_rad_s = win_s > 0.0 ? win_thresh_rad / win_s : 0.0;
@@ -799,8 +838,15 @@ MoveResult MotionEngine::move_to_limit(
       snapshot.temperature_coil = st.temperature_coil;
       progress(snapshot);
     }
+    // A force-carrying approach must see a TRUE stop, not merely a small window
+    // displacement: the setpoint's budget and friction routinely press its
+    // actual speed under 20 % of the command, and that is not contact. The
+    // window's average speed has to be below stall_speed_mm_s too.
+    const bool still_creeping =
+        force_n.has_value() && win_delta.has_value() && win_s > 0.0 &&
+        *win_delta / win_s > stall_speed_rad_s;
     if (judge_stall && win_delta.has_value() && (press || in_ramp) &&
-        *win_delta < win_thresh_rad) {
+        *win_delta < win_thresh_rad && !still_creeping) {
       // "Not moving" is not "on the workpiece": with a force setpoint, a stop
       // that never left the leg's start can also mean the budget could not
       // break static friction. Counting that as contact hands a jaw with a
@@ -857,7 +903,7 @@ MoveResult MotionEngine::move_to_limit(
     drop_torque(last_sample_pos, source);
   }
 
-  const GripperState st = io_.get_state(true);
+  const GripperState st = fresh_state(source);
   const bool reached = std::fabs(st.position_rad - target) < config_.reach_tol;
   // Success differs by target, Python verbatim: pressing onto the empty stop
   // succeeds by STALLING near that stop; the grasp approach succeeds by
@@ -1118,7 +1164,28 @@ GraspResult MotionEngine::hand_over(const MoveResult& move, double force,
       return grasp_ends_with_release(*request, move, force, /*cycles=*/0);
     }
   }
-  const HoldOutcome hold = hold_force(force, hold_s, progress);
+  HoldOutcome hold;
+  try {
+    hold = hold_force(force, hold_s, progress);
+  } catch (const CommError& e) {
+    // The bus went silent while the hold was refreshing its status. The last
+    // torque must not stay on the bus: drop it, then report the failure rather
+    // than letting the exception escape with the grip still commanded (the
+    // Python engine does the same).
+    std::fprintf(stderr,
+                 "[litegrip] grasp: hold interrupted (%s) — dropping torque "
+                 "and reporting ok=false\n",
+                 e.what());
+    try {
+      drop_torque(move.state.position_rad, "grasp");
+    } catch (const LiteGripError& release_error) {
+      std::fprintf(stderr,
+                   "[litegrip] grasp: dropping torque after the hold failure "
+                   "also failed (%s)\n",
+                   release_error.what());
+    }
+    return refused(/*no_bite=*/false);
+  }
   if (hold.release_requested) {
     // The hold stopped without consuming the request (actions._hold_force does
     // the same): the opening semantics belong to grasp(). The fallback cannot
@@ -1240,7 +1307,13 @@ ReleaseResult MotionEngine::release_now(
   if (!request.abort) {
     check_calibrated(gcfg);
   }
-  const GripperState st = io_.get_state(true);
+  // An E-stop does not need a fresh reading: the zero-gain frame produces no
+  // force from q, so the cached position is enough. Requiring a status answer
+  // would delay the torque-off by a retry and, when the motor does not answer,
+  // send no frame at all — exactly when a stop is needed most. A normal
+  // release IS a position move and still refreshes.
+  const GripperState st =
+      request.abort ? io_.get_state(false) : fresh_state("release");
   const double pos = st.position_rad;
 
   if (request.abort) {
@@ -1340,10 +1413,9 @@ MotionEngine::HoldOutcome MotionEngine::hold_force(
                          UnitConversion::kNToNm;
 
   HoldOutcome outcome;
-  GripperState st = io_.get_state(true);
-  if (!st.has_data()) {
-    throw SafetyFault("grasp: no valid feedback — the hold is refused");
-  }
+  // The hand-over pose must be a measurement, not a cached reading: the hold
+  // streams torque from here with no position term behind it.
+  GripperState st = fresh_state("grasp-hold");
   double pos = st.position_rad;
   // Entering force mode: continue from the torque in flight so the handover is
   // continuous. Torque already past the setpoint starts AT the setpoint — that
@@ -1380,7 +1452,7 @@ MotionEngine::HoldOutcome MotionEngine::hold_force(
       emit(pos, 0.0, tau_cmd, 0.0, 0.0, "grasp-hold");
     }
     ++outcome.cycles;
-    st = io_.get_state(true);
+    st = fresh_state("grasp-hold");
     // Python aborts on a motor error; the latch check is the C++ addition —
     // a latched fault must not keep the squeeze running.
     if (st.error_code != 1 || safety_.is_fault_latched()) {

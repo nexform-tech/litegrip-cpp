@@ -37,11 +37,32 @@ struct CanFrame {
   const std::uint8_t* bytes() const noexcept { return data.data(); }
 };
 
+/// The transport surface MotorController drives. CanTransport is the real
+/// SocketCAN implementation; tests substitute a queue-backed fake, exactly as
+/// the Python suite's duck-typed transport does.
+///
+/// Kept to the operations the controller performs, and called from one thread
+/// at a time, like CanTransport itself.
+class CanIo {
+ public:
+  virtual ~CanIo() = default;
+
+  virtual void set_id_filter(const std::vector<int>& can_ids) = 0;
+  virtual void send(int can_id, const std::uint8_t* data, std::size_t size,
+                    double timeout_s = 0.1) = 0;
+  virtual void send_multi(int can_id, const std::uint8_t* data,
+                          std::size_t size, int count,
+                          double interval_s = 0.002) = 0;
+  virtual std::optional<CanFrame> recv(double timeout_s = 0.0) = 0;
+  virtual void drain() = 0;
+  virtual void close() = 0;
+};
+
 /// SocketCAN transport: opens one CAN socket and provides send/recv.
 ///
 /// Not thread-safe. `recv()` may be called from a control loop; `send()` from
 /// the same thread.
-class CanTransport {
+class CanTransport : public CanIo {
  public:
   /// `mode` is a *preference*: open() reconciles it with the interface MTU
   /// (classic CAN sockets on FD-capable interfaces may silently drop frames).
@@ -57,7 +78,7 @@ class CanTransport {
   /// missing or down.
   void open();
 
-  void close();
+  void close() override;
   bool is_open() const noexcept { return fd_ >= 0; }
 
   const std::string& channel() const noexcept { return channel_; }
@@ -70,7 +91,7 @@ class CanTransport {
   /// buffer, a one-frame-per-cycle reader falls behind, and the motor's own
   /// status frames are delayed or dropped — making read-back appear frozen
   /// while the motor is actually moving. Empty clears the filter.
-  void set_id_filter(const std::vector<int>& can_ids);
+  void set_id_filter(const std::vector<int>& can_ids) override;
   void add_id_filter(int can_id);
 
   /// Send one frame. Retries on EAGAIN until `timeout_s`.
@@ -83,18 +104,18 @@ class CanTransport {
   /// write-failure counterpart is CommError — not CANTimeoutError, which names
   /// a *read* timeout.)
   void send(int can_id, const std::uint8_t* data, std::size_t size,
-            double timeout_s = 0.1);
+            double timeout_s = 0.1) override;
 
   /// Send the same frame `count` times, spacing by `interval_s`.
   /// DM motors need repeated config commands for reliability.
   void send_multi(int can_id, const std::uint8_t* data, std::size_t size,
-                  int count, double interval_s = 0.002);
+                  int count, double interval_s = 0.002) override;
 
   /// Receive one frame; nullopt on timeout. `timeout_s == 0` = non-blocking.
-  std::optional<CanFrame> recv(double timeout_s = 0.0);
+  std::optional<CanFrame> recv(double timeout_s = 0.0) override;
 
   /// Read and discard everything pending.
-  void drain();
+  void drain() override;
 
  private:
   void apply_id_filter();

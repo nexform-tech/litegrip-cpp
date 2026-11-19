@@ -214,7 +214,7 @@ stderr 报警。对不流状态帧的夹爪，`get_state()` 会先耗满这 0.5 
 | `open(speed_mm_s=None, progress={})` → `MoveResult` | 斜坡走向张开侧标定限位并压住它。`GripperConfig::work_stroke_mm` 严格落在行程之内时改为停在那 个开口，是一次普通定位。 |
 | `close(speed_mm_s=None, progress={})` → `MoveResult` | 同样，朝闭合侧。`work_stroke_mm` 是张开侧的数，不改变闭合停在哪里。 |
 | `home()` → `MoveResult` | 斜坡走到标定闭合位置。不是压紧：它停在零点**上**，而不是压住零点。 |
-| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | 闭合到工件上 —— 空载则闭合到闭合侧标定限位 —— 然后爬到并保持 `force_n` N。闭合段带着 `force_n` 作为力矩预算，所以撞上工件时压出的力不超过设定值。只有夹爪停下来后保力段才接手：`stalled`（两指之间有东西）或 `reached`（空载闭合到位）。但**从起点就没动过**就停下、且预算低于 `MotionConfig::breakaway_nm` 时不算接触 —— 那是预算压不出静摩擦 —— 这种情形调用原地撤力、返回 `no_bite = true`，不进保力段。`hold_s = 0` 保到故障或越位护栏为止。`hold_s = 0` 的保力用 `release()` 结束。 |
+| `grasp(force_n=None, hold_s=0.0, progress={})` → `GraspResult` | 闭合到工件上 —— 空载则闭合到闭合侧标定限位 —— 然后爬到并保持 `force_n` N。闭合段带着 `force_n` 作为力矩预算，所以撞上工件时压出的力不超过设定值。只有夹爪停下来后保力段才接手：`stalled`（两指之间有东西）或 `reached`（空载闭合到位）。带力接近段里 `stalled` 还要求窗口平均速度低于 `MotionConfig::stall_speed_mm_s`（2 mm/s）—— 还在慢速蠕动的夹爪不算接触，不交给纯力矩的保力段。但**从起点就没动过**就停下、且预算低于 `MotionConfig::breakaway_nm` 时不算接触 —— 那是预算压不出静摩擦 —— 这种情形调用原地撤力、返回 `no_bite = true`，不进保力段。`hold_s = 0` 保到故障或越位护栏为止。`hold_s = 0` 的保力用 `release()` 结束。 |
 | `release(clearance_mm=10.0, abort=false, timeout_s=None)` → `ReleaseResult` | 结束正在进行的 `grasp()` 并张开：撤掉夹持设定力，再让夹爪斜坡走到 `max(当前, 交接点) + clearance_mm`，钳在标定张开限位以内。可在任意线程调用，包括 `grasp(hold_s = 0)` 正阻塞在另一个线程的时候 —— 见 [结束夹持](#结束夹持)。没有夹取在跑时，就在调用方线程里直接张开。`abort = true` 只撤力、不张开。超时是 `ok = false`，不抛异常。 |
 | `request_release(clearance_mm=10.0, abort=false)` → `bool` | `release()` 的非阻塞形式：把请求排给正在跑的 `grasp()` 并返回 `true`，否则返回 `false`。自己绝不发帧 —— UI 线程、信号处理、急停回调里都安全。 |
 | `goto_mm(position_mm, kp=None, kd=None, duration=0.5)` → `MoveResult` | 斜坡走到一个毫米目标（0 = 闭合）。 |
@@ -397,7 +397,9 @@ CAN 帧归夹取线程所有：两个线程同时给同一条总线上斜坡，�
 第四种组合是失败，本版本新增：
 
 - **`grasp()` 返回 `ok = false, reached = false, stalled = false`**，说明闭合段
-  结束时既没到位也没堵转 —— 夹爪还在自由行程里。此时**不进入**保力段：保力帧里
+  结束时既没到位也没堵转 —— 夹爪还在自由行程里。慢速蠕动也归这一路：窗口净位移
+  虽小，平均速度仍高于 `MotionConfig::stall_speed_mm_s`（2 mm/s），不算真停，
+  闭合段一直走到帧数上界、按失败收尾。此时**不进入**保力段：保力帧里
   既没有位置项也没有速度项，把还在走的夹爪交过去，前馈力矩就成了唯一作用在它上面
   的力，它会一路加速直到越位护栏撤力。调用改为原地撤力返回，`cycles = 0`。什么都
   没夹住。看到这个结果说明闭合段被拖住了 —— 读数过期，或者机构自身预算顶不过的
@@ -482,6 +484,7 @@ const litegrip::MoveResult res = gripper.goto_mm(
 | `stop_lead_mm` / `press_zone_mm` | `0.7` / `2.0` | 压紧段领先上限，以及它从哪里接管 |
 | `stop_tol` | `0.02` rad | 「停在止点上」的容差 |
 | `stall_cycles` / `stall_ratio` / `stall_delta` | `5` / `0.2` / `0.0015` | 堵转窗口 |
+| `stall_speed_mm_s` | `2.0` | 带力接近段交接的真停速度下限，mm/s —— 只看 20% 窗口会把慢速蠕动当成接触（见 `grasp`） |
 | `stop_torque_nm` / `stop_torque_cycles` / `stop_speed_ratio` | `0.7` / `3` / `0.5` | 行进段力矩保护 |
 | `stop_release_s` | `0.2` | 被保护拦下或失力之后那段无力的尾巴 |
 | `force_n` / `force_ramp_n_s` | `20.0` / `20.0` | 默认夹持力，以及保力的爬升速率（N/s） |

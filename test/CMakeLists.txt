@@ -9,6 +9,7 @@ set(LITEGRIP_CPP_TESTS
   test_headers.cpp
   test_protocol.cpp
   test_motor.cpp
+  test_can_poll_drain.cpp
   test_golden.cpp
   test_transport.cpp
   test_json.cpp
