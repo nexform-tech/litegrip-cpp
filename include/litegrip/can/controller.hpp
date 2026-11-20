@@ -1,8 +1,8 @@
 // litegrip/can/controller.hpp — manages DM motors over one CAN transport.
 //
-// Port of litegrip_driver/litegrip/can/controller.py. Kept multi-motor capable
-// even though LiteGrip uses a single motor: it is the general-purpose surface
-// for anyone driving several Damiao motors on one bus.
+// Port of litegrip_driver/litegrip/can/controller.py. The SDK registers one
+// gripper motor; the class keeps a motor map internally because the status
+// dispatch is keyed by the motor's master id.
 
 #pragma once
 
@@ -35,23 +35,13 @@ class MotorController {
 
   // ── motor management ──────────────────────────────────────────────────
 
-  /// Register a motor. When `mst_id` is nullopt it is auto-detected (register
-  /// read, then a status-refresh probe, then a hardcoded default).
+  /// Register a motor. `mst_id` (the CAN id the motor's status frames arrive
+  /// on) is explicit: shipped LiteGrip units use 0x18 and there is no probing.
   ///
-  /// Returns a reference valid until remove_motor().
-  MotorState& add_motor(int can_id, std::optional<int> mst_id = std::nullopt,
+  /// Returns a reference valid for the controller's lifetime.
+  MotorState& add_motor(int can_id, int mst_id,
                         MotorType motor_type = MotorType::kDM4310,
                         ControlMode control_mode = ControlMode::kMit);
-
-  void remove_motor(const MotorState& motor);
-
-  MotorState* get_motor(int mst_id);
-  MotorState* get_motor_by_can_id(int can_id);
-
-  /// Registered motors, keyed by mst_id.
-  const std::unordered_map<int, std::unique_ptr<MotorState>>& motors() const noexcept {
-    return motors_;
-  }
 
   // ── command dispatch ──────────────────────────────────────────────────
 
@@ -78,17 +68,6 @@ class MotorController {
   /// Send one MIT control frame. Call in a loop at >= 200 Hz for smooth motion.
   void control_mit(MotorState& motor, double kp, double kd, double q,
                    double dq = 0.0, double tau = 0.0);
-
-  // ── parameter access ──────────────────────────────────────────────────
-
-  /// Read a register; throws CANTimeoutError when the motor does not answer.
-  double read_param(MotorState& motor, DmReg rid, double timeout_s = 0.5);
-
-  /// Write a register (no confirmation wait).
-  void write_param(MotorState& motor, DmReg rid, double value);
-
-  /// Save parameters to flash. The motor must be disabled first.
-  void save_params(MotorState& motor);
 
   // ── polling ───────────────────────────────────────────────────────────
 
@@ -126,10 +105,11 @@ class MotorController {
   void close();
 
  private:
-  /// MST_ID fallback: LiteGrip ships with mst_id == 0x18 (24).
-  static constexpr int kDefaultMstId = 0x18;
+  /// Read a register; throws CANTimeoutError when the motor does not answer.
+  double read_param(MotorState& motor, DmReg rid, double timeout_s = 0.5);
 
-  int detect_mst_id(int can_id, double timeout_s = 0.5);
+  /// Write a register (no confirmation wait).
+  void write_param(MotorState& motor, DmReg rid, double value);
 
   /// Decode one received frame into its motor state, when it belongs to a
   /// registered motor. Returns nullptr for foreign and parameter frames.

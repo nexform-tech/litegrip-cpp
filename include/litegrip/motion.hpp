@@ -2,7 +2,7 @@
 // positioning ramps / zero-gravity).
 //
 // Port of litegrip_driver/litegrip/actions.py plus the matching parts of
-// gripper.py. LiteGrip's open()/close()/grasp()/... construct one MotionEngine
+// gripper.py. The Gripper facade's open()/close()/grasp()/... construct one MotionEngine
 // per call and forward to it. The engine talks only to the MotionIo seam — not
 // to LiteGrip or GripperBus — which is what lets test_motion.cpp run complete
 // ramps against a fake.
@@ -22,10 +22,10 @@
 //     moves inward only, at kp <= recovery_kp_max, |dq| <= recovery_dq_max and
 //     tau = 0, and which refuses to start at all while the guard's fault latch
 //     is set. It is the recovery channel re-implemented engine-side because
-//     guard_recovery_frame() admits only positions inside the packaged
-//     "mechanical observed range" (the reference unit's unverified hand-push
-//     bound, safety.hpp), which no shipped calibration's stops lie inside —
-//     see the TODO-style note on the function for the follow-up;
+//     a gate bounded by the packaged "mechanical observed range" (the reference
+//     unit's unverified hand-push bound, safety.hpp) would refuse positions
+//     that no shipped calibration's stops lie inside — see the note on the
+//     function for the follow-up;
 //   * hold-type operations (grasp's hold, exit_zero_gravity) never
 //     run the recovery drive-in: driving "inward" while holding a workpiece
 //     would open the grip. open()/close()/grasp()/move_at_speed*() — the
@@ -71,7 +71,7 @@ class MotionIo {
 
   /// Ask the motor for a status frame (0xCC) and wait for the reply, bounded
   /// by `timeout_s`. Returns true when a status frame arrived. Sends no motion
-  /// command and changes no motor output. Mirrors LiteGrip::refresh_status.
+  /// command and changes no motor output. Mirrors Gripper::refresh_status.
   virtual bool refresh_status(double timeout_s) = 0;
 
   /// One MIT frame. Returns false when it was NOT sent (not connected /
@@ -259,24 +259,6 @@ struct MotionConfig {
   // next move. Raising it widens that window with it; lowering it does not
   // narrow the window below stop_tol.
   double hold_runaway_rad = 0.05;
-  // [Deprecated] A hold no longer uses gains (see above). Kept so an older
-  // config still compiles; setting them has no effect.
-  double hold_kp = 150.0;          // deprecated: hold stiffness
-  double hold_kd = 2.0;            // deprecated: hold damping
-
-  // ── enable (used by the actions layer) ────────────────────────────────
-  int enable_retries = 3;
-  double enable_retry_interval = 0.2;
-
-  // ── zero() probing (used by the actions layer) ────────────────────────
-  double calib_kp = 20.0;
-  double calib_kd = 2.0;
-  double calib_step_rad = 0.05;
-  double calib_tau_limit = 2.0;
-  double calib_stall_delta = 0.0015;
-  int calib_stall_cycles = 5;
-  int calib_max_iter = 200;
-
   // ── test / simulation seams (empty = real clock / real sleep) ─────────
   std::function<void(double)> sleep_fn{};
   std::function<double()> monotonic_fn{};
@@ -328,10 +310,10 @@ using MoveProgressCallback = std::function<void(const MoveProgress&)>;
 ///    mid-travel is also a stall, but far from the calibrated stop — ok=false.
 ///  * grasp()'s closing leg: success = reached the closed-side calibrated stop
 ///    and did NOT stall, i.e. reached && !stalled.
-///  * the positioning moves (goto_mm / goto_rad / move_to / home /
-///    move_at_speed*): their target is a point INSIDE the travel, so success =
-///    reached && !stalled. A shortfall there is ok=false, and unless the
-///    travel-leg protection ended it, `released` is set as well.
+///  * the internal positioning moves (ramp_to / move_at_speed*): their target
+///    is a point INSIDE the travel, so success = reached && !stalled. A
+///    shortfall there is ok=false, and unless the travel-leg protection ended
+///    it, `released` is set as well.
 ///  * a move ended by the travel-leg stall-torque protection is never `ok`:
 ///    the gripper was blocked and then let go limp, which is not a press.
 struct MoveResult {

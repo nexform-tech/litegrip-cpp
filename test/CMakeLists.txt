@@ -19,7 +19,6 @@ set(LITEGRIP_CPP_TESTS
   test_gripper.cpp
   test_motion.cpp
   test_probe.cpp
-  test_control_loop.cpp
 )
 
 foreach(test_src IN LISTS LITEGRIP_CPP_TESTS)
@@ -29,17 +28,11 @@ foreach(test_src IN LISTS LITEGRIP_CPP_TESTS)
   add_test(NAME ${test_name} COMMAND ${test_name})
 endforeach()
 
-# test_calibration verifies the SHIPPED factory_calibration.json, so it needs
-# the source data directory. Test-only: the library itself resolves its data
-# location at run time and never bakes in a machine-dependent path.
+# test_calibration / test_gripper verify the SHIPPED factory_calibration.json,
+# so they need the source data directory. Test-only: the library itself
+# resolves its data location at run time and never bakes in a
+# machine-dependent path.
 target_compile_definitions(test_calibration PRIVATE
   LITEGRIP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../calibration")
 target_compile_definitions(test_gripper PRIVATE
   LITEGRIP_TEST_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../calibration")
-
-# test_safety loads the shipped versioned baselines. The library discovers its
-# data directory at run time (no baked-in path), so point it at the source tree.
-set_tests_properties(test_safety PROPERTIES
-  ENVIRONMENT "LITEGRIP_DATA_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..")
-set_tests_properties(test_control_loop PROPERTIES
-  ENVIRONMENT "LITEGRIP_DATA_DIR=${CMAKE_CURRENT_SOURCE_DIR}/..")

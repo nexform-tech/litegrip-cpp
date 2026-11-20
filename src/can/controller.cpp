@@ -29,30 +29,23 @@ void sleep_s(double seconds) {
 
 MotorController::~MotorController() { close(); }
 
-MotorState& MotorController::add_motor(int can_id, std::optional<int> mst_id,
+MotorState& MotorController::add_motor(int can_id, int mst_id,
                                        MotorType motor_type,
                                        ControlMode control_mode) {
-  if (!mst_id.has_value()) {
-    mst_id = detect_mst_id(can_id);
-  }
-
   MotorParams params;
   params.motor_type = motor_type;
   params.can_id = can_id;
-  params.mst_id = *mst_id;
+  params.mst_id = mst_id;
   params.control_mode = control_mode;
 
   auto owned = std::make_unique<MotorState>(params);
-  const int key = *mst_id;
   MotorState* raw = owned.get();
-  motors_[key] = std::move(owned);
+  motors_[mst_id] = std::move(owned);
 
-  // Install the hardware RX filter for every registered mst_id. Done AFTER
-  // mst_id detection (detection needs unfiltered RX). On a shared bus this
+  // Install the hardware RX filter for the motor's mst_id. On a shared bus this
   // stops foreign frames from flooding the RX buffer and starving this motor's
   // status frames — the root cause of "state read-back freezes while the motor
-  // keeps moving". Param responses arrive on the same mst_id, so read_param
-  // still works.
+  // keeps moving".
   std::vector<int> ids;
   ids.reserve(motors_.size());
   for (const auto& entry : motors_) {
@@ -61,30 +54,6 @@ MotorState& MotorController::add_motor(int can_id, std::optional<int> mst_id,
   transport_.set_id_filter(ids);
 
   return *raw;
-}
-
-void MotorController::remove_motor(const MotorState& motor) {
-  motors_.erase(motor.mst_id());
-  std::vector<int> ids;
-  ids.reserve(motors_.size());
-  for (const auto& entry : motors_) {
-    ids.push_back(entry.first);
-  }
-  transport_.set_id_filter(ids);
-}
-
-MotorState* MotorController::get_motor(int mst_id) {
-  const auto it = motors_.find(mst_id);
-  return it == motors_.end() ? nullptr : it->second.get();
-}
-
-MotorState* MotorController::get_motor_by_can_id(int can_id) {
-  for (auto& entry : motors_) {
-    if (entry.second->can_id() == can_id) {
-      return entry.second.get();
-    }
-  }
-  return nullptr;
 }
 
 void MotorController::send_command(MotorState& motor, std::uint8_t cmd,
@@ -188,11 +157,6 @@ void MotorController::write_param(MotorState& motor, DmReg rid, double value) {
   transport_.send(kBroadcastId, data.data(), data.size());
 }
 
-void MotorController::save_params(MotorState& motor) {
-  const auto data = pack_save_param_frame(motor.can_id());
-  transport_.send(kBroadcastId, data.data(), data.size());
-}
-
 MotorState* MotorController::poll(double timeout_s, int max_frames) {
   MotorState* updated = nullptr;
   const int limit = std::max(1, max_frames);
@@ -257,68 +221,6 @@ bool MotorController::poll_until(MotorState& motor, double timeout_s) {
     sleep_s(0.001);
   }
   return false;
-}
-
-int MotorController::detect_mst_id(int can_id, double timeout_s) {
-  const int can_id_low = can_id & 0x0F;
-
-  // Detection must see frames on ids not yet known, so any active RX filter is
-  // cleared for the duration; add_motor() reinstalls it afterwards.
-  transport_.set_id_filter({});
-
-  // Strategy 1: read the MST_ID register. The motor answers on its real
-  // mst_id; match by the can_id embedded in the parameter response.
-  {
-    transport_.drain();
-    const auto request = pack_read_param_frame(can_id, static_cast<int>(DmReg::kMstId));
-    transport_.send(kBroadcastId, request.data(), request.size());
-
-    const double deadline = monotonic_now() + timeout_s;
-    while (monotonic_now() < deadline) {
-      const auto frame = transport_.recv(0.01);
-      if (!frame.has_value()) {
-        continue;
-      }
-      const auto resp = unpack_param_response(frame->bytes(), frame->dlc);
-      if (!resp.has_value() || resp->rid != static_cast<int>(DmReg::kMstId)) {
-        continue;
-      }
-      if (resp->can_id != can_id_low) {
-        continue;
-      }
-      const int mst = static_cast<int>(resp->value);
-      if (mst >= 1 && mst <= 0xFE) {
-        return mst;
-      }
-    }
-  }
-
-  // Strategy 2: send a status refresh; the status frame's arrival CAN id *is*
-  // the mst_id.
-  {
-    transport_.drain();
-    const auto request = pack_refresh_frame(can_id);
-    transport_.send(kBroadcastId, request.data(), request.size());
-
-    const double deadline = monotonic_now() + timeout_s;
-    while (monotonic_now() < deadline) {
-      const auto frame = transport_.recv(0.01);
-      if (!frame.has_value() || frame->dlc < 8) {
-        continue;
-      }
-      if ((frame->data[0] & 0x0F) != can_id_low) {
-        continue;
-      }
-      const int mst = frame->can_id & 0x7FF;
-      if (mst >= 1 && mst <= 0xFE) {
-        return mst;
-      }
-    }
-  }
-
-  // Neither strategy worked: fall back to the shipped default. The caller is
-  // expected to override it explicitly if that is wrong.
-  return kDefaultMstId;
 }
 
 void MotorController::close() { transport_.close(); }

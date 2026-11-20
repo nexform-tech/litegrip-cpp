@@ -1,8 +1,8 @@
-// test_transport.cpp — SocketCAN transport checks that do NOT transmit.
+// test_transport.cpp — classic-CAN SocketCAN transport checks that do NOT
+// transmit.
 //
 // Deliberately non-intrusive: a live gripper (can0 up, carrier present) may be
 // attached to this machine, so this test only ever
-//   * reads an interface MTU via ioctl,
 //   * exercises the error path for a missing interface,
 //   * opens and closes a socket on a real CAN interface (bind only).
 // It never calls send(), so it cannot disturb a running stack.
@@ -11,7 +11,6 @@
 // the suite still works on machines without CAN hardware.
 
 #include <net/if.h>
-#include <sys/socket.h>
 #include <unistd.h>
 
 #include <iostream>
@@ -34,22 +33,6 @@ void check(bool condition, const char* what) {
 }  // namespace
 
 int main() {
-  // ── iface_mtu on a known interface ────────────────────────────────────
-  {
-    const int fd = ::socket(AF_INET, SOCK_DGRAM, 0);
-    check(fd >= 0, "throwaway socket created");
-    if (fd >= 0) {
-      const auto mtu = litegrip::can::iface_mtu(fd, "lo");
-      check(mtu.has_value(), "loopback MTU readable");
-      if (mtu.has_value()) {
-        check(*mtu > 0, "loopback MTU positive");
-      }
-      const auto bogus = litegrip::can::iface_mtu(fd, "lg_no_such_iface");
-      check(!bogus.has_value(), "missing interface yields no MTU");
-      ::close(fd);
-    }
-  }
-
   // ── opening a missing interface must throw ConnectError ───────────────
   {
     litegrip::can::CanTransport transport("lg_no_such_iface");
@@ -87,10 +70,6 @@ int main() {
     transport.open();
     check(transport.is_open(), "can0 opens");
     check(transport.channel() == "can0", "channel name preserved");
-    // can0 is classic CAN (MTU 16) here, so the requested mode must survive
-    // reconciliation.
-    check(transport.mode() == litegrip::can::CanMode::kCan,
-          "classic CAN interface keeps classic mode");
     transport.close();
     check(!transport.is_open(), "can0 closes");
 

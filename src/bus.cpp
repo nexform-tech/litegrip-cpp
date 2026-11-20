@@ -1,14 +1,18 @@
-// bus.cpp — GripperBus, ported from
-// litegrip_driver/litegrip/protocols/can_bus.py (LiteGripCAN).
+// bus.cpp — GripperBus: the single-motor CAN layer.
 
 #include "litegrip/bus.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <functional>
+#include <limits>
+#include <string>
 #include <thread>
 
+#include "litegrip/constants.hpp"
 #include "litegrip/exceptions.hpp"
 #include "litegrip/teardown.hpp"
 
@@ -29,9 +33,7 @@ void sleep_s(double seconds) {
 
 }  // namespace
 
-GripperBus::GripperBus(GripperConfig config)
-    : config_(std::move(config)),
-      hold_policy_(std::make_unique<DefaultHoldPolicy>()) {}
+GripperBus::GripperBus(GripperConfig config) : config_(std::move(config)) {}
 
 GripperBus::~GripperBus() { disconnect(); }
 
@@ -40,16 +42,25 @@ bool GripperBus::connect() {
     return true;
   }
 
-  const can::CanMode mode =
-      config_.canfd_mode ? can::CanMode::kCanFd : can::CanMode::kCan;
-
-  transport_ = std::make_unique<can::CanTransport>(config_.can_channel, mode);
+  transport_ = std::make_unique<can::CanTransport>(config_.can_channel);
   transport_->open();  // throws ConnectError when the interface is unusable
 
   controller_ = std::make_unique<can::MotorController>(*transport_);
   connected_ = true;
 
-  register_gripper(config_.can_id, config_.mst_id, GripperParams::kMotorType);
+  try {
+    motor_ = &controller_->add_motor(config_.can_id, config_.mst_id,
+                                     GripperParams::kMotorType,
+                                     can::ControlMode::kMit);
+  } catch (const LiteGripError& error) {
+    // Leave the object in a clean, retryable state rather than half-connected.
+    controller_.reset();
+    transport_->close();
+    transport_.reset();
+    connected_ = false;
+    throw CommError(std::string("could not register the gripper motor: ") +
+                    error.what());
+  }
   return true;
 }
 
@@ -59,14 +70,10 @@ void GripperBus::disconnect(bool disable) noexcept {
   }
 
   // Disable on the way out unless the caller asked the motor to stay enabled.
-  // The condition also covers a bare enable() that was never preceded by
-  // init(): the Python original would have left that motor enabled (holding
-  // position with torque) after disconnect.
+  // ~GripperBus() calls this, and a destructor that lets a CommError escape
+  // terminates the process — the failure is contained and reported instead.
   if (disable && motor_ != nullptr && (initialized_ || motor_->is_enabled())) {
-    // ~GripperBus() calls this, and a destructor that lets a CommError escape
-    // terminates the process — the failure is contained and reported instead.
-    teardown_step_quietly("disable",
-                          [this] { GripperBus::disable(); });
+    teardown_step_quietly("disable", [this] { GripperBus::disable(); });
   }
 
   if (controller_) {
@@ -82,32 +89,6 @@ void GripperBus::disconnect(bool disable) noexcept {
   initialized_ = false;
 }
 
-int GripperBus::register_gripper(int can_id, std::optional<int> mst_id,
-                                 can::MotorType motor_type) {
-  if (!connected_ || controller_ == nullptr) {
-    throw CommError("CAN not connected");
-  }
-
-  try {
-    motor_ = &controller_->add_motor(can_id, mst_id, motor_type,
-                                     can::ControlMode::kMit);
-  } catch (const LiteGripError& error) {
-    throw CommError(std::string("could not register the gripper motor: ") +
-                    error.what());
-  }
-
-  if (!config_.mst_id.has_value()) {
-    config_.mst_id = motor_->mst_id();
-  }
-  return motor_->mst_id();
-}
-
-void GripperBus::set_hold_policy(std::unique_ptr<HoldPolicy> policy) {
-  if (policy != nullptr) {
-    hold_policy_ = std::move(policy);
-  }
-}
-
 std::optional<int> GripperBus::enable_and_hold(
     const GripperConfig& effective_config) {
   if (controller_ == nullptr || motor_ == nullptr) {
@@ -116,58 +97,55 @@ std::optional<int> GripperBus::enable_and_hold(
 
   controller_->enable(*motor_);  // 0xFC
 
-  try {
-    // The policy covers the window between 0xFC taking effect and the first
-    // hold frame, waits for a fresh status frame, then holds the measured
-    // position.
-    hold_policy_->init(*this, effective_config);
-  } catch (const HardwareError&) {
+  // Cover the window between 0xFC taking effect and the first hold frame with
+  // zero-gain frames, streamed rather than sent once: one lost frame would
+  // otherwise leave the motor running the previous session's target.
+  control_mit_stream(0.0, 0.0, 0.0, 0.05, 0.0, 0.0, 0.005);
+
+  const std::uint64_t prev_rx = motor_->rx_count();
+  const double deadline = monotonic_now() + DefaultParams::kInitTimeoutS;
+  bool fresh = false;
+  while (monotonic_now() < deadline) {
+    // Keep feeding the motor while waiting: an enabled motor that hears nothing
+    // for ~900 ms latches the comm-loss fault this wait is meant to detect.
+    control_mit(0.0, 0.0, 0.0, 0.0, 0.0);
+    poll(0.01);
+    if (motor_->rx_count() > prev_rx) {
+      fresh = true;
+      break;
+    }
+    sleep_s(0.005);
+  }
+
+  if (!fresh) {
     return std::nullopt;  // no feedback
+  }
+
+  // rx_count only advances on a decoded status frame, so position() is a real
+  // reading: hold it with the configured gains.
+  if (motor_->rx_count() != 0) {
+    control_mit_stream(motor_->position(), effective_config.kp,
+                       effective_config.kd, 0.05);
   }
   return motor_->error();
 }
 
-bool GripperBus::enable(std::optional<double> kp, std::optional<double> kd) {
-  if (controller_ == nullptr || motor_ == nullptr) {
-    return false;
-  }
-  GripperConfig effective = config_;
-  if (kp.has_value()) {
-    effective.kp = *kp;
-  }
-  if (kd.has_value()) {
-    effective.kd = *kd;
-  }
-
-  // nullopt (no feedback) is not 0 and not 1, so a silent motor is reported as
-  // a failed enable rather than a successful one.
-  const std::optional<int> error = enable_and_hold(effective);
-  return error.has_value() && (*error == 0 || *error == 1);
-}
-
-bool GripperBus::init(std::optional<double> kp, std::optional<double> kd) {
+bool GripperBus::init(std::optional<int> retries) {
   if (!connected_ || controller_ == nullptr || motor_ == nullptr) {
     throw NotInitializedError("not connected or no gripper registered");
   }
 
-  GripperConfig effective = config_;
-  if (kp.has_value()) {
-    effective.kp = *kp;
-  }
-  if (kd.has_value()) {
-    effective.kd = *kd;
-  }
-
+  const int attempts = std::max(
+      1, retries.value_or(static_cast<int>(GripperParams::kFaultClearRetries)));
   int last_error = -1;
 
-  for (int attempt = 0; attempt < GripperParams::kFaultClearRetries; ++attempt) {
+  for (int attempt = 0; attempt < attempts; ++attempt) {
     // 1. Disable, so the mode switch and the enable start from a known state.
     controller_->disable(*motor_);
     sleep_s(0.01);
 
     // 2. Switch to MIT. A failed verification is not fatal here: the motor may
-    //    already be in MIT, and the enable/hold below is what actually proves
-    //    the link.
+    //    already be in MIT, and the enable/hold below is what proves the link.
     if (!controller_->switch_control_mode(*motor_, can::ControlModeCode::kMit)) {
       std::fprintf(stderr,
                    "[litegrip] MIT mode switch could not be verified; "
@@ -175,23 +153,20 @@ bool GripperBus::init(std::optional<double> kp, std::optional<double> kd) {
     }
     sleep_s(0.05);
 
-    // 3 + 4. Enable, cover the window, verify feedback, hold. The motor is left
-    //        holding the position it actually has, so it cannot jump towards
-    //        whatever target the previous session left behind.
-    const std::optional<int> error = enable_and_hold(effective);
+    // 3. Enable, cover the window, verify feedback, hold. The motor is left
+    //    holding the position it actually has. Only error==1 means enabled.
+    const std::optional<int> error = enable_and_hold(config_);
     if (!error.has_value()) {
       last_error = -2;  // timeout / no feedback
-    } else if (*error == 0 || *error == 1) {
+    } else if (*error == 1) {
       initialized_ = true;
       return true;
     } else {
       last_error = *error;
     }
 
-    // Retry: clear the fault before the next attempt. No bare enable() here —
-    // the next iteration disables immediately, and an uncovered enable is
-    // exactly the window this method avoids.
-    if (attempt < GripperParams::kFaultClearRetries - 1) {
+    // Retry: clear the fault before the next attempt.
+    if (attempt < attempts - 1) {
       controller_->clear_fault(*motor_);
       sleep_s(0.01);
     }
@@ -222,26 +197,20 @@ bool GripperBus::disable() {
   return true;
 }
 
-bool GripperBus::clear_fault(std::optional<double> kp, std::optional<double> kd) {
+bool GripperBus::clear_fault() {
   if (controller_ == nullptr || motor_ == nullptr) {
     return false;
   }
 
-  GripperConfig effective = config_;
-  if (kp.has_value()) {
-    effective.kp = *kp;
-  }
-  if (kd.has_value()) {
-    effective.kd = *kd;
-  }
-
-  for (int attempt = 0; attempt < GripperParams::kFaultClearRetries; ++attempt) {
+  const int attempts = GripperParams::kFaultClearRetries;
+  for (int attempt = 0; attempt < attempts; ++attempt) {
     // Strategy 1: direct clear + enable (proven for UV faults, where the motor
     // is already effectively disabled).
     controller_->clear_fault(*motor_);
     sleep_s(0.005);
-    const std::optional<int> first = enable_and_hold(effective);
-    if (first.has_value() && (*first == 0 || *first == 1)) {
+    const std::optional<int> first = enable_and_hold(config_);
+    if (first.has_value() && *first == 1) {
+      initialized_ = true;
       return true;
     }
 
@@ -250,13 +219,56 @@ bool GripperBus::clear_fault(std::optional<double> kp, std::optional<double> kd)
     sleep_s(0.01);
     controller_->clear_fault(*motor_);
     sleep_s(0.01);
-    const std::optional<int> second = enable_and_hold(effective);
-    if (second.has_value() && (*second == 0 || *second == 1)) {
+    const std::optional<int> second = enable_and_hold(config_);
+    if (second.has_value() && *second == 1) {
+      initialized_ = true;
       return true;
     }
   }
 
+  initialized_ = false;
   return false;
+}
+
+bool GripperBus::set_zero() {
+  if (controller_ == nullptr || motor_ == nullptr) {
+    return false;
+  }
+  if (!initialized_) {
+    // The zero command is only accepted in a controlled state; make the
+    // precondition explicit instead of sending 0xFE into an unknown mode.
+    return false;
+  }
+
+  // 0xFE overwrites the encoder zero. Disable first so the write cannot fight
+  // a live control loop, then re-enable and hold at the new zero.
+  disable();
+  sleep_s(0.01);
+  controller_->set_zero(*motor_);  // 0xFE
+  sleep_s(0.05);
+
+  if (!init()) {
+    return false;
+  }
+
+  if (!update_state(0.5)) {
+    std::fprintf(stderr,
+                 "[litegrip] set_zero: no status frame after re-enable — "
+                 "the zero could not be verified\n");
+    return false;
+  }
+  const double position = motor_->position();
+  if (!(std::fabs(position) <= 1e-3)) {
+    std::fprintf(stderr,
+                 "[litegrip] set_zero: read back %+.6f rad after 0xFE, which "
+                 "is more than 1e-3 rad from zero — the motor did not accept "
+                 "the new zero\n",
+                 position);
+    return false;
+  }
+  std::printf("[litegrip] set_zero: encoder zero set (read back %+.6f rad)\n",
+              position);
+  return true;
 }
 
 bool GripperBus::control_mit(double q_target, double kp, double kd,
@@ -269,8 +281,7 @@ bool GripperBus::control_mit(double q_target, double kp, double kd,
                              tau_feedforward);
   } catch (const std::exception& e) {
     // Still false, not a throw: this is the one-frame send and its callers
-    // check the return value. The reason is no longer swallowed, though — a
-    // silent false is what made a dropped frame look like motion.
+    // check the return value. The reason is no longer swallowed, though.
     std::fprintf(stderr, "[litegrip] %s: MIT frame not sent: %s\n",
                  config_.can_channel.c_str(), e.what());
     return false;
@@ -360,8 +371,7 @@ bool await_refresh_reply(double timeout_s,
                          const std::function<void()>& send_refresh,
                          const std::function<bool(double)>& await_status) {
   // Each attempt gets HALF the caller's budget, so the retry cannot make the
-  // call outlast timeout_s — a policy that doubled the deadline would be a
-  // worse bug than the one it fixes.
+  // call outlast timeout_s.
   const double budget = timeout_s / 2.0;
   for (int attempt = 0; attempt < 2; ++attempt) {
     send_refresh();
@@ -385,11 +395,8 @@ bool GripperBus::refresh_status(double timeout_s) {
   }
 
   // A disabled motor does not stream status frames on its own, so the refresh
-  // command (which is answered regardless of enable state) is how position is
-  // read before the first enable. Sends no motion command. The retry policy is
-  // in await_refresh_reply(): the first call after connect() is answered late
-  // by the mst_id detection's parameter read, not by this request, so one
-  // attempt can be lost on a perfectly healthy link.
+  // command (answered regardless of enable state) is how position is read
+  // before the first enable. Sends no motion command.
   return await_refresh_reply(
       timeout_s, [this] { controller_->refresh_status(*motor_); },
       [this](double attempt_budget) {
@@ -428,19 +435,13 @@ int GripperBus::get_temperature_coil() const {
   return motor_ != nullptr ? motor_->t_coil() : 0;
 }
 
-double GripperBus::read_param(int rid, double timeout_s) {
-  if (controller_ == nullptr || motor_ == nullptr) {
-    throw NotInitializedError("not connected or no gripper registered");
-  }
-  return controller_->read_param(*motor_, static_cast<can::DmReg>(rid),
-                                 timeout_s);
+double GripperBus::data_age_s() const {
+  return motor_ != nullptr ? motor_->data_age_s()
+                           : std::numeric_limits<double>::infinity();
 }
 
-void GripperBus::write_param(int rid, double value) {
-  if (controller_ == nullptr || motor_ == nullptr) {
-    throw NotInitializedError("not connected or no gripper registered");
-  }
-  controller_->write_param(*motor_, static_cast<can::DmReg>(rid), value);
+bool GripperBus::has_data() const {
+  return motor_ != nullptr && motor_->has_data();
 }
 
 }  // namespace litegrip

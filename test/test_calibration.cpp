@@ -75,17 +75,12 @@ int main() {
                  "rad_to_mm is the span over the recorded travel");
       check(factory->can_id.has_value() && *factory->can_id == 8, "can_id");
       check(factory->mst_id.has_value() && *factory->mst_id == 24, "mst_id");
-      check(factory->canfd_mode.has_value() && !*factory->canfd_mode,
-            "canfd_mode");
       check(factory->motor_type.has_value() && *factory->motor_type == "DM4310",
             "motor_type");
-      // The factory file must not carry a stiffness of its own. Two documented
-      // entry points describe the same gripper: load_template("normal") states
-      // a direction and carries no gains, so it lands on GripperConfig's
-      // defaults (asserted in the mount-template block below), while
-      // load_calibration() on this file overwrites kp/kd. When the two
-      // disagree, the same stop is pressed by a different factor while the
-      // geometry still looks identical -- the one-field mismatch this pins.
+      // The factory file must not carry a stiffness of its own: load_calibration()
+      // overwrites kp/kd when the file has them, and the engine is dimensioned
+      // for the defaults (max_lead_mm, stop_lead_mm, stop_torque_nm are each
+      // quoted at kp=100).
       // The file carried kp 5.0 against a default of 100.0, and the engine is
       // dimensioned for 100: max_lead_mm, stop_lead_mm and stop_torque_nm are
       // each quoted at that gain. At 5.0 the closing authority caps at 0.33 Nm
@@ -100,12 +95,7 @@ int main() {
       check(!factory->kd.has_value() ||
                 std::fabs(*factory->kd - defaults.kd) < 1e-12,
             "the factory file's kd is GripperConfig's default, not its own");
-      check(factory->grasp_torque_threshold.has_value() &&
-                std::fabs(*factory->grasp_torque_threshold - 0.5) < 1e-12,
-            "grasp_torque_threshold");
-      // Carried so the file means the same thing to the Python SDK, which acts
-      // on it; this SDK parses and re-emits it without using it (see
-      // GripperConfig::work_stroke_mm). Same value as the Python SDK's copy.
+      // Work stroke: open() stops at this point instead of pressing the stop.
       check(factory->work_stroke_mm.has_value() &&
                 std::fabs(*factory->work_stroke_mm - 80.0) < 1e-12,
             "work_stroke_mm");
@@ -148,7 +138,6 @@ int main() {
     config.work_stroke_mm = 80.0;
     config.kp = 5.0;
     config.kd = 2.0;
-    config.grasp_torque_threshold = 0.5;
 
     const std::string path = std::string(kFixtureDir) + "/roundtrip.json";
     // The explicit can_id/mst_id/motor_type arguments are authoritative for
@@ -184,76 +173,6 @@ int main() {
       check(document->get_bool("calibrated", false),
             "the JSON itself carries the calibrated flag");
     }
-  }
-
-  // ── mount templates ───────────────────────────────────────────────────
-  {
-    // calibration_template_path() discovers the data directory at run time;
-    // in the test tree its root is the calibration/ directory's parent.
-    const std::string data_dir = std::string(LITEGRIP_TEST_DATA_DIR) + "/..";
-    ::setenv("LITEGRIP_DATA_DIR", data_dir.c_str(), 1);
-
-    const std::vector<std::string> names =
-        litegrip::list_calibration_templates();
-    check(names.size() == 2 && names[0] == "normal" && names[1] == "reverse",
-          "the templates are normal, then reverse");
-
-    const auto normal = litegrip::read_calibration_file(
-        litegrip::calibration_template_path("normal"));
-    check(normal.has_value(), "the normal template parses");
-    if (normal.has_value()) {
-      // Same numbers as the Python SDK's calibration_normal.json: the closed
-      // stop is the numerically LARGER angle (a normal mount).
-      check_near(normal->zero_position_rad, 0.114, 1e-12, "normal closed");
-      check_near(normal->max_position_rad, -1.491, 1e-12, "normal open");
-      check_near(normal->rad_to_mm, 74.8, 1e-12, "normal rad_to_mm");
-      check(normal->calibrated.has_value() && *normal->calibrated,
-            "the template declares itself calibrated");
-      // A template states a *direction*: it must carry no identity and no
-      // tuning, or loading it would silently rewrite what the caller set.
-      check(!normal->channel.has_value() && !normal->can_id.has_value() &&
-                !normal->mst_id.has_value() && !normal->kp.has_value() &&
-                !normal->kd.has_value() && !normal->canfd_mode.has_value() &&
-                !normal->grasp_torque_threshold.has_value(),
-            "the template carries no channel / ids / gains");
-    }
-
-    const auto reverse = litegrip::read_calibration_file(
-        litegrip::calibration_template_path("reverse"));
-    check(reverse.has_value(), "the reverse template parses");
-    if (normal.has_value() && reverse.has_value()) {
-      check_near(reverse->zero_position_rad, normal->max_position_rad, 1e-12,
-                 "reverse swaps the closed limit");
-      check_near(reverse->max_position_rad, normal->zero_position_rad, 1e-12,
-                 "reverse swaps the open limit");
-      check_near(reverse->rad_to_mm, normal->rad_to_mm, 1e-12,
-                 "both templates share the same scale");
-    }
-
-    // An unknown name is a hard error, and the message names the valid ones.
-    bool threw = false;
-    try {
-      litegrip::calibration_template_path("sideways");
-    } catch (const litegrip::CommandError& error) {
-      threw = true;
-      const std::string message = error.what();
-      check(message.find("normal") != std::string::npos &&
-                message.find("reverse") != std::string::npos,
-            "the unknown-template error lists the valid names");
-    }
-    check(threw, "an unknown template name throws CommandError");
-
-    // With no template available, the resolver returns the primary candidate
-    // — never the factory path. (Under ctest the working directory holds no
-    // calibration/ tree, so the data-dir candidate is conclusive.)
-    const std::string empty_dir = std::string(kFixtureDir) + "/no_data";
-    ::mkdir(empty_dir.c_str(), 0755);
-    ::setenv("LITEGRIP_DATA_DIR", empty_dir.c_str(), 1);
-    check(litegrip::calibration_template_path("normal") ==
-              empty_dir + "/calibration/normal.json",
-          "an unavailable template resolves to its own candidate, not the "
-          "factory file");
-    ::unsetenv("LITEGRIP_DATA_DIR");
   }
 
   // ── where a packaged data file is looked for ──────────────────────────
@@ -469,19 +388,23 @@ int main() {
 
   // ── path resolution / overrides ───────────────────────────────────────
   {
-    const std::string explicit_calib =
-        std::string(kFixtureDir) + "/env_calib.json";
-    ::setenv("LITEGRIP_CALIB", explicit_calib.c_str(), 1);
-    check(litegrip::default_calibration_path() == explicit_calib,
-          "LITEGRIP_CALIB overrides the default calib path");
-    ::unsetenv("LITEGRIP_CALIB");
-
-    // Without the override: $HOME/.litegrip/litegrip_calibration.json
     const std::string fake_home = std::string(kFixtureDir) + "/home";
     ::setenv("HOME", fake_home.c_str(), 1);
+
+    check(litegrip::default_calibration_path("can1") ==
+              fake_home + "/.litegrip/can1_calibration.json",
+          "default calib path is per-channel under $HOME/.litegrip");
     check(litegrip::default_calibration_path() ==
-              fake_home + "/.litegrip/litegrip_calibration.json",
-          "default calib path is under $HOME/.litegrip");
+              fake_home + "/.litegrip/can0_calibration.json",
+          "the default channel is can0");
+
+    // LITEGRIP_CALIB names a file to LOAD; it does not move where the channel's
+    // own measurement is SAVED.
+    ::setenv("LITEGRIP_CALIB", "/tmp/somewhere.json", 1);
+    check(litegrip::default_calibration_path("can1") ==
+              fake_home + "/.litegrip/can1_calibration.json",
+          "LITEGRIP_CALIB does not override the save path");
+    ::unsetenv("LITEGRIP_CALIB");
 
     ::setenv("LITEGRIP_FACTORY_CALIB", kFactoryPath.c_str(), 1);
     check(litegrip::factory_calibration_path() == kFactoryPath,

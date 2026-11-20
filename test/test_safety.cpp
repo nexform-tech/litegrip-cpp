@@ -1,4 +1,4 @@
-// test_safety.cpp — the safety core: limits, guards, modes, latch, baselines.
+// test_safety.cpp — the safety core: limits, guards, modes, latch, watchdog.
 //
 // These are the criteria that decide whether a frame may reach the motor, so
 // they are tested directly and adversarially: every "must reject" case below is
@@ -9,8 +9,6 @@
 #include <iostream>
 #include <limits>
 #include <string>
-#include <sys/stat.h>
-#include <sys/types.h>
 
 #include "litegrip/exceptions.hpp"
 #include "litegrip/safety.hpp"
@@ -46,20 +44,6 @@ void check_throws(const char* what, Fn&& fn) {
 }
 
 const double kInf = std::numeric_limits<double>::infinity();
-
-std::string write_temp_json(const std::string& name, const std::string& body) {
-  ::mkdir("/tmp/litegrip_safety_test", 0755);
-  const std::string path = "/tmp/litegrip_safety_test/" + name;
-  FILE* file = std::fopen(path.c_str(), "w");
-  if (file == nullptr) {
-    std::cerr << "FAIL: could not write fixture " << path << "\n";
-    ++g_failures;
-    return path;
-  }
-  std::fwrite(body.data(), 1, body.size(), file);
-  std::fclose(file);
-  return path;
-}
 
 }  // namespace
 
@@ -381,48 +365,6 @@ int main() {
                "position outside the red lines is still used");
   }
 
-  // ── guard_recovery_frame ──────────────────────────────────────────────
-  {
-    litegrip::SafetyGuard guard{defaults};
-    // Already inside: nothing to recover.
-    check_throws("recovery from inside the red lines is refused",
-                 [&] {
-                   guard.guard_recovery_frame(-0.5, 10.0, 1.0, 0.0, 0.0, -0.5, 0.0);
-                 });
-    // Outside and moving further out: refused.
-    check_throws("recovery that moves further out is refused",
-                 [&] {
-                   guard.guard_recovery_frame(-1.3, 10.0, 1.0, -0.1, 0.0, -1.25,
-                                              0.0);
-                 });
-    // Outside and moving back in, within the recovery ceilings: allowed.
-    const double target =
-        guard.guard_recovery_frame(-1.2, 10.0, 1.0, 0.1, 0.0, -1.25, 0.0);
-    check_near(target, -1.2, 1e-12, "inward recovery is allowed");
-    // Recovery gains / speeds / torques have their own much tighter ceilings.
-    check_throws("recovery kp above its ceiling is refused",
-                 [&] {
-                   guard.guard_recovery_frame(-1.2, 100.0, 1.0, 0.0, 0.0, -1.25,
-                                              0.0);
-                 });
-    check_throws("recovery velocity above its ceiling is refused",
-                 [&] {
-                   guard.guard_recovery_frame(-1.2, 10.0, 1.0, 1.0, 0.0, -1.25,
-                                              0.0);
-                 });
-    check_throws("recovery torque above its ceiling is refused",
-                 [&] {
-                   guard.guard_recovery_frame(-1.2, 10.0, 1.0, 0.0, 1.0, -1.25,
-                                              0.0);
-                 });
-    // Beyond the mechanical range: no automatic recovery.
-    check_throws("recovery from beyond the mechanical range is refused",
-                 [&] {
-                   guard.guard_recovery_frame(-1.2, 10.0, 1.0, 0.0, 0.0, -1.35,
-                                              0.0);
-                 });
-  }
-
   // ── guard_hold_frame ──────────────────────────────────────────────────
   //
   // A hold is the one frame that has to keep pushing while the measured torque
@@ -523,70 +465,6 @@ int main() {
       check_throws("beyond the mechanical range latches in every mode",
                    [&] { guard.guard_feedback_position(-1.35); });
     }
-  }
-
-  // ── baseline loading ──────────────────────────────────────────────────
-  {
-    const litegrip::SafetyLimits baseline = litegrip::load_safety_baseline();
-    check_near(baseline.red_min_rad, litegrip::kPackageRedMin, 1e-12,
-               "3.5 baseline open red line");
-    check_near(baseline.red_max_rad, litegrip::kPackageRedMax, 1e-12,
-               "3.5 baseline closed red line");
-    check_near(baseline.params.tau_max_nm, 3.5, 1e-12, "3.5 baseline torque");
-
-    const litegrip::SafetyLimits rollback = litegrip::load_safety_baseline("0.25");
-    check_near(rollback.params.tau_max_nm, 0.25, 1e-12,
-               "0.25 rollback baseline torque");
-    check_near(rollback.red_min_rad, baseline.red_min_rad, 1e-12,
-               "the two baselines share the same red lines");
-
-    check_throws("an unknown baseline version is refused",
-                 [] { litegrip::load_safety_baseline("9.9"); });
-    check_throws("an explicit missing baseline file is refused",
-                 [] { litegrip::load_safety_baseline("/tmp/nope/none.json"); });
-  }
-  {
-    // A config file may narrow...
-    const std::string narrowed = write_temp_json(
-        "narrow.json",
-        "{\"mechanical_observed_min_rad\":-1.27,"
-        "\"mechanical_observed_max_rad\":0.05,"
-        "\"red_open_limit_rad\":-1.2,\"red_close_limit_rad\":-0.05}");
-    const auto loaded = litegrip::load_safety_limits(narrowed);
-    check(loaded.has_value(), "a narrowing config loads");
-    if (loaded.has_value()) {
-      check_near(loaded->red_min_rad, -1.2, 1e-12, "narrowed open red line");
-    }
-
-    // ...but never widen.
-    const std::string widened = write_temp_json(
-        "widen.json",
-        "{\"mechanical_observed_min_rad\":-1.27,"
-        "\"mechanical_observed_max_rad\":0.05,"
-        "\"red_open_limit_rad\":-1.5,\"red_close_limit_rad\":0.5}");
-    check_throws("a widening config is refused",
-                 [&] { litegrip::load_safety_limits(widened); });
-
-    // Disabling the red lines is refused with an actionable message.
-    const std::string disabled = write_temp_json(
-        "disabled.json",
-        "{\"mechanical_observed_min_rad\":-1.27,"
-        "\"mechanical_observed_max_rad\":0.05,"
-        "\"red_open_limit_rad\":-1.24,\"red_close_limit_rad\":-0.01,"
-        "\"red_line_enabled\":false}");
-    check_throws("red_line_enabled=false is refused",
-                 [&] { litegrip::load_safety_limits(disabled); });
-
-    // Missing required fields.
-    const std::string incomplete =
-        write_temp_json("incomplete.json", "{\"red_open_limit_rad\":-1.24}");
-    check_throws("a config missing required fields is refused",
-                 [&] { litegrip::load_safety_limits(incomplete); });
-
-    // A path that does not exist yields nullopt (the contract the caller must
-    // handle), not a silent fallback.
-    check(!litegrip::load_safety_limits("/tmp/nope/none.json").has_value(),
-          "a missing config yields nullopt");
   }
 
   if (g_failures != 0) {

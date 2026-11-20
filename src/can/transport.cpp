@@ -1,8 +1,8 @@
-// transport.cpp — SocketCAN transport.
+// transport.cpp — classic-CAN SocketCAN transport.
 //
 // Port of litegrip_driver/litegrip/can/transport.py. Uses the kernel's own
-// can_frame / canfd_frame layouts (<linux/can.h>) instead of the Python
-// original's hand-rolled struct formats — same wire layout, less to get wrong.
+// can_frame layout (<linux/can.h>) instead of the Python original's
+// hand-rolled struct format — same wire layout, less to get wrong.
 //
 // One deliberate divergence: the Python code computed
 // `is_extended = bool(can_id & CAN_EFF_MASK)` (CAN_EFF_MASK = 0x1FFFFFFF),
@@ -17,7 +17,6 @@
 #include <linux/can/raw.h>
 #include <net/if.h>
 #include <poll.h>
-#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -55,26 +54,12 @@ std::string describe_interface(const std::string& channel) {
 
 }  // namespace
 
-std::optional<int> iface_mtu(int fd, const std::string& iface) noexcept {
-  if (fd < 0) {
-    return std::nullopt;
-  }
-  struct ifreq ifr{};
-  std::strncpy(ifr.ifr_name, iface.c_str(), IFNAMSIZ - 1);
-  if (::ioctl(fd, SIOCGIFMTU, &ifr) < 0) {
-    return std::nullopt;
-  }
-  return ifr.ifr_mtu;
-}
-
-CanTransport::CanTransport(std::string channel, CanMode mode)
-    : channel_(std::move(channel)), mode_(mode) {}
+CanTransport::CanTransport(std::string channel) : channel_(std::move(channel)) {}
 
 CanTransport::~CanTransport() { close(); }
 
 CanTransport::CanTransport(CanTransport&& other) noexcept
     : channel_(std::move(other.channel_)),
-      mode_(other.mode_),
       fd_(other.fd_),
       accept_ids_(std::move(other.accept_ids_)) {
   other.fd_ = -1;
@@ -84,7 +69,6 @@ CanTransport& CanTransport::operator=(CanTransport&& other) noexcept {
   if (this != &other) {
     close();
     channel_ = std::move(other.channel_);
-    mode_ = other.mode_;
     fd_ = other.fd_;
     accept_ids_ = std::move(other.accept_ids_);
     other.fd_ = -1;
@@ -100,32 +84,6 @@ void CanTransport::open() {
   const int fd = ::socket(PF_CAN, SOCK_RAW, CAN_RAW);
   if (fd < 0) {
     throw ConnectError("socket(PF_CAN) failed: " + errno_text());
-  }
-
-  // Some USB-CAN adapters (gs_usb) and kernel versions need CAN FD socket mode
-  // on FD-capable interfaces; a classic CAN socket on such an interface may
-  // silently drop frames. Reconcile the requested mode with the interface MTU.
-  if (const auto mtu = iface_mtu(fd, channel_)) {
-    if (*mtu >= kCanFdMtu && mode_ == CanMode::kCan) {
-      mode_ = CanMode::kCanFd;
-    } else if (*mtu < kCanFdMtu && mode_ == CanMode::kCanFd) {
-      std::fprintf(stderr,
-                   "[litegrip] %s has classic-CAN MTU %d but CAN FD was "
-                   "requested; using classic CAN.\n",
-                   describe_interface(channel_).c_str(), *mtu);
-      mode_ = CanMode::kCan;
-    }
-  }
-
-  if (mode_ == CanMode::kCanFd) {
-    const int on = 1;
-    if (::setsockopt(fd, SOL_CAN_RAW, CAN_RAW_FD_FRAMES, &on, sizeof(on)) < 0) {
-      std::fprintf(stderr,
-                   "[litegrip] failed to enable CAN FD on %s (%s); falling "
-                   "back to classic CAN.\n",
-                   describe_interface(channel_).c_str(), errno_text().c_str());
-      mode_ = CanMode::kCan;
-    }
   }
 
   const unsigned int ifindex = ::if_nametoindex(channel_.c_str());
@@ -183,12 +141,6 @@ void CanTransport::set_id_filter(const std::vector<int>& can_ids) {
   }
 }
 
-void CanTransport::add_id_filter(int can_id) {
-  std::vector<int> ids = accept_ids_;
-  ids.push_back(can_id);
-  set_id_filter(ids);
-}
-
 void CanTransport::apply_id_filter() {
   if (fd_ < 0) {
     return;
@@ -223,41 +175,22 @@ void CanTransport::send(int can_id, const std::uint8_t* data, std::size_t size,
   if (data == nullptr && size > 0) {
     throw CommandError("null payload with non-zero size");
   }
-
-  const void* frame = nullptr;
-  std::size_t frame_len = 0;
-  struct can_frame classic{};
-  struct canfd_frame fd_frame{};
-
-  if (mode_ == CanMode::kCanFd) {
-    if (size > sizeof(fd_frame.data)) {
-      throw CommandError("CAN FD frames hold at most 64 bytes");
-    }
-    fd_frame.can_id = static_cast<canid_t>(can_id) & CAN_EFF_MASK;
-    fd_frame.len = static_cast<__u8>(size);
-    if (size > 0) {
-      std::memcpy(fd_frame.data, data, size);
-    }
-    frame = &fd_frame;
-    frame_len = CANFD_MTU;
-  } else {
-    if (size > sizeof(classic.data)) {
-      throw CommandError("classic CAN frames hold at most 8 bytes");
-    }
-    classic.can_id = static_cast<canid_t>(can_id) & CAN_SFF_MASK;
-    classic.can_dlc = static_cast<__u8>(size);
-    if (size > 0) {
-      std::memcpy(classic.data, data, size);
-    }
-    frame = &classic;
-    frame_len = CAN_MTU;
+  if (size > sizeof(can_frame::data)) {
+    throw CommandError("classic CAN frames hold at most 8 bytes");
   }
+
+  struct can_frame frame{};
+  frame.can_id = static_cast<canid_t>(can_id) & CAN_SFF_MASK;
+  frame.can_dlc = static_cast<__u8>(size);
+  if (size > 0) {
+    std::memcpy(frame.data, data, size);
+  }
+  const char* bytes = reinterpret_cast<const char*>(&frame);
 
   // The socket is non-blocking: retry while the send buffer is full.
   const double deadline = monotonic_now() + timeout_s;
-  const char* bytes = static_cast<const char*>(frame);
   while (true) {
-    const ssize_t written = ::write(fd_, bytes, frame_len);
+    const ssize_t written = ::write(fd_, bytes, CAN_MTU);
     if (written >= 0) {
       return;
     }
@@ -268,8 +201,7 @@ void CanTransport::send(int can_id, const std::uint8_t* data, std::size_t size,
     if (remaining <= 0.0) {
       // A full buffer means this frame did NOT go out. Returning quietly made
       // the caller treat it as sent — on the bench that chain is what produced
-      // "moved 0.000 mm" reported as success. The header always promised the
-      // caller would find out; this is the implementation catching up to it.
+      // "moved 0.000 mm" reported as success.
       std::fprintf(stderr,
                    "[litegrip] CAN send timeout on %s (buffer full >%.1fs), "
                    "frame to 0x%03X not sent\n",
@@ -313,39 +245,21 @@ std::optional<CanFrame> CanTransport::recv(double timeout_s) {
     return std::nullopt;
   }
 
-  std::uint8_t buffer[CANFD_MTU] = {};
+  std::uint8_t buffer[CAN_MTU] = {};
   const ssize_t n = ::read(fd_, buffer, sizeof(buffer));
-  if (n < 0) {
+  if (n < static_cast<ssize_t>(sizeof(struct can_frame))) {
     return std::nullopt;
   }
 
+  struct can_frame frame{};
+  std::memcpy(&frame, buffer, sizeof(frame));
+
   CanFrame out;
   out.timestamp = monotonic_now();
-
-  if (mode_ == CanMode::kCanFd) {
-    if (n < static_cast<ssize_t>(sizeof(struct canfd_frame))) {
-      return std::nullopt;
-    }
-    struct canfd_frame fd_frame{};
-    std::memcpy(&fd_frame, buffer, sizeof(fd_frame));
-    out.is_extended = (fd_frame.can_id & CAN_EFF_FLAG) != 0;
-    out.is_fd = true;
-    out.can_id = static_cast<int>(fd_frame.can_id & CAN_SFF_MASK);
-    out.dlc = fd_frame.len > sizeof(out.data) ? sizeof(out.data) : fd_frame.len;
-    std::memcpy(out.data.data(), fd_frame.data, out.dlc);
-  } else {
-    if (n < static_cast<ssize_t>(sizeof(struct can_frame))) {
-      return std::nullopt;
-    }
-    struct can_frame classic{};
-    std::memcpy(&classic, buffer, sizeof(classic));
-    out.is_extended = (classic.can_id & CAN_EFF_FLAG) != 0;
-    out.is_fd = false;
-    out.can_id = static_cast<int>(classic.can_id & CAN_SFF_MASK);
-    out.dlc = classic.can_dlc > sizeof(out.data) ? sizeof(out.data)
-                                                 : classic.can_dlc;
-    std::memcpy(out.data.data(), classic.data, out.dlc);
-  }
+  out.is_extended = (frame.can_id & CAN_EFF_FLAG) != 0;
+  out.can_id = static_cast<int>(frame.can_id & CAN_SFF_MASK);
+  out.dlc = frame.can_dlc > sizeof(out.data) ? sizeof(out.data) : frame.can_dlc;
+  std::memcpy(out.data.data(), frame.data, out.dlc);
   return out;
 }
 

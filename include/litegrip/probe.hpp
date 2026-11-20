@@ -1,7 +1,7 @@
 // litegrip/probe.hpp — the calibration probes' step loops.
 //
-// Port of the loops inside the Python SDK's LiteGrip.calibrate() (_find_limit
-// and _bounded_move) and LiteGrip.calibrate_guided() (_step_to_limit).
+// Port of the loops inside the Python SDK's calibrate() (_find_limit and
+// _bounded_move).
 //
 // They sit behind a seam for the same reason the action engine does (motion.hpp
 // and its MotionIo): what keeps them from breaking a jaw is arithmetic — the
@@ -21,7 +21,7 @@
 namespace litegrip {
 
 /// The seam a probe drives. Production callers pass gripper.cpp's BusProbe,
-/// which forwards to LiteGrip's GripperBus; tests pass a fake plant.
+/// which forwards to GripperBus; tests pass a fake plant.
 class ProbeIo {
  public:
   virtual ~ProbeIo() = default;
@@ -73,8 +73,8 @@ double probe_to_limit(ProbeIo& io, double direction, const ProbeConfig& config,
 /// Move toward `target` one step at a time, guarded like the probe: stop at the
 /// torque ceiling, or as soon as the position stops changing.
 ///
-/// Why this does not simply call goto_rad(): that path drives a bounded engine
-/// ramp now, but it is bounded by the CALIBRATED TRAVEL, and the travel is
+/// Why this does not simply use the positioning ramp: that path is bounded by
+/// the CALIBRATED TRAVEL, and the travel is
 /// exactly what is in doubt while calibrating — a config whose scale is wrong
 /// puts a plausible-looking target past the real stop. Leading by one step at a
 /// time and stopping on the torque ceiling needs no scale to be safe.
@@ -82,7 +82,7 @@ void guarded_move_to(ProbeIo& io, double target, const ProbeConfig& config,
                      const char* label);
 
 /// A probed travel in radians -> millimetres per radian. Mirrors the Python
-/// SDK's LiteGrip._scale_from_travel, and is the ONE place any calibration path
+/// SDK's _scale_from_travel, and is the ONE place any calibration path
 /// derives the scale.
 ///
 /// The numerator is `max_stroke_mm + kStopInsetMm` rather than `max_stroke_mm`:
@@ -112,7 +112,7 @@ struct ProbeCalibration {
 /// `close_sign` says which end is closed. It is never discovered here — a stall
 /// only says "something stopped me", and both ends are hard stops — so it is
 /// taken from the config and preserved; load a calibration first. The order the
-/// two probes run in is the order LiteGrip assigns the limits in, which is what
+/// two probes run in is the order the caller assigns the limits in, which is what
 /// `close_sign` reads back.
 ///
 /// @throws CommError the two stops coincided, so no scale could be derived.

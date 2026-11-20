@@ -5,10 +5,9 @@ find_dependency(Threads)
 
 include("${CMAKE_CURRENT_LIST_DIR}/litegrip_cppTargets.cmake")
 
-# Where the calibration / safety-baseline files were installed. Consumers need
-# this to point the library at a baseline explicitly (LITEGRIP_DATA_DIR, or the
-# safety_baseline parameter taking a full path) when the run-time search would
-# not find them.
+# Where the factory calibration file was installed. Consumers need this to
+# point the library at the data directory explicitly (LITEGRIP_DATA_DIR) when
+# the run-time search would not find it.
 set_and_check(litegrip_cpp_DATA_DIR
   "${PACKAGE_PREFIX_DIR}/@CMAKE_INSTALL_DATADIR@/litegrip_cpp/calibration")
 

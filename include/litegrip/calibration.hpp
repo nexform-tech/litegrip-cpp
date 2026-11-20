@@ -1,25 +1,17 @@
 // litegrip/calibration.hpp — calibration JSON load/save.
 //
-// Format is deliberately identical to the Python SDK's (same keys, same units)
-// so the two can be compared side by side during the port's parallel-validation
-// phase (see PLAN-litegrip-cpp.md D8).
+// Format is identical to the Python SDK's (same keys, same units), so the two
+// can be compared side by side.
 //
-// Path resolution mirrors the Python original:
-//   * a no-argument load reads env LITEGRIP_CALIB when it is set, then the
-//     packaged, read-only factory_calibration.json — and nothing else
-//   * ~/.litegrip/<channel>_calibration.json (what save_calibration() writes)
-//     and the legacy ~/.litegrip/litegrip_calibration.json are still resolved
-//     by default_calibration_path(), so a caller can name one or point
-//     LITEGRIP_CALIB at it, but a no-argument load does not pick them up: a
-//     leftover file must not silently outrank the shipped baseline
-// A candidate that declares a *different* channel is skipped, not adopted:
-// every LiteGrip ships at CAN id 0x08, so on a two-gripper machine the channel
-// is the only identity key (see LiteGrip::load_calibration).
-//
-// Mount templates (normal.json / reverse.json) are deprecated and kept for
-// backward compatibility: shipped units are normal mount and the factory
-// calibration already describes them. A template declares a direction by name
-// and never falls back to the factory file.
+// Path resolution:
+//   * the automatic chain (constructor / no-argument load_calibration()) reads
+//     $LITEGRIP_CALIB when set, then ~/.litegrip/<channel>_calibration.json,
+//     then the packaged factory_calibration.json
+//   * save_calibration() writes ~/.litegrip/<channel>_calibration.json by
+//     default, so the next constructor picks the measured calibration up
+//   * a candidate that declares a *different* channel is skipped (not fatal):
+//     several LiteGrips may share CAN id 0x08 on one machine, and then the
+//     channel is the only identity key.
 
 #pragma once
 
@@ -31,7 +23,7 @@
 
 namespace litegrip {
 
-/// Environment variable overriding the user calibration path.
+/// Environment variable naming an explicit calibration file to load.
 inline constexpr const char* kCalibEnvVar = "LITEGRIP_CALIB";
 
 /// Environment variable naming the directory that holds the packaged data
@@ -39,40 +31,18 @@ inline constexpr const char* kCalibEnvVar = "LITEGRIP_CALIB";
 ///
 /// `litegrip_cpp_DATA_DIR` in the CMake package config reports the installed
 /// location. Use one of the two when the run-time search cannot find the
-/// baseline — a deployment that moves the data, for instance.
+/// factory calibration — a deployment that moves the data, for instance.
 inline constexpr const char* kDataDirEnvVar = "LITEGRIP_DATA_DIR";
 
-/// Legacy user calibration path: $LITEGRIP_CALIB, else
-/// ~/.litegrip/litegrip_calibration.json.
+/// Per-channel user calibration path: `~/.litegrip/<channel>_calibration.json`
+/// (`channel` defaults to can0).
 ///
-/// The pre-per-channel location, kept so a calibration saved by an older
-/// version still loads; it is now the *legacy* entry of load_calibration()'s
-/// automatic chain rather than the primary one. A calibration saved here is
-/// still picked up next run regardless of the process working directory.
-std::string default_calibration_path();
-
-/// Per-channel user calibration path: $LITEGRIP_CALIB, else
-/// ~/.litegrip/<channel>_calibration.json.
-///
-/// Every LiteGrip ships at CAN id 0x08, so when two grippers share a machine
-/// the *channel* is the only thing that tells them apart — which is why the
-/// per-channel file comes first and why a candidate naming a different channel
-/// is skipped rather than adopted. Mirrors gripper.default_calib_path().
-std::string default_calibration_path(const std::string& channel);
-
-/// Calibrations on this machine that a no-argument load_calibration() will not
-/// read: `$HOME/.litegrip/<channel>_*.json` and the legacy
-/// `$HOME/.litegrip/litegrip_calibration.json`, sorted by path. Empty when that
-/// directory does not exist.
-///
-/// Reporting them is the point. They are written by save_calibration() and by
-/// older versions, so a machine can hold a measured, per-device calibration
-/// while the SDK drives with the factory one — and nothing would say so. Only
-/// names that could belong to `channel` are returned, so a second gripper's
-/// file does not appear in the first one's log. Mirrors the Python SDK's
-/// `_ignored_calib_files()`, which shipped in its #45.
-std::vector<std::string> ignored_local_calibrations(
-    const std::string& channel);
+/// This is what save_calibration() writes and what the automatic load chain
+/// reads after `$LITEGRIP_CALIB`. It deliberately does NOT apply the
+/// `$LITEGRIP_CALIB` override: that variable names a file to LOAD, while this
+/// function answers "where does this channel's own measurement live?".
+std::string default_calibration_path(
+    const std::string& channel = DefaultParams::kCanChannel);
 
 /// Path of the packaged factory calibration (read-only fallback).
 ///
@@ -86,24 +56,12 @@ std::vector<std::string> ignored_local_calibrations(
 ///   3. the process working directory: `calibration/`, `../calibration/`, `.`
 ///
 /// Nothing machine-dependent is compiled in: entry 2 is what lets an installed
-/// SDK (`<prefix>/bin/grip` beside `<prefix>/share/litegrip_cpp/calibration/`)
-/// find its own baseline from any working directory. Entry 3 is last because it
-/// is the only one that depends on where the caller happens to stand.
+/// SDK find its own baseline from any working directory. Entry 3 is last
+/// because it is the only one that depends on where the caller happens to stand.
 ///
 /// When no candidate exists the strongest is returned anyway, so the caller's
-/// error message can name a path to act on. Mirrors gripper._FACTORY_CALIB.
+/// error message can name a path to act on.
 std::string factory_calibration_path();
-
-/// Deprecated: names of the packaged mount templates, in declaration order.
-///
-/// Kept for backward compatibility. Shipped units are normal mount and the
-/// factory calibration already describes them, so a caller does not select a
-/// mount. A template declares a *direction* — which end of the travel is
-/// closed — and nothing else. It deliberately carries no channel, CAN ids or
-/// gains: adopting a device identity or a tuning from a file that exists to
-/// state a direction would silently rewrite what the caller set. Mirrors
-/// gripper.list_templates().
-std::vector<std::string> list_calibration_templates();
 
 /// The locations searched for a packaged data file, strongest first, for a
 /// program running from `program_dir` (pass an empty string for a program whose
@@ -121,15 +79,6 @@ std::vector<std::string> calibration_data_candidates(
 std::string resolve_calibration_data_file(const std::string& relative,
                                           const std::string& program_dir);
 
-/// Deprecated: path of a packaged mount template, kept for compatibility.
-///
-/// Shipped units are normal mount and the factory calibration already
-/// describes them, so new code should not select a template. Found by the same
-/// search as factory_calibration_path(). Throws CommandError for an unknown
-/// name — never falls back to the factory file. Mirrors
-/// gripper._resolve_template().
-std::string calibration_template_path(const std::string& name);
-
 /// Calibration file contents, decoded.
 struct CalibrationFile {
   bool has_closed = false;
@@ -143,14 +92,10 @@ struct CalibrationFile {
   std::optional<int> can_id;
   std::optional<int> mst_id;
   std::optional<std::string> channel;
-  std::optional<bool> canfd_mode;
   std::optional<double> kp;
   std::optional<double> kd;
-  std::optional<double> grasp_torque_threshold;
   std::optional<std::string> motor_type;
   /// How far open() may travel, counted from the closed zero; 0 = no limit.
-  /// Unlike the Python SDK, this SDK does not act on it yet — see
-  /// GripperConfig::work_stroke_mm.
   std::optional<double> work_stroke_mm;
 
   /// Whether the numbers in this file are a real measurement. Absent means

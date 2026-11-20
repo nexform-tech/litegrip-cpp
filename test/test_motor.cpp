@@ -21,8 +21,6 @@ using litegrip::describe_error;
 using litegrip::GripperConfig;
 using litegrip::GripperParams;
 using litegrip::GripperState;
-using litegrip::GripperStatus;
-using litegrip::has_flag;
 using litegrip::UnitConversion;
 
 namespace {
@@ -119,15 +117,6 @@ int main() {
     check_near(calib.travel_mm(), 1.605 * 74.8, 0.01, "travel_mm");
   }
 
-  // ── GripperStatus flags ───────────────────────────────────────────────
-  {
-    const GripperStatus flags =
-        GripperStatus::kEnabled | GripperStatus::kGrasped;
-    check(has_flag(flags, GripperStatus::kEnabled), "ENABLED flag set");
-    check(has_flag(flags, GripperStatus::kGrasped), "GRASPED flag set");
-    check(!has_flag(flags, GripperStatus::kMoving), "MOVING flag not set");
-  }
-
   // ── error descriptions (English) ──────────────────────────────────────
   check(contains(describe_error(0x0), "disabled"), "describe 0x0");
   check(contains(describe_error(0x1), "enabled"), "describe 0x1");
@@ -195,8 +184,8 @@ int main() {
   // ── UnitConversion ────────────────────────────────────────────────────
   check_near(UnitConversion::kNmToN * UnitConversion::kNToNm, 1.0, 0.01,
              "NM_TO_N * N_TO_NM ~ 1");
-  check_near(UnitConversion::kRadToMm * UnitConversion::kMmToRad, 1.0, 0.01,
-             "RAD_TO_MM * MM_TO_RAD ~ 1");
+  check_near(UnitConversion::kRadToMm * (1.0 / UnitConversion::kRadToMm), 1.0,
+             1e-12, "RAD_TO_MM inverse round-trips");
 
   // ── GripperParams ─────────────────────────────────────────────────────
   check(GripperParams::kMstId == 0x18, "GripperParams MST_ID == 0x18");

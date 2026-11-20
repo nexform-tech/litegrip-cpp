@@ -292,25 +292,14 @@ class SafetyGuard {
                            std::optional<double> tau_act,
                            const std::string& source = "motion");
 
-  /// Validate a recovery frame: only outward->inward, within the recovery
-  /// ceilings. This is the ONLY path that may move while the measured position
-  /// is outside the red lines. Returns the normalized target.
-  double guard_recovery_frame(double q_target, double kp, double kd,
-                             double dq_target, double tau_feedforward,
-                             std::optional<double> q_act,
-                             std::optional<double> dq_act,
-                             const std::string& source = "recovery");
-
   /// Validate a bounded-torque HOLD frame: the frame may keep pushing while the
   /// measured torque is already over the ceiling, but only as long as the
   /// frame's OWN estimated output torque
   /// (`kp*(q_target-q_act) - kd*dq_act + tau_ff`) stays under the hard ceiling.
   ///
-  /// Use this instead of guard_recovery_frame() to keep a grasp alive. The
-  /// recovery gate exists for driving back from OUTSIDE the red lines and
-  /// refuses every position that is already inside them — which is exactly
-  /// where a grasp happens — so a hold routed through it always degrades to a
-  /// zero-torque frame, and the spring then opens the jaws.
+  /// Use this to keep a grasp alive. A hold must be able to keep pushing while
+  /// the measured torque is already over the ceiling — that is what holding a
+  /// grasped object means — while still bounding what the frame asks for.
   ///
   /// The criterion is also the stronger one: it bounds what the frame is about
   /// to ASK FOR, not what the loop last measured. A frame whose estimated
@@ -346,49 +335,13 @@ class SafetyGuard {
   std::vector<FrameMode> mode_stack_{FrameMode::kNormal};
 };
 
-// ── configuration loading ─────────────────────────────────────────────────
-
-/// Delivered safety-baseline versions -> file names (relative to the SDK's
-/// data directory). The version is selected explicitly, never "whatever file
-/// happens to be there" — otherwise a rollback becomes an unauditable in-place
-/// edit. Both files share the same red lines; only hard_torque_limit_nm differs.
-struct SafetyBaselineVersion {
-  const char* version;
-  const char* file_name;
-};
-
-/// Known baseline versions. The single place to change the default is
-/// kDefaultSafetyBaseline.
-extern const SafetyBaselineVersion kSafetyBaselineVersions[];
-extern const std::size_t kSafetyBaselineVersionsCount;
-inline constexpr const char* kDefaultSafetyBaseline = "3.5";
-
-/// Absolute path of a version's file. Does NOT check existence.
-/// Throws SafetyConfigError for an unknown version.
-std::string safety_baseline_path(const std::string& version);
-
-/// Load red-line config from JSON. The loaded config may only TIGHTEN the
-/// packaged baseline; anything wider is rejected. Returns nullopt when no file
-/// is found — that is part of the contract, and the caller must handle it
-/// explicitly rather than being handed some shared fallback object.
-/// Throws SafetyConfigError on malformed content or an attempt to widen.
-std::optional<SafetyLimits> load_safety_limits(
-    const std::optional<std::string>& path = std::nullopt);
-
-/// Load a versioned baseline. FAIL-CLOSED: a missing/invalid/widened file
-/// throws rather than silently falling back, so "the config was lost" cannot
-/// look identical to "the config is fine".
-/// Throws SafetyConfigError.
-SafetyLimits load_safety_baseline(
-    const std::optional<std::string>& version = std::nullopt);
-
 /// The canonical baseline, freshly constructed per call (never a shared object
 /// that a caller could mutate in place).
 SafetyLimits canonical_baseline();
 
 /// Validate / sanitize / compare against the canonical baseline, returning the
-/// independent sanitized copy. The single gate every loaded or injected limit
-/// set goes through. Throws SafetyConfigError.
+/// independent sanitized copy. The single gate every limit set goes through.
+/// Throws SafetyConfigError.
 SafetyLimits checked_limits(const SafetyLimits& candidate,
                             const std::string& source);
 

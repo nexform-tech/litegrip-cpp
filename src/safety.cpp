@@ -1,5 +1,4 @@
-// safety.cpp — the safety core: limits, guards, modes, latch, watchdog,
-// baseline loading.
+// safety.cpp — the safety core: limits, guards, modes, latch, watchdog.
 //
 // Ported from the safety-aware SDK variant's safety_limits.py (core only — the
 // contact/force/stall physics models are out of scope, see the plan D5).
@@ -15,29 +14,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
-#include <limits>
 #include <string>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <vector>
 
 #include "litegrip/can/protocol.hpp"
 #include "litegrip/exceptions.hpp"
-#include "litegrip/json.hpp"
 
 namespace litegrip {
 namespace {
-
-bool file_exists(const std::string& path) {
-  struct stat info {};
-  return ::stat(path.c_str(), &info) == 0 && S_ISREG(info.st_mode);
-}
-
-const char* env_or_null(const char* name) {
-  const char* value = std::getenv(name);
-  return (value != nullptr && value[0] != '\0') ? value : nullptr;
-}
 
 bool finite(double value) { return std::isfinite(value); }
 
@@ -75,28 +58,6 @@ void require_positive(double value, const std::string& name,
   if (value <= 0.0) {
     throw SafetyConfigError(source + ": " + name + " must be positive");
   }
-}
-
-/// Candidate locations for a data file shipped with the calibration/baseline
-/// data. Mirrors factory_calibration_path(): no machine-dependent path is baked
-/// into the source.
-std::string find_data_file(const std::string& name) {
-  std::vector<std::string> candidates;
-  if (const char* data_dir = env_or_null("LITEGRIP_DATA_DIR")) {
-    candidates.push_back(std::string(data_dir) + "/calibration/" + name);
-    candidates.push_back(std::string(data_dir) + "/" + name);
-  }
-  candidates.push_back("calibration/" + name);
-  candidates.push_back("../calibration/" + name);
-  candidates.push_back(name);
-  candidates.push_back("../" + name);
-
-  for (const std::string& candidate : candidates) {
-    if (file_exists(candidate)) {
-      return candidate;
-    }
-  }
-  return candidates.front();
 }
 
 }  // namespace
@@ -478,78 +439,6 @@ double SafetyGuard::guard_motion_frame(double q_target, double kp, double kd,
   return q_safe;
 }
 
-double SafetyGuard::guard_recovery_frame(double q_target, double kp, double kd,
-                                        double dq_target, double tau_feedforward,
-                                        std::optional<double> q_act,
-                                        std::optional<double> /*dq_act*/,
-                                        const std::string& source) {
-  check_not_latched(source);
-
-  q_target = normalize_scalar(q_target, "target angle", source);
-  kp = normalize_scalar(kp, "kp", source);
-  kd = normalize_scalar(kd, "kd", source);
-  dq_target = normalize_scalar(dq_target, "target velocity", source);
-  tau_feedforward = normalize_scalar(tau_feedforward, "feed-forward torque",
-                                    source);
-
-  if (!q_act.has_value()) {
-    throw SafetyFault(source +
-                      ": no valid feedback — recovery motion is refused");
-  }
-  const double measured = normalize_scalar(*q_act, "measured position", source);
-
-  if (measured < limits_.mech_min_rad || measured > limits_.mech_max_rad) {
-    throw SafetyFault(source +
-                      ": measured position is outside the mechanical observed "
-                      "range — automatic recovery refused, inspect the "
-                      "mechanism");
-  }
-  if (limits_.red_min_rad <= measured && measured <= limits_.red_max_rad) {
-    throw LimitViolation(source +
-                         ": measured position is already inside the red lines, "
-                         "no recovery needed");
-  }
-
-  // Direction: only toward the inside.
-  if (measured > limits_.red_max_rad && dq_target > 0.0) {
-    throw LimitViolation(source +
-                         ": position is past the closed red line, further "
-                         "closing is refused");
-  }
-  if (measured < limits_.red_min_rad && dq_target < 0.0) {
-    throw LimitViolation(source +
-                         ": position is past the open red line, further "
-                         "opening is refused");
-  }
-  if (measured > limits_.red_max_rad && q_target > measured) {
-    throw LimitViolation(source +
-                         ": target is further outside than the current "
-                         "position — command not sent");
-  }
-  if (measured < limits_.red_min_rad && q_target < measured) {
-    throw LimitViolation(source +
-                         ": target is further outside than the current "
-                         "position — command not sent");
-  }
-
-  const TemporaryParams& p = limits_.params;
-  if (kp < 0.0 || kp > p.recovery_kp_max) {
-    throw LimitViolation(source + ": recovery kp exceeds its ceiling");
-  }
-  if (std::fabs(dq_target) > p.recovery_dq_max) {
-    throw LimitViolation(source + ": recovery velocity exceeds its ceiling");
-  }
-  if (std::fabs(tau_feedforward) > p.recovery_tau_max) {
-    throw LimitViolation(source + ": recovery torque exceeds its ceiling");
-  }
-  if (q_target < limits_.mech_min_rad || q_target > limits_.mech_max_rad) {
-    throw SafetyFault(source +
-                      ": recovery target is outside the mechanical observed "
-                      "range — command not sent");
-  }
-  return q_target;
-}
-
 double SafetyGuard::guard_hold_frame(double q_target, double kp, double kd,
                                     double dq_target, double tau_feedforward,
                                     std::optional<double> q_act,
@@ -682,118 +571,6 @@ void SafetyGuard::guard_feedback_position(double q, const std::string& source) {
       source + ": measured position crossed the software red lines";
   latch_fault(reason);
   throw SafetyFault(reason);
-}
-
-// ── baseline loading ──────────────────────────────────────────────────────
-
-const SafetyBaselineVersion kSafetyBaselineVersions[] = {
-    {"3.5", "safety_limits_350.json"},
-    {"0.25", "safety_limits_025.json"},
-};
-const std::size_t kSafetyBaselineVersionsCount =
-    sizeof(kSafetyBaselineVersions) / sizeof(kSafetyBaselineVersions[0]);
-
-std::string safety_baseline_path(const std::string& version) {
-  for (std::size_t i = 0; i < kSafetyBaselineVersionsCount; ++i) {
-    if (version == kSafetyBaselineVersions[i].version) {
-      return find_data_file(kSafetyBaselineVersions[i].file_name);
-    }
-  }
-  throw SafetyConfigError("unknown safety baseline version '" + version + "'");
-}
-
-std::optional<SafetyLimits> load_safety_limits(
-    const std::optional<std::string>& path) {
-  std::vector<std::string> candidates;
-  if (path.has_value()) {
-    candidates.push_back(*path);
-  } else {
-    candidates.push_back("safety_limits.json");
-    candidates.push_back("../safety_limits.json");
-    candidates.push_back("calibration/safety_limits.json");
-    candidates.push_back("../calibration/safety_limits.json");
-  }
-
-  std::string source;
-  std::optional<json::Value> document;
-  for (const std::string& candidate : candidates) {
-    if (!file_exists(candidate)) {
-      continue;
-    }
-    document = json::Value::parse_file(candidate);
-    if (!document.has_value()) {
-      throw SafetyConfigError("safety limits config is not valid JSON: " +
-                              candidate);
-    }
-    source = candidate;
-    break;
-  }
-  if (!document.has_value()) {
-    // Contract: the caller must handle "no config file" explicitly rather than
-    // being handed some shared fallback object.
-    return std::nullopt;
-  }
-
-  for (const char* required : {"mechanical_observed_min_rad",
-                              "mechanical_observed_max_rad",
-                              "red_open_limit_rad", "red_close_limit_rad"}) {
-    if (!document->contains(required)) {
-      throw SafetyConfigError("safety limits config " + source +
-                              " is missing the required field " + required);
-    }
-  }
-
-  if (document->contains("red_line_enabled") &&
-      !document->get_bool("red_line_enabled", true)) {
-    throw SafetyConfigError(
-        "safety limits config " + source +
-        " sets red_line_enabled=false — the red lines cannot be disabled; a "
-        "config file may only NARROW the interval");
-  }
-
-  SafetyLimits candidate;
-  candidate.mech_min_rad =
-      document->get_number("mechanical_observed_min_rad", kPackageMechMin);
-  candidate.mech_max_rad =
-      document->get_number("mechanical_observed_max_rad", kPackageMechMax);
-  candidate.red_min_rad =
-      document->get_number("red_open_limit_rad", kPackageRedMin);
-  candidate.red_max_rad =
-      document->get_number("red_close_limit_rad", kPackageRedMax);
-  candidate.enabled = document->get_bool("red_line_enabled", true);
-  if (document->contains("hard_torque_limit_nm")) {
-    candidate.params.tau_max_nm =
-        document->get_number("hard_torque_limit_nm", kPackageTauMaxNm);
-  }
-
-  return checked_limits(candidate, "safety limits config " + source);
-}
-
-SafetyLimits load_safety_baseline(const std::optional<std::string>& version) {
-  const std::string wanted =
-      version.has_value() ? *version : std::string(kDefaultSafetyBaseline);
-
-  // A string containing a path separator is taken as an explicit file, not a
-  // version name. That lets a deployment pin an exact file (and lets tests point
-  // at one) without the version table having to know about it — while a bare
-  // version still resolves through the table, so the rollback stays auditable.
-  const std::string path = wanted.find('/') != std::string::npos
-                               ? wanted
-                               : safety_baseline_path(wanted);
-  if (!file_exists(path)) {
-    // Fail-closed: silently falling back would make "the config was lost" look
-    // identical to "the config is correct", and the process would run with a
-    // torque ceiling nobody confirmed.
-    throw SafetyConfigError("safety baseline '" + wanted +
-                            "' file does not exist: " + path +
-                            " — refusing to fall back to any default");
-  }
-  const auto limits = load_safety_limits(path);
-  if (!limits.has_value()) {
-    throw SafetyConfigError("safety baseline '" + wanted +
-                            "' could not be loaded: " + path);
-  }
-  return *limits;
 }
 
 SafetyLimits canonical_baseline() {

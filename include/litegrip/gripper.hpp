@@ -1,21 +1,23 @@
-// litegrip/gripper.hpp — high-level gripper API (LiteGrip).
+// litegrip/gripper.hpp — high-level gripper API (litegrip::Gripper).
 //
-// Port of litegrip_driver/litegrip/gripper.py. This is the entry point most
-// consumers use: connect, init (hold), open/close/goto, calibrate, read state.
+// The entry point most consumers use: construct (which auto-loads a
+// calibration), connect, enable, move, read state.
 //
-// Capability scope: lifecycle, hold-based init, calibration, position motion,
-// the action engine (open/close/grasp/positioning ramps/zero-gravity —
-// motion.hpp), state and parameter access. Trajectory record/playback and
-// teleop are later stages.
+// Units: opening in millimetres (0 = closed), motor angle in radians, velocity
+// in rad/s, torque in N·m. "Newtons" in grasp() are approximate (10 N per
+// N·m) and are NOT force-calibrated.
 //
-// Naming: `goto` is a C++ keyword, so the millimetre-target method is goto_mm().
+// Error policy: commands return bool; invalid arguments/state raise
+// CommandError / NotInitializedError; transport and hardware failures raise
+// CommError / HardwareError. A motion that ran but did not reach its goal
+// returns false and logs the reason.
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
-#include <utility>
 
 #include "litegrip/bus.hpp"
 #include "litegrip/calibration.hpp"
@@ -25,415 +27,232 @@
 
 namespace litegrip {
 
+/// Live motor feedback (pika-style struct).
+struct MotorData {
+  double Position = 0.0;  // rad
+  double Speed = 0.0;     // rad/s
+  double Torque = 0.0;    // N·m
+};
+
+/// Live motor status (pika-style struct).
+struct MotorStatus {
+  std::string Status = "0x00";  // motor error/status word, hex string
+  int DriverTemp = 0;           // MOS temperature, °C
+  int MotorTemp = 0;            // coil temperature, °C
+};
+
 /// LiteGrip adaptive two-finger gripper.
 ///
-/// Lifetime (R4): construction does NOT touch the bus — a GripperConfig object
-/// must be valid without hardware. connect() opens it explicitly (or use
-/// connect_raii()); the destructor always disconnects, so a connected gripper
-/// is never left enabled by accident.
-///
-/// The destructor does not throw, and neither does disconnect() — destroying a
-/// gripper whose CAN link has died must still return an exit code. See
-/// teardown.hpp for how a failing disable is contained and reported.
-///
-/// Implements MotionIo by private inheritance — LiteGrip is the IO the action
-/// engine drives; the seam's methods keep their existing public names.
-class LiteGrip : private MotionIo {
+/// Construction does NOT touch the bus; it does auto-load a calibration from
+/// `$LITEGRIP_CALIB`, `~/.litegrip/<channel>_calibration.json`, or the bundled
+/// factory calibration (in that order), so distance commands work out of the
+/// box. connect() opens the bus explicitly; the destructor always disconnects,
+/// so a connected gripper is never left enabled by accident.
+class Gripper : private MotionIo {
  public:
-  explicit LiteGrip(GripperConfig config = GripperConfig{});
-  ~LiteGrip();
-  LiteGrip(const LiteGrip&) = delete;
-  LiteGrip& operator=(const LiteGrip&) = delete;
-  /// Movable so connect_raii() can return one. The moved-from object is left
-  /// disconnected and inert, so its destructor does nothing.
-  LiteGrip(LiteGrip&& other) noexcept;
-  LiteGrip& operator=(LiteGrip&& other) noexcept;
-
-  /// Connect and return a live instance (throws ConnectError on failure).
-  /// The RAII one-liner: the returned object disconnects on destruction.
-  static LiteGrip connect_raii(GripperConfig config = GripperConfig{});
+  explicit Gripper(GripperConfig config = GripperConfig{});
+  /// Convenience constructor: channel plus CAN ids. `mst_id` defaults to 0x18
+  /// (0x08 + 0x10); there is no auto-detection.
+  Gripper(std::string channel, int can_id = GripperParams::kCanId,
+          int mst_id = GripperParams::kMstId);
+  ~Gripper();
+  Gripper(const Gripper&) = delete;
+  Gripper& operator=(const Gripper&) = delete;
 
   // ── properties ────────────────────────────────────────────────────────
   const std::string& channel() const noexcept { return config_.can_channel; }
   int can_id() const noexcept { return config_.can_id; }
-  std::optional<int> mst_id() const noexcept { return mst_id_; }
+  int mst_id() const noexcept { return config_.mst_id; }
   bool is_connected() const noexcept { return connected_; }
-  /// True when the motor is enabled. Also the engine's MotionIo::is_enabled:
-  /// disconnect() clears enabled_, so this matches Python's
-  /// `self._can is not None and self._enabled` in every reachable state.
   bool is_enabled() const noexcept override { return enabled_; }
   const GripperConfig& config() const noexcept override { return config_; }
-  GripperConfig& config() noexcept { return config_; }
-  /// Whether disconnect() disables the motor first. Default true; set false
-  /// to leave the motor enabled (holding position with torque) after the bus
-  /// closes. Mirrors the Python SDK's same-named attribute.
-  bool disable_on_disconnect() const noexcept { return disable_on_disconnect_; }
-  void set_disable_on_disconnect(bool value) noexcept {
-    disable_on_disconnect_ = value;
-  }
 
-  // ── connection ────────────────────────────────────────────────────────
+  // ── lifecycle ─────────────────────────────────────────────────────────
 
-  /// Open the bus and register the motor. When the config leaves mst_id unset
-  /// it is auto-detected here.
+  /// Open SocketCAN and register the motor. Repeated calls return true.
+  /// Throws ConnectError / CommError on failure.
   bool connect();
 
-  /// Close the bus, disabling the motor first unless
-  /// disable_on_disconnect() is false.
-  ///
-  /// Does not throw, from any state, on any bus. The destructor and the move
-  /// assignment both call it and both are noexcept, so a disable frame that
-  /// fails on a dead bus is reported on stderr and swallowed rather than
-  /// terminating the process; the bus is closed either way. Call disable()
-  /// directly when the failure has to reach the caller.
+  /// Disable the motor (zero torque) then close the bus. Idempotent and
+  /// noexcept: a failing disable is reported on stderr, never thrown.
   void disconnect() noexcept;
 
-  // ── enable / init / fault ─────────────────────────────────────────────
+  /// Full init: disable -> MIT mode -> enable -> hold at the current position,
+  /// verifying error==1 from a fresh status frame. `retries` overrides the
+  /// built-in retry count. Throws HardwareError on failure.
+  bool enable(std::optional<int> retries = std::nullopt);
 
-  /// Enable, clearing a latched fault first if one is present. The motor ends
-  /// up holding its current position (see HoldPolicy / init()).
-  bool enable();
-
-  /// Initialise = enable and hold. This SDK's `init` means exactly that and
-  /// nothing else; the behaviour lives behind HoldPolicy (R2) so it can be
-  /// replaced without touching anything else.
-  bool init();
-
-  /// Drop torque on the motor so the jaws can be moved by hand. Throws
-  /// CommError when the frame cannot be sent — this is the entry to use when
-  /// the caller has to know the motor was actually let go; disconnect() is the
-  /// one that never throws.
+  /// Drop torque so the jaws can be moved by hand.
   bool disable();
 
-  /// Clear latched faults (UV / OC / OT): disable -> clear (0xFB) -> enable,
-  /// retried up to kFaultClearRetries times. Throws HardwareError on failure.
+  /// Clear latched faults (UV / OC / OT) and re-enable. Throws HardwareError
+  /// when the fault cannot be cleared.
   bool clear_fault();
 
-  /// Emergency stop: send a zero-torque MIT frame. Does NOT disable the motor —
-  /// it stays enabled but exerts zero torque, so it can be back-driven.
-  void stop();
-
-  // ── low-level frame access ────────────────────────────────────────────
-
-  /// Send a single MIT control frame (expert use; sustained motion should go
-  /// through goto_rad() / move_to()). For custom control loops that manage
-  /// their own timing.
-  bool send_mit_frame(double q, double kp, double kd, double dq = 0.0,
-                      double tau = 0.0) override;
-
-  /// Poll one CAN frame and update the cached state.
-  bool poll(double timeout_s = 0.0);
-
-  // ── motion ────────────────────────────────────────────────────────────
-
-  /// Move to the closed (zero) position: this instance's calibrated closed
-  /// limit, so the target follows the direction the calibration declares.
+  /// Make the current encoder angle zero via 0xFE (disable -> zero ->
+  /// re-enable), then read back and require |position| <= 1e-3 rad.
   ///
-  /// An ordinary positioning ramp (see goto_rad), so `ok` is reached &&
-  /// !stalled. Not a press: close() aims past the calibrated limit to press the
-  /// real stop, home() aims at the calibrated closed position and stops on it,
-  /// so the zero can be approached without loading it.
-  MoveResult home();
-
-  /// Full open / close — the action engine's ramp (motion.hpp): a velocity
-  /// feed-forward per frame, a lead cap that narrows near the calibrated
-  /// limit, then a light press onto the mechanical stop, which ends the move.
-  /// `speed_mm_s` empty = MotionConfig::speed_mm_s.
-  ///
-  /// Returns a MoveResult whose bool is `ok` = pressed onto the stop (stalled
-  /// and parked within MotionConfig::stop_tol of the limit), so the old
-  /// `if (gripper.open())` idiom keeps working. Blocked halfway is also a
-  /// stall, but far from the stop, and is falsy — including when the
-  /// travel-leg torque protection ends the move (`protection_tripped`), which
-  /// leaves the gripper limp for MotionConfig::stop_release_s.
-  ///
-  /// One exception to the press: when GripperConfig::work_stroke_mm sits
-  /// strictly inside the measured travel, open() stops AT that point instead
-  /// of pressing the stop — an ordinary positioning move, so `ok` is `reached
-  /// and not stalled`. `limit_rad` still reports the open-side calibrated
-  /// limit, which the target stops short of. close() has no equivalent: force
-  /// control happens through grasp().
-  ///
-  /// Breaking change: the old open(kp, kd, duration) / close(kp, kd, force_n,
-  /// duration) signatures are gone. close() takes no force at all — the
-  /// online Python SDK's close() doesn't either; use grasp() to close onto an
-  /// object and squeeze.
-  MoveResult open(std::optional<double> speed_mm_s = std::nullopt,
-                  MoveProgressCallback progress = {});
-  MoveResult close(std::optional<double> speed_mm_s = std::nullopt,
-                   MoveProgressCallback progress = {});
-
-  /// Close onto an object and then hold it with force_n newtons (empty =
-  /// MotionConfig::force_n); the closing leg stops INSIDE the calibrated
-  /// limit, so it stalls on the object, not on the empty stop. `hold_s` = 0
-  /// holds until a fault.
-  ///
-  /// The N value is NOT force-calibrated in this SDK
-  /// (kForceCalibrationVerified is false): it is applied as a torque
-  /// feed-forward of close_sign * force_n * 0.1 Nm, exactly like the Python
-  /// SDK — the two SDKs agree, but not because the newtons are physical. Do
-  /// not build force-limited behaviour on this number.
-  ///
-  /// The hold is bounded by MotionConfig::hold_runaway_rad: a measured position
-  /// that walks that far past the closed-side calibrated limit ends the hold
-  /// with GraspResult::travel_guard set and ok false.
-  ///
-  /// The hand-over also never happens for an approach that stopped without
-  /// ever leaving its start pose while its budget was below
-  /// MotionConfig::breakaway_nm: the budget could not break static friction,
-  /// and handing that jaw to the torque-only hold would power it across the
-  /// free stroke. That outcome is GraspResult::no_bite with ok false and
-  /// cycles 0, and not one hold frame is sent. Above the breakaway a zero
-  /// displacement is contact and is held normally.
-  GraspResult grasp(std::optional<double> force_n = std::nullopt,
-                    double hold_s = 0.0, MoveProgressCallback progress = {});
-
-  /// End an in-progress grasp() and open the jaws — callable from any thread,
-  /// including while grasp(0) is blocked in another one. With no grasp running
-  /// it opens in the calling thread. `clearance_mm` is how much further than
-  /// the declared grip pose the jaws open; `abort = true` is the E-stop form
-  /// (torque off, no opening move). See MotionEngine::release for the full
-  /// rules.
-  ReleaseResult release(double clearance_mm = 10.0, bool abort = false,
-                        std::optional<double> timeout_s = std::nullopt);
-
-  /// Non-blocking form of release(): queue the request if a grasp is running
-  /// and return true. Never sends a frame — safe for a UI thread or an E-stop
-  /// callback (not async-signal-safe). See MotionEngine::request_release.
-  bool request_release(double clearance_mm = 10.0, bool abort = false);
-
-  /// Positioning move to an absolute opening in mm (0 = closed) at a constant
-  /// speed. The same bounded ramp as goto_mm, so the same MoveResult reading
-  /// (`ok` = reached && !stalled) and the same 4 mm lead cap. A speed of zero
-  /// or less is refused; it used to report success without moving.
-  MoveResult move_at_speed(double target_mm, double speed_mm_s = 30.0,
-                           std::optional<double> kp = std::nullopt,
-                           std::optional<double> kd = std::nullopt);
-
-  /// The same in rad, at speed_rad_s.
-  MoveResult move_at_speed_rad(double target_rad, double speed_rad_s = 0.5,
-                               std::optional<double> kp = std::nullopt,
-                               std::optional<double> kd = std::nullopt);
-
-  /// Zero-gravity mode: the motor stays enabled but exerts no torque and can
-  /// be back-driven by hand. duration_s > 0 streams zero-torque frames for
-  /// that long; 0 sends one bootstrap frame and the caller must keep polling
-  /// (or sending frames) to sustain the mode. Any motion command resumes
-  /// normal control.
-  void enter_zero_gravity(double duration_s = 0.0);
-
-  /// Leave zero-gravity: one hold frame at the measured position under the
-  /// configured gains, so the gripper must not jump toward a stale target.
-  /// Silent no-op when the motor is not enabled.
-  void exit_zero_gravity();
-
-  /// Move to an absolute position in millimetres (0 = closed).
-  ///
-  /// A bounded ramp, not a step: one frame per MotionConfig::frame_interval
-  /// whose command leads the measured position by at most
-  /// MotionConfig::max_lead_mm, so the frame's torque stays near
-  /// kp x max_lead_mm instead of saturating the +-10 Nm MIT range. `duration`
-  /// is the LENGTH OF THE RAMP — the speed is derived from the distance — so a
-  /// long trip at the default is fast; pass a longer duration for long moves.
-  /// The result is `ok` only when the jaws arrived and did not stall, and a
-  /// shortfall that the travel-leg protection did not end comes back with
-  /// MoveResult::released set, meaning the force was taken off.
-  MoveResult goto_mm(double position_mm, std::optional<double> kp = std::nullopt,
-                     std::optional<double> kd = std::nullopt,
-                     double duration = 0.5);
-
-  /// The same in radians. The target is clamped into the calibrated travel and
-  /// an uncalibrated config is refused, both before any frame is sent.
-  ///
-  /// `dq_target` and `tau_feedforward` must be 0 — the ramp derives the
-  /// velocity feed-forward from distance / duration and carries no feed-forward
-  /// torque, so a caller-supplied value is refused with CommandError rather
-  /// than silently ignored. `duration` must be positive and finite.
-  MoveResult goto_rad(double position_rad,
-                      std::optional<double> kp = std::nullopt,
-                      std::optional<double> kd = std::nullopt,
-                      double dq_target = 0.0, double tau_feedforward = 0.0,
-                      double duration = 0.5);
-
-  /// The same as goto_rad, with a longer default duration.
-  MoveResult move_to(double target_rad, std::optional<double> kp = std::nullopt,
-                     std::optional<double> kd = std::nullopt,
-                     double tau_feedforward = 0.0, double duration = 1.0);
+  /// IRREVERSIBLE for the motor's absolute reference. Returns false when the
+  /// motor does not accept or confirm the new zero.
+  bool set_zero();
 
   // ── calibration ───────────────────────────────────────────────────────
 
-  /// Automatic calibration: back off, step toward close until stall, back off,
-  /// step toward open until stall, then derive the conversion factor.
+  /// Probe both mechanical limits with low stiffness, update the config, then
+  /// save to the default per-channel path automatically.
   ///
-  /// The direction is NOT discovered — a stall only says something stopped the
-  /// jaws, and both ends are hard stops. It comes from the config's close_sign,
-  /// so load a calibration first; the result preserves the direction it
-  /// declares. On shipped units the factory calibration already supplies it.
-  ///
-  /// Two independent guards keep the probe from pressing the structure apart
-  /// (see probe.hpp): the command lead is re-derived from the measured position
-  /// every step, capping the pressing torque at `kp x step_rad`, and `tau_limit`
-  /// ends the probe as soon as |tau| reaches it. Pass std::nullopt to disable
-  /// the ceiling; a probe that needs more torque than the ceiling to move then
-  /// stops there and reports it.
-  CalibrationData calibrate(double kp = 60.0, double kd = 2.0,
-                            double step_rad = 0.1, double stall_delta = 0.0003,
-                            int stall_cycles = 8, int max_iter = 30,
-                            std::optional<double> tau_limit = 2.0);
+  /// BLOCKING and it moves the jaws against both stops — make sure the travel
+  /// is clear. The direction (which end is closed) comes from the loaded
+  /// calibration and is preserved; load a calibration first on a fresh unit.
+  CalibrationData calibrate();
 
-  /// Calibrate and persist in one call: calibrate() at its defaults, then
-  /// save_calibration() to this channel's own file. The gripper is driven
-  /// against both end stops, so make sure the travel is clear. Returns what
-  /// calibrate() returned.
-  ///
-  /// That file is *not* read back by a no-argument load_calibration(), which
-  /// reads the factory calibration only — so also point `LITEGRIP_CALIB` at
-  /// what this wrote, or load it by path on the next run.
-  ///
-  /// Mirrors the Python SDK's zero(), which is the same pair of calls; the two
-  /// SDKs are being kept name-for-name compatible. The Python one passes its
-  /// calibration gains from the config, this one takes calibrate()'s defaults.
-  /// Calibrate-then-save is available separately when the result must be
-  /// inspected or written somewhere else — `calibrate()` does not touch the
-  /// flash or the disk.
-  CalibrationData zero();
-
-  /// Guided two-step calibration: open first, then close, with the same probe
-  /// guards as calibrate() (probe.hpp) and the same direction rule.
-  ///
-  /// ⚠ This SDK does NOT read the keyboard: the probe stops on the stall
-  /// criterion or the torque ceiling only. The Python SDK's calibrate_guided()
-  /// additionally returns as soon as the operator presses Enter
-  /// (sys.stdin.isatty()); there is no equivalent here yet.
-  CalibrationData calibrate_guided(double kp = 60.0, double kd = 2.0,
-                                   double step_rad = 0.08,
-                                   double stall_delta = 0.0004,
-                                   int stall_cycles = 6, int max_iter = 40,
-                                   std::optional<double> tau_limit = 2.0);
-
-  /// Calibrate by hand-moving the gripper while it is in zero-torque mode.
-  ///
-  /// Which of the two extremes the hand reaches is the closed limit follows the
-  /// direction the calibration declares (close_sign), not which reading is
-  /// numerically larger.
-  CalibrationData calibrate_manual(double duration = 30.0,
-                                   double settle_time = 2.0,
-                                   double sample_interval = 0.01);
-
-  /// Persist the current calibration. Returns the path written.
-  ///
-  /// Without `path`, writes to this channel's own file
-  /// (default_calibration_path(channel)). One file per channel is what keeps
-  /// two grippers on one machine from overwriting each other.
-  ///
-  /// A no-argument load_calibration() reads the factory calibration only, so
-  /// what this writes is *not* read back on its own: name it
-  /// (`load_calibration(returned_path)`) or point `LITEGRIP_CALIB` at it. A
-  /// warning on stderr says so at save time.
-  std::string save_calibration(std::optional<std::string> path = std::nullopt);
-
-  /// Load calibration into config. Two ways to say which file:
-  ///
-  ///  * `path` — an explicit file, which may be anywhere. Falls back to the
-  ///    packaged factory calibration when that file cannot be read, and may
-  ///    still return true when it does. A channel mismatch is only warned
-  ///    about, not skipped.
-  ///  * no argument — `$LITEGRIP_CALIB` when it is set, then the packaged
-  ///    factory calibration, and nothing else. A calibration measured on this
-  ///    machine is never picked up by accident: name it with `path`, or point
-  ///    `LITEGRIP_CALIB` at it. Files the load walked past in `~/.litegrip/`
-  ///    are named on stderr, and the file that won is printed. A candidate
-  ///    whose `channel` field names a different interface is *skipped*, so a
-  ///    can1 unit fails loudly rather than silently adopting can0's
-  ///    calibration — every LiteGrip ships at CAN id 0x08, so the channel is
-  ///    the only identity key.
-  ///
-  /// The limits in the file decide the direction: whichever of the two is
-  /// numerically larger is the closed side (see GripperConfig::close_sign()).
-  /// Call after connect() and before enable().
+  /// Load a calibration. With `path`, that file is the only source tried (no
+  /// fallback). Without it: `$LITEGRIP_CALIB`, then
+  /// `~/.litegrip/<channel>_calibration.json`, then the bundled factory
+  /// calibration. Returns false when nothing readable was found.
   bool load_calibration(std::optional<std::string> path = std::nullopt);
 
-  /// Deprecated: load a packaged mount template by name. Kept for backward
-  /// compatibility only.
-  ///
-  /// Shipped units are normal mount and the factory calibration already
-  /// describes them, so new code uses a no-argument load_calibration() or an
-  /// explicit path instead of selecting a mount. Names come from
-  /// list_calibration_templates().
-  ///
-  /// Strict: an unknown name or an unreadable template throws CommandError
-  /// instead of falling back to the factory file.
-  bool load_template(const std::string& name);
+  /// Persist the current calibration. Without `path`, writes
+  /// `~/.litegrip/<channel>_calibration.json`. Returns the path written.
+  std::string save_calibration(
+      std::optional<std::string> path = std::nullopt);
 
-  // ── state ─────────────────────────────────────────────────────────────
+  // ── motion (blocking; require connected + enabled + calibrated) ────────
 
-  /// Current state. `wait` = wait for a fresh status frame, up to the
-  /// staleness horizon (kStaleAfterS, 0.5 s); false = return the cached
-  /// snapshot immediately (control loops).
+  /// Ramp toward the open side and press lightly onto the stop. When
+  /// `work_stroke_mm` is set and smaller than the travel, stop at that point
+  /// instead (an ordinary positioning move). Success = pressed and parked near
+  /// the calibrated limit (or reached the work stroke).
+  bool open(std::optional<double> speed_mm_s = std::nullopt);
+
+  /// Ramp toward the closed side and press lightly onto the stop. Success =
+  /// pressed and parked near the calibrated limit.
+  bool close(std::optional<double> speed_mm_s = std::nullopt);
+
+  /// Positioning move to an absolute opening in mm (0 = closed), clamped into
+  /// the calibrated travel; no limit press. Rejects non-finite values and
+  /// uncalibrated configs. Success = reached and not stalled.
+  bool set_gripper_distance(
+      double distance_mm, std::optional<double> speed_mm_s = std::nullopt);
+
+  /// Positioning move to an absolute motor angle in rad, clamped into the
+  /// calibrated travel; same success semantics as set_gripper_distance().
+  /// `speed_mm_s` is the travel speed (millimetres per second).
+  bool set_motor_angle(double angle_rad,
+                       std::optional<double> speed_mm_s = std::nullopt);
+
+  /// Send one MIT follow frame for teleoperation, in millimetres.
   ///
-  /// The wait is bounded by that horizon on purpose, so the two say the same
-  /// thing: a read that waited and got no frame IS a stale read, and
-  /// is_stale() reports it (a miss also warns on stderr). A shorter wait would
-  /// hand back a snapshot no frame arrived for while is_stale() still called it
-  /// a measurement.
+  /// This is a single frame, not a move: no ramp, no settle, no bus read. Call
+  /// it at the teleoperation loop's own rate (typically 100–200 Hz).
+  /// `distance_mm` is an absolute opening from the closed zero and is
+  /// interpreted with THIS gripper's calibration, so a leader may send its own
+  /// `get_gripper_distance()` even when the two calibration files differ in
+  /// zero, direction or scale. A shorter follower stroke still clamps at its
+  /// own travel; normalise in the caller when the strokes differ.
   ///
-  /// A disabled motor does not stream status frames, so the snapshot may hold
-  /// constructor defaults — check is_stale() / data_age_s before trusting it,
-  /// or send a refresh frame first.
+  /// The target is clamped into the calibrated travel. Bounds: kp 0..500,
+  /// kd 0..5, |dq| <= 10 rad/s, |tau| <= 3.5 Nm; invalid values are refused
+  /// before any frame is sent. Returns true when the frame was written, false
+  /// when the transport failed (a one-way command cannot prove the motor
+  /// accepted it). The caller owns the leader-side reading, loop timing and
+  /// watchdog.
+  bool follow_gripper_distance(
+      double distance_mm, std::optional<double> kp = std::nullopt,
+      std::optional<double> kd = std::nullopt, double dq = 0.0,
+      double tau = 0.0,
+      std::function<void(double)> force_feedback = {});
+
+  /// Measured squeeze in N (approximate, motor-torque-derived; cached).
+  /// Follower-side value to forward to the leader's render_force_feedback().
+  double get_gripper_force();
+
+  /// Configure leader-side force-feedback rendering. DISABLED by default;
+  /// `enabled = true` turns render_force_feedback() on. Bounds:
+  /// gain >= 0, threshold >= 0, max_tau 0..3.5 Nm, damping 0..5, timeout > 0.
+  void configure_force_feedback(bool enabled = false,
+                                double gain_nm_per_n = 0.10,
+                                double threshold_n = 2.0,
+                                double max_tau_nm = 1.0, double damping = 0.1,
+                                double timeout_s = 0.3);
+
+  /// Render a follower squeeze on the leader as one MIT frame: kp=0,
+  /// kd=damping, tau=-close_sign*min((force-threshold)*gain, max_tau).
+  /// Age beyond the configured timeout drops resistance and damping. Returns
+  /// false when feedback is disabled; sends nothing in that case.
+  bool render_force_feedback(double force_n, double age_s = 0.0);
+
+  /// Adaptive close until stall, then a pure torque hold at
+  /// `force_n * 0.1 N·m` (`force_n` empty = MotionConfig::force_n).
+  /// `hold_s = 0` holds until release() or a fault.
+  ///
+  /// True only when the hold was established and ended normally. False on
+  /// no-bite, travel guard, protection, or a bus failure during the hold; the
+  /// reason is logged. The N value is NOT force-calibrated.
+  bool grasp(std::optional<double> force_n = std::nullopt, double hold_s = 0.0);
+
+  /// End an in-progress grasp and open `clearance_mm` beyond the declared grip
+  /// pose, clamped to the calibrated open limit. Thread-safe: callable from
+  /// another thread while grasp(hold_s = 0) blocks. Use disable() for an
+  /// emergency torque cut.
+  bool release(double clearance_mm = 10.0);
+
+  // ── feedback (throw NotInitializedError when not connected) ────────────
+
+  /// Cached snapshot with `fresh`, `data_age_s`, `is_stale()`. `wait = true`
+  /// waits up to the staleness horizon (0.5 s) for a fresh frame.
   GripperState get_state(bool wait = true) override;
 
-  /// Request a status frame even while disabled (0xCC refresh).
-  bool refresh_status(double timeout_s = 0.5) override;
+  /// Send 0xCC and wait briefly for a status frame.
+  bool refresh_status();
 
-  double get_position_mm();
-  double get_position_rad();
-  /// Estimated gripping force in N. Non-const on purpose: like its siblings it
-  /// refreshes the state, which is bus I/O.
-  double get_force();
-  double get_torque();
-  int get_error();
-  std::pair<int, int> get_temperature();  // (mos, coil) degC
-  GripperInfo get_info() const;
+  MotorData get_motor_data();
+  MotorStatus get_motor_status();
+  double get_motor_position();  // rad
+  double get_motor_speed();     // rad/s
+  double get_motor_torque();    // N·m
+  /// Opening from the closed zero, mm (NOT the jaw gap: do not double it).
+  double get_gripper_distance();
+  int get_driver_temp();  // MOS temperature, °C
+  int get_motor_temp();   // coil temperature, °C
+  std::string get_status_raw();  // hex string, e.g. "0x01"
 
-  bool is_moving();
-  /// Torque exceeds the configured grasp-detection threshold.
-  bool is_grasped();
-  bool wait_for_ready(double timeout = 5.0);
+  /// SDK/package version string (NOT device firmware).
+  std::string get_version() const;
 
-  // ── parameter access (expert) ─────────────────────────────────────────
-
-  double read_param(int rid, double timeout_s = 0.5);
-  void write_param(int rid, double value);
-
-  // ── safety (expert) ───────────────────────────────────────────────────
-
-  /// The safety guard in effect, for diagnostics.
+  /// The safety guard in effect, for diagnostics (read-only).
   const SafetyGuard& safety() const noexcept { return *safety_; }
 
  private:
-  void check_connected() const;
+  // ── MotionIo ──────────────────────────────────────────────────────────
   void check_enabled() const override;
+  bool refresh_status(double timeout_s) override;
+  bool send_mit_frame(double q, double kp, double kd, double dq,
+                      double tau) override;
 
-  /// Copy a decoded calibration into the config. `instance_channel` is the
-  /// channel *before* the copy: a file naming a different one is worth a
-  /// warning (the channel is the identity key when two grippers share CAN id
-  /// 0x08) but is not fatal, since older files predate the field.
+  void check_connected() const;
+  /// Copy the facade's config into the bus (kp/kd/limits are read there).
+  void sync_bus_config() noexcept;
+  /// Copy a decoded calibration into the config.
   void apply_calibration(const CalibrationFile& calibration,
                          const std::string& instance_channel);
 
   GripperConfig config_;
   /// Shared with every MotionEngine this gripper constructs, so a grasp
-  /// running on one thread can be ended by release()/request_release() on
-  /// another. Deliberately not moved: a moved-to gripper starts with an idle
-  /// one, and a grasp in flight during a move is not a legal state anyway.
+  /// running on one thread can be ended by release() on another.
   ReleaseCoordinator release_;
   std::unique_ptr<GripperBus> bus_;
   std::unique_ptr<SafetyGuard> safety_;
-  std::optional<int> mst_id_;
   bool connected_ = false;
   bool enabled_ = false;
-  bool disable_on_disconnect_ = true;
-  GripperStatus status_flags_ = GripperStatus::kNone;
+
+  // Leader-side haptic rendering; off until configure_force_feedback().
+  bool feedback_enabled_ = false;
+  double feedback_gain_nm_per_n_ = 0.10;
+  double feedback_threshold_n_ = 2.0;
+  double feedback_max_tau_nm_ = 1.0;
+  double feedback_damping_ = 0.1;
+  double feedback_timeout_s_ = 0.3;
 };
 
 }  // namespace litegrip

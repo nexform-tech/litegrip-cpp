@@ -16,7 +16,7 @@
 //   * recover_to_interior() drives a move that starts outside the red lines
 //     back inside, inward-only, at the recovery ceilings from those same
 //     params, with tau = 0, failing closed on any doubt — see its definition
-//     for why guard_recovery_frame() cannot be the one doing this today;
+//     for why a guard-side gate cannot be the one doing this today;
 //   * hold-type operations (grasp's hold, exit_zero_gravity) never
 //     run the recovery drive-in: driving "inward" while squeezing a workpiece
 //     would open the grip.
@@ -123,7 +123,7 @@ double toward(double value, double target, double step) {
 /// driven to as if the caller had asked for it — while a NaN rate becomes a NaN
 /// dq that only send_frame() refuses, i.e. mid-move, once the ramp has already
 /// started. Neither is a refusal at the entry, which is what Python does at
-/// these same sites (gripper.py goto_rad / move_at_speed / ramp_to) and for the
+/// these same sites (actions.py ramp_to / the calibration probe) and for the
 /// same reason.
 void check_finite(const char* source, const char* name, double value) {
   if (!std::isfinite(value)) {
@@ -396,21 +396,19 @@ int MotionEngine::drop_torque(double pos, const char* source) {
 // bounds mirror the guard's recovery channel: kp <= recovery_kp_max, |dq| <=
 // recovery_dq_max, tau = 0, monotone inward.
 //
-// Why not guard_recovery_frame()? It exists for exactly this, and this
-// function is its engine-side twin — but it admits only positions inside the
-// packaged "mechanically observed range" [mech_min, mech_max] (safety.hpp),
-// which the baseline file itself documents as the REFERENCE unit's unverified
-// zero-gravity hand-push bound, and which every shipped calibration's stops
-// lie outside (the stops are what pressing onto them is FOR). The guard
-// therefore refuses to move a gripper off its own stops — by construction,
-// not by accident (test_safety pins the refusal), and widening the bounds is
-// mechanically rejected (assert_no_wider_than). Rather than widen a baseline,
-// the engine judges plausibility against THE UNIT'S OWN calibration: after
-// calibration, "within this unit's validated travel (± whatever a successful
-// call may leave behind, recovery_window_rad)" replaces "inside the reference
-// unit's hand-push range". OPEN ITEM for the safety owner: once the envelope is re-measured
-// per unit, this crawl should collapse into guard_recovery_frame() and the
-// twin logic should disappear.
+// Why not a guard-side recovery gate? The packaged "mechanically observed
+// range" [mech_min, mech_max] (safety.hpp) is the REFERENCE unit's unverified
+// zero-gravity hand-push bound, and every shipped calibration's stops lie
+// outside it (the stops are what pressing onto them is FOR). A gate bounded by
+// that range would refuse to move a gripper off its own stops — by
+// construction, not by accident — and widening the bounds is mechanically
+// rejected (assert_no_wider_than). Rather than widen a baseline, the engine
+// judges plausibility against THE UNIT'S OWN calibration: after calibration,
+// "within this unit's validated travel (± whatever a successful call may leave
+// behind, recovery_window_rad)" replaces "inside the reference unit's
+// hand-push range". OPEN ITEM for the safety owner: once the envelope is
+// re-measured per unit, this crawl should collapse into a guard-side recovery
+// gate and the twin logic should disappear.
 //
 // Fail closed: no feedback / non-finite / outside the unit's own travel /
 // latched fault / no progress within recovery.timeout_s all throw, and not a
@@ -1538,7 +1536,7 @@ MoveResult MotionEngine::ramp_to(double target_rad, double speed_mm_s,
   return res;
 }
 
-// ── the move_at_speed entry points (Python gripper.move_at_speed_rad) ────
+// ── the internal speed-specified entry points (engine tests only) ────────
 
 MoveResult MotionEngine::move_at_speed(double target_mm, double speed_mm_s,
                                        std::optional<double> kp,

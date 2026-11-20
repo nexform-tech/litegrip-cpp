@@ -25,8 +25,8 @@ include(GNUInstallDirs)
 find_package(Threads REQUIRED)
 
 # ── library ───────────────────────────────────────────────────────────────
-# T1 froze the API surface (headers). T2 adds the can/* layer; bus/LiteGrip
-# land in T3 and safety/ControlLoop in T4.
+# T1 froze the API surface (headers). T2 adds the can/* layer; the bus and the
+# Gripper facade land in T3, the safety core in T4.
 add_library(litegrip_cpp
   src/version.cpp
   src/exceptions.cpp
@@ -37,13 +37,11 @@ add_library(litegrip_cpp
   src/can/controller.cpp
   src/json.cpp
   src/calibration.cpp
-  src/hold_policy.cpp
   src/bus.cpp
   src/safety.cpp
   src/gripper.cpp
   src/motion.cpp
   src/probe.cpp
-  src/control_loop.cpp
 )
 add_library(litegrip_cpp::litegrip_cpp ALIAS litegrip_cpp)
 
@@ -78,10 +76,10 @@ install(TARGETS litegrip_cpp
 
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
-# Calibration / safety data (factory_calibration.json, safety_limits_*.json).
-# These are *data*: a deployment may override them, but the factory defaults
-# must ship so load_calibration()'s read-only fallback works out of the box.
-# The path is mirrored by litegrip_cpp_DATA_DIR in the CMake package config.
+# Calibration data (factory_calibration.json). This is *data*: a deployment may
+# override it, but the factory default must ship so the constructor's automatic
+# load works out of the box. The path is mirrored by litegrip_cpp_DATA_DIR in
+# the CMake package config.
 install(DIRECTORY calibration/
   DESTINATION ${CMAKE_INSTALL_DATADIR}/litegrip_cpp/calibration
 )

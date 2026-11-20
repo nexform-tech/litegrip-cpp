@@ -1,11 +1,15 @@
 // litegrip/bus.hpp — single-gripper CAN bus layer (GripperBus).
 //
-// Port of litegrip_driver/litegrip/protocols/can_bus.py (LiteGripCAN). Renamed
-// to GripperBus in the C++ SDK: it is no longer "the CAN module", it is the
-// bus-level API for one gripper, and the name should say what it is.
+// This layer knows about ONE gripper motor. It owns the SocketCAN transport,
+// the MotorController and the motor state, and exposes exactly the operations
+// the Gripper facade needs: connect, init/hold, disable, fault clearing,
+// set-zero, MIT control, polling and feedback getters.
 //
-// This layer knows about ONE gripper motor. For several motors on one bus use
-// litegrip::can::MotorController directly.
+// The enable-and-hold behaviour lives here: after 0xFC the bus streams
+// zero-gain cover frames, waits
+// for a fresh status frame, then holds the measured position. One lost cover
+// frame would otherwise let the motor keep running a stale target, and an
+// enabled motor that hears nothing for ~900 ms latches its comm-loss fault.
 
 #pragma once
 
@@ -17,7 +21,6 @@
 #include "litegrip/can/controller.hpp"
 #include "litegrip/can/motor.hpp"
 #include "litegrip/can/transport.hpp"
-#include "litegrip/hold_policy.hpp"
 #include "litegrip/models.hpp"
 
 namespace litegrip {
@@ -34,71 +37,56 @@ class GripperBus {
 
   // ── connection ────────────────────────────────────────────────────────
 
-  /// Open the CAN transport and register the gripper motor (auto-detecting
-  /// mst_id when the config leaves it unset).
+  /// Open the CAN transport and register the single gripper motor with the
+  /// configured can_id / mst_id. Idempotent; throws ConnectError.
   bool connect();
 
   /// Disable (when initialised) and close the transport. `disable = false`
   /// leaves the motor enabled — holding position with torque — for callers
-  /// that own the motor state themselves (LiteGrip::disable_on_disconnect).
+  /// that already disabled it.
   ///
   /// Does not throw, and the transport is always closed: a disable frame that
   /// fails on a dead bus is reported on stderr and swallowed, because
   /// ~GripperBus() calls this and an escaping exception would terminate the
-  /// process. Use disable() directly when the failure has to be visible to the
-  /// caller.
+  /// process. Use disable() directly when the failure has to be visible.
   void disconnect(bool disable = true) noexcept;
 
   bool is_connected() const noexcept { return connected_; }
   bool is_initialized() const noexcept { return initialized_; }
 
-  /// Register the gripper motor; returns the actual (possibly detected) mst_id.
-  int register_gripper(int can_id = GripperParams::kCanId,
-                       std::optional<int> mst_id = std::nullopt,
-                       can::MotorType motor_type = can::MotorType::kDM4310);
-
   // ── enable / init / hold ──────────────────────────────────────────────
 
-  /// Full initialisation. Once enabled the motor is left HOLDING ITS CURRENT
-  /// POSITION (see HoldPolicy), not outputting zero torque — so it cannot jump
-  /// toward whatever target the previous session left behind.
-  ///
-  /// Returns true when the motor answers and is healthy (error 0 or 1).
-  /// Throws HardwareError on timeout / persistent fault / no feedback.
-  bool init(std::optional<double> kp = std::nullopt,
-            std::optional<double> kd = std::nullopt);
+  /// Full initialisation: disable -> MIT mode -> enable -> hold-at-current,
+  /// verifying error==1 from a fresh status frame, retried on failure. Throws
+  /// HardwareError on timeout / persistent fault / no feedback.
+  bool init(std::optional<int> retries = std::nullopt);
 
-  /// Enable only (no full init). Prefer init(); the motor is likewise left
-  /// holding position, and a silent motor counts as failure, not success.
-  bool enable(std::optional<double> kp = std::nullopt,
-              std::optional<double> kd = std::nullopt);
+  /// Alias of init(): the motor is left holding its current position.
+  /// Reports false (rather than throwing init()'s NotInitializedError) when the
+  /// bus was never connected, matching disable()/clear_fault().
+  bool enable() { return connected_ ? init() : false; }
 
+  /// Drop torque (0xFD).
   bool disable();
 
   /// Clear a latched fault and re-enable, again ending in hold-at-current.
-  bool clear_fault(std::optional<double> kp = std::nullopt,
-                   std::optional<double> kd = std::nullopt);
+  bool clear_fault();
 
-  /// Replace the hold strategy (R2). Takes effect on the next init()/enable().
-  void set_hold_policy(std::unique_ptr<HoldPolicy> policy);
-  const HoldPolicy& hold_policy() const noexcept { return *hold_policy_; }
+  /// Make the current encoder angle zero via 0xFE: disable -> zero -> re-enable,
+  /// then read back and require |position| <= 1e-3 rad. Irreversible.
+  bool set_zero();
 
   // ── motion ────────────────────────────────────────────────────────────
 
-  /// Send one MIT control frame. Returns false when not initialised or when the
-  /// frame could not be sent (a warning names the reason).
+  /// Send one MIT control frame. Returns false when no motor is registered or
+  /// when the frame could not be sent (a warning names the reason).
   bool control_mit(double q_target, double kp, double kd,
                    double dq_target = 0.0, double tau_feedforward = 0.0);
 
-  /// Stream MIT frames for a duration (blocking). DM motors need a continuous
-  /// frame stream to sustain motion.
-  ///
-  /// Returns true only when every frame went out; a stream with some failed
-  /// frames returns false and logs how many. Throws CommandError when the
-  /// timing is unusable — duration_s non-finite or <= 0, interval_s non-finite
-  /// or < 0 — because those send nothing at all, and CommError when not one
-  /// frame could be sent, because then the bus or the enable is broken and
-  /// returning success would report motion that never happened.
+  /// Stream MIT frames for a duration (blocking). Returns true only when every
+  /// frame went out; throws CommandError when the timing is unusable, CommError
+  /// when not one frame could be sent, and returns false when no motor is
+  /// registered.
   bool control_mit_stream(double q_target, double kp, double kd,
                           double duration_s, double dq_target = 0.0,
                           double tau_feedforward = 0.0,
@@ -112,12 +100,8 @@ class GripperBus {
   /// Poll until at least one new status frame arrives.
   bool update_state(double timeout_s = 0.05);
 
-  /// Send the 0xCC refresh and wait for the reply. A disabled motor does not
-  /// stream status frames on its own, so this is how position is read before
-  /// the first enable. Sends no motion command and changes no motor output.
-  ///
-  /// Retries once, each attempt on half of `timeout_s`, so the call still
-  /// takes at most `timeout_s` — see await_refresh_reply().
+  /// Send the 0xCC refresh and wait for the reply (retried once, each attempt
+  /// on half of `timeout_s`, so the call still takes at most `timeout_s`).
   bool refresh_status(double timeout_s = 0.5);
 
   double get_position() const;    // rad
@@ -127,32 +111,25 @@ class GripperBus {
   int get_temperature_mos() const;
   int get_temperature_coil() const;
 
-  /// Read a motor register by rid; throws CANTimeoutError.
-  double read_param(int rid, double timeout_s = 0.5);
-
-  /// Write a motor register (no confirmation wait).
-  void write_param(int rid, double value);
-
-  /// Expert access to the underlying motor state (may be null before connect).
-  can::MotorState* motor() noexcept { return motor_; }
+  /// Age of the last decoded status frame (seconds; infinity = none).
+  double data_age_s() const;
+  bool has_data() const;
 
   const GripperConfig& config() const noexcept { return config_; }
   GripperConfig& config() noexcept { return config_; }
 
  private:
-  /// Send 0xFC, let the hold policy cover the enable window and settle, then
-  /// report the motor's error code from the first fresh status frame.
+  /// Send 0xFC, cover the enable window with zero-gain frames, wait for a fresh
+  /// status frame, then hold the measured position with kp/kd.
   ///
-  /// Returns nullopt when no feedback arrived (the policy throws HardwareError,
-  /// which is caught here). This mirrors the Python original's
-  /// `_enable_and_hold`, including the distinction between "no answer"
-  /// (nullopt) and "answered with a fault" (the code).
+  /// Returns nullopt when no feedback arrived (timeout). Mirrors the Python
+  /// original's `_enable_and_hold`, including the distinction between "no
+  /// answer" (nullopt) and "answered with a fault" (the code).
   std::optional<int> enable_and_hold(const GripperConfig& effective_config);
 
   GripperConfig config_;
   std::unique_ptr<can::CanTransport> transport_;
   std::unique_ptr<can::MotorController> controller_;
-  std::unique_ptr<HoldPolicy> hold_policy_;
   can::MotorState* motor_ = nullptr;  // owned by controller_
   bool connected_ = false;
   bool initialized_ = false;
@@ -160,13 +137,6 @@ class GripperBus {
 
 /// The retry policy behind GripperBus::refresh_status(), on its own so it can
 /// be driven without a bus (test/test_bus.cpp).
-///
-/// The motor answers the mst_id detection's parameter read about 0.5 s late,
-/// after that strategy's deadline. The reply lands inside the first refresh
-/// window, where it is discarded as a parameter frame rather than counted as a
-/// status frame, so the first refresh after connect() went unanswered on a
-/// healthy link and refresh_status() returned false until the caller retried by
-/// hand. Nothing on the bus was wrong; one attempt was simply lost.
 ///
 /// `send_refresh` puts the 0xCC request on the bus and `await_status` waits for
 /// a status frame within the budget it is handed. Two attempts, each given half
@@ -180,12 +150,7 @@ bool await_refresh_reply(double timeout_s,
 ///
 /// The bound is kStaleAfterS itself, and that is the point: "fresh" is what
 /// GripperState::is_stale() answers, so the two have to describe the same
-/// thing. A wait shorter than the horizon returns snapshots no frame arrived
-/// for — anything aged between the wait and the horizon — with is_stale() still
-/// false, indistinguishable from a measurement, and the guard callers are told
-/// to write cannot catch them. Waiting the horizon makes a miss mean the
-/// snapshot is past kStaleAfterS, so is_stale() reports it. Waiting longer
-/// would only delay an answer that is stale already.
+/// thing. Waiting longer would only delay an answer that is stale already.
 ///
 /// `await_status` waits for a status frame within the budget it is handed and
 /// reports whether one arrived. Returns true when one did.

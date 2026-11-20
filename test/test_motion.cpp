@@ -348,7 +348,7 @@ class FakeIo : public MotionIo {
     // order is exact, but keep the source in view).
     st.position_mm =
         (cfg_.pos_closed_rad - st.position_rad) * s * cfg_.rad_to_mm;
-    st.force_n = s * st.torque_nm * cfg_.nm_to_n;
+    st.force_n = s * st.torque_nm * UnitConversion::kNmToN;
     st.data_age_s = answered ? 0.0 : kStaleAfterS + 1.0;
     return st;
   }
@@ -1868,30 +1868,6 @@ void test_a_yielding_workpiece_does_not_erode_the_hold_force() {
   check(steady, "hold: a yielding workpiece does not erode the held force");
 }
 
-void test_the_hold_frame_carries_no_gains() {
-  // hold_kp / hold_kd are deprecated: setting them must change nothing. The
-  // values are deliberately INSIDE the guard's ceilings, so an implementation
-  // that wrongly used them fails the assertion below instead of tripping
-  // kp_max / kd_max and aborting the test binary.
-  FakeIo io = yielding_gripper();
-  SafetyGuard guard = make_guard();
-  MotionConfig m = instant_config();
-  m.monotonic_fn = tick_clock(0.1);
-  m.hold_kp = 90.0;
-  m.hold_kd = 5.0;
-  MotionEngine engine(io, guard, m);
-
-  engine.grasp(20.0, 1.2);
-
-  const std::vector<Frame> hold = at_setpoint(io.frames);
-  check(!hold.empty(), "hold: there are frames at the setpoint");
-  bool gainless = true;
-  for (const Frame& f : hold) {
-    gainless = gainless && f.kp == 0.0 && f.kd == 0.0;
-  }
-  check(gainless, "hold: a configured hold_kp/hold_kd never reaches a frame");
-}
-
 // ── a held force ramps to its setpoint (Python dump S10) ─────────────────
 //
 // The hold used to jump to the setpoint in one frame. At handover the motor is
@@ -3169,22 +3145,23 @@ void test_recovery_config_ceilings() {
                                   "too-stiff recovery refuses at use");
 }
 
-// ── LiteGrip forwarding: refusals before any engine work ────────────────
+// ── Gripper forwarding: refusals before any engine work ─────────────────
 
-void test_litegrip_forwarding() {
-  LiteGrip g;  // default config, not connected
+void test_gripper_forwarding() {
+  Gripper g;  // default config, not connected
   check_throws<NotInitializedError>([&] { g.close(); },
-                                    "LiteGrip::close while disconnected");
+                                    "Gripper::close while disconnected");
   check_throws<NotInitializedError>([&] { g.open(); },
-                                    "LiteGrip::open while disconnected");
+                                    "Gripper::open while disconnected");
   check_throws<NotInitializedError>([&] { g.grasp(); },
-                                    "LiteGrip::grasp while disconnected");
-  check_throws<NotInitializedError>([&] { g.move_at_speed(40.0); },
-                                    "LiteGrip::move_at_speed while disconnected");
-  check_throws<NotInitializedError>([&] { g.enter_zero_gravity(0.0); },
-                                    "LiteGrip::enter_zero_gravity disconnected");
-  g.exit_zero_gravity();  // no connection check; silent when disabled
-  check(true, "LiteGrip::exit_zero_gravity is a silent no-op when disabled");
+                                    "Gripper::grasp while disconnected");
+  check_throws<NotInitializedError>([&] { g.set_gripper_distance(40.0); },
+                                    "Gripper::set_gripper_distance disconnected");
+  check_throws<NotInitializedError>([&] { g.set_motor_angle(-0.5); },
+                                    "Gripper::set_motor_angle disconnected");
+  check_throws<NotInitializedError>([&] { g.release(10.0); },
+                                    "Gripper::release while disconnected");
+  check(!g.get_version().empty(), "Gripper::get_version works without a bus");
 }
 
 // ── stale state / true-stop handover (Python PR #86) ─────────────────────
@@ -3400,7 +3377,6 @@ int main() {
   test_ramp_to_refuses_what_the_ramp_cannot_honour();
   test_move_at_speed_target_already_reached();
   test_a_yielding_workpiece_does_not_erode_the_hold_force();
-  test_the_hold_frame_carries_no_gains();
   test_the_climb_starts_from_the_torque_in_flight();
   test_every_climbing_frame_adds_the_same_amount();
   test_it_lands_exactly_on_the_setpoint_and_stays();
@@ -3433,7 +3409,7 @@ int main() {
   test_the_shipped_calibration_spans_the_shipped_red_lines();
   test_recovery_jammed_is_fault();
   test_recovery_config_ceilings();
-  test_litegrip_forwarding();
+  test_gripper_forwarding();
   test_a_slow_creep_is_not_handed_over_mid_travel();
   test_a_slow_creep_without_contact_never_enters_the_hold();
   test_open_does_not_start_from_a_cached_position_while_idle();

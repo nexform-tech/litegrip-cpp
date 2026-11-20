@@ -1,12 +1,13 @@
-// test_bus.cpp — GripperBus lifecycle, error paths and the HoldPolicy seam.
+// test_bus.cpp — GripperBus lifecycle and error paths.
 //
-// Hardware-dependent paths (connect / init / motion) are NOT exercised here:
-// they need the real device. What is covered is the behaviour that must hold
-// without one — construction, the "not connected" refusals, config plumbing,
-// and the pluggable hold policy (R2).
+// Hardware-dependent paths (connect / init / motion / set_zero) are NOT
+// exercised against a device here: they need the real gripper. What is
+// covered is the behaviour that must hold without one — construction, the
+// "not connected" refusals, config plumbing, feedback getter defaults and the
+// refresh/staleness policies.
 
+#include <cmath>
 #include <iostream>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -24,22 +25,6 @@ void check(bool condition, const char* what) {
   }
 }
 
-// A stand-in for the user's rewrite of the hold behaviour: proves the seam is
-// usable without touching anything else.
-class TrackingPolicy : public litegrip::HoldPolicy {
- public:
-  void init(litegrip::GripperBus&, const litegrip::GripperConfig&) override {
-    ++init_calls;
-  }
-  void hold(litegrip::GripperBus&, const litegrip::GripperConfig&) override {
-    ++hold_calls;
-  }
-  const char* name() const noexcept override { return "TrackingPolicy"; }
-
-  int init_calls = 0;
-  int hold_calls = 0;
-};
-
 }  // namespace
 
 int main() {
@@ -48,9 +33,10 @@ int main() {
     litegrip::GripperBus bus;
     check(!bus.is_connected(), "a fresh bus is not connected");
     check(!bus.is_initialized(), "a fresh bus is not initialised");
-    check(bus.motor() == nullptr, "a fresh bus has no motor");
     check(bus.config().can_id == litegrip::GripperParams::kCanId,
           "config defaults carried through");
+    check(bus.config().mst_id == 0x18, "mst_id defaults to 0x18");
+    check(!bus.has_data(), "a fresh bus has no data");
   }
 
   // ── every bus operation refuses while disconnected ────────────────────
@@ -65,20 +51,12 @@ int main() {
     check(!bus.enable(), "enable refuses when closed");
     check(!bus.disable(), "disable refuses when closed");
     check(!bus.clear_fault(), "clear_fault refuses when closed");
+    check(!bus.set_zero(), "set_zero refuses when closed");
     check(bus.get_position() == 0.0, "position defaults to 0");
     check(bus.get_velocity() == 0.0, "velocity defaults to 0");
     check(bus.get_torque() == 0.0, "torque defaults to 0");
     check(bus.get_error() == -1, "error defaults to -1 when there is no motor");
-
-    bool threw = false;
-    try {
-      bus.read_param(7);
-    } catch (const litegrip::NotInitializedError&) {
-      threw = true;
-    } catch (const litegrip::LiteGripError&) {
-      threw = true;
-    }
-    check(threw, "read_param throws while disconnected");
+    check(std::isinf(bus.data_age_s()), "data age defaults to infinity");
   }
 
   // ── init on a closed bus is an explicit error, not a silent false ─────
@@ -120,46 +98,21 @@ int main() {
     config.can_channel = "can1";
     config.can_id = 0x09;
     config.mst_id = 0x19;
-    config.canfd_mode = true;
     config.kp = 123.0;
     litegrip::GripperBus bus(config);
     check(bus.config().can_channel == "can1", "channel carried into the bus");
     check(bus.config().can_id == 0x09, "can_id carried into the bus");
-    check(bus.config().mst_id.has_value() && *bus.config().mst_id == 0x19,
-          "mst_id carried into the bus");
-    check(bus.config().canfd_mode, "canfd_mode carried into the bus");
+    check(bus.config().mst_id == 0x19, "mst_id carried into the bus");
 
-    // The accessor is mutable, matching the Python SDK's model.
+    // The accessor is mutable so the facade can sync a loaded calibration.
     bus.config().kp = 200.0;
     check(bus.config().kp == 200.0, "config is mutable through the accessor");
   }
 
-  // ── the R2 hold seam ──────────────────────────────────────────────────
-  {
-    litegrip::GripperBus bus;
-    check(std::string(bus.hold_policy().name()) == "DefaultHoldPolicy",
-          "default hold policy installed");
-
-    auto policy = std::make_unique<TrackingPolicy>();
-    TrackingPolicy* observer = policy.get();
-    bus.set_hold_policy(std::move(policy));
-    check(std::string(bus.hold_policy().name()) == "TrackingPolicy",
-          "injected hold policy is in effect");
-    check(observer->init_calls == 0 && observer->hold_calls == 0,
-          "injected policy is not called until init/enable");
-
-    // A null policy must not replace a working one.
-    bus.set_hold_policy(nullptr);
-    check(std::string(bus.hold_policy().name()) == "TrackingPolicy",
-          "null policy is ignored");
-  }
-
   // ── the refresh retry policy ──────────────────────────────────────────
   //
-  // The first refresh_status() after connect() is answered late by the mst_id
-  // detection's parameter read rather than by its own request, so one attempt
-  // is lost on a healthy link. The policy is driven with lambdas here because
-  // the failure it covers needs a motor that answers 0.5 s late.
+  // Two attempts, each given half the caller's budget, so a retry cannot make
+  // the call outlast timeout_s.
   {
     int sends = 0;
     const bool ok =
@@ -191,12 +144,6 @@ int main() {
   }
 
   // ── a wait = true state read waits the staleness horizon ───────────────
-  //
-  // #50: the wait and is_stale() have to describe the same thing. A wait
-  // shorter than kStaleAfterS can come back empty-handed while the snapshot it
-  // returns is still younger than the horizon — is_stale() false — so a cached
-  // read is handed back as a measurement and the guard the README documents
-  // misses it. Waiting the horizon is what makes a miss mean "stale".
   {
     double budget = -1.0;
     const bool fresh =

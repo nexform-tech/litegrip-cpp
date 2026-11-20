@@ -1,8 +1,11 @@
-// litegrip/can/transport.hpp — raw SocketCAN transport.
+// litegrip/can/transport.hpp — raw SocketCAN transport (classic CAN).
 //
 // Port of litegrip_driver/litegrip/can/transport.py. Nothing but Linux
 // SocketCAN and the C++ standard library; no libsocketcan, no third-party
 // dependency.
+//
+// The DM4310 protocol is classic CAN (8-byte frames), and this SDK is classic
+// CAN only: no CAN FD socket mode, no FD frame layout.
 
 #pragma once
 
@@ -15,23 +18,12 @@
 
 namespace litegrip::can {
 
-/// CAN interface mode.
-enum class CanMode : int {
-  kCan = 0,    // classic CAN, 8-byte payload
-  kCanFd = 1,  // CAN FD, up to 64-byte payload
-};
-
-/// Classic CAN frame MTU / CAN FD frame MTU, as reported by SIOCGIFMTU.
-inline constexpr int kCanMtu = 16;
-inline constexpr int kCanFdMtu = 72;
-
-/// A single CAN frame.
+/// A single classic CAN frame.
 struct CanFrame {
   int can_id = 0;
-  std::array<std::uint8_t, 64> data{};
+  std::array<std::uint8_t, 8> data{};
   std::size_t dlc = 0;
   bool is_extended = false;
-  bool is_fd = false;
   double timestamp = 0.0;  // monotonic seconds
 
   const std::uint8_t* bytes() const noexcept { return data.data(); }
@@ -64,9 +56,7 @@ class CanIo {
 /// the same thread.
 class CanTransport : public CanIo {
  public:
-  /// `mode` is a *preference*: open() reconciles it with the interface MTU
-  /// (classic CAN sockets on FD-capable interfaces may silently drop frames).
-  explicit CanTransport(std::string channel, CanMode mode = CanMode::kCan);
+  explicit CanTransport(std::string channel);
   ~CanTransport();
 
   CanTransport(const CanTransport&) = delete;
@@ -82,7 +72,6 @@ class CanTransport : public CanIo {
   bool is_open() const noexcept { return fd_ >= 0; }
 
   const std::string& channel() const noexcept { return channel_; }
-  CanMode mode() const noexcept { return mode_; }
 
   /// Restrict which CAN ids the kernel delivers to this socket.
   ///
@@ -92,17 +81,12 @@ class CanTransport : public CanIo {
   /// status frames are delayed or dropped — making read-back appear frozen
   /// while the motor is actually moving. Empty clears the filter.
   void set_id_filter(const std::vector<int>& can_ids) override;
-  void add_id_filter(int can_id);
 
   /// Send one frame. Retries on EAGAIN until `timeout_s`.
   ///
   /// Throws CommError when the send buffer stays full for that whole time: the
   /// frame did NOT go out, and a caller that cannot send has to find out or it
-  /// reports motion that never happened. (It used to log and return, which is
-  /// how "moved 0.000 mm" came back as success on the bench. The Python
-  /// original now raises too; its TimeoutError is an OSError, and this SDK's
-  /// write-failure counterpart is CommError — not CANTimeoutError, which names
-  /// a *read* timeout.)
+  /// reports motion that never happened.
   void send(int can_id, const std::uint8_t* data, std::size_t size,
             double timeout_s = 0.1) override;
 
@@ -121,12 +105,8 @@ class CanTransport : public CanIo {
   void apply_id_filter();
 
   std::string channel_;
-  CanMode mode_;
   int fd_ = -1;
   std::vector<int> accept_ids_;
 };
-
-/// Read interface MTU (kCanMtu / kCanFdMtu); nullopt on failure.
-std::optional<int> iface_mtu(int fd, const std::string& iface) noexcept;
 
 }  // namespace litegrip::can

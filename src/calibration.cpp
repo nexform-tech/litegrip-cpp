@@ -5,10 +5,8 @@
 
 #include "litegrip/calibration.hpp"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdlib>
-#include <dirent.h>
 #include <optional>
 #include <string>
 #include <sys/stat.h>
@@ -55,22 +53,6 @@ std::string program_directory() {
   return slash == std::string::npos ? std::string{} : path.substr(0, slash);
 }
 
-/// The packaged mount templates, in declaration order (normal first).
-///
-/// A template declares a *direction* and nothing else: it deliberately carries
-/// no channel, CAN ids or gains, because adopting an identity or a tuning from
-/// a file that exists to state a direction would silently rewrite what the
-/// caller set. Mirrors the Python SDK's CALIB_TEMPLATES.
-struct CalibrationTemplate {
-  const char* name;
-  const char* file;
-};
-
-constexpr CalibrationTemplate kCalibrationTemplates[] = {
-    {"normal", "normal.json"},
-    {"reverse", "reverse.json"},
-};
-
 }  // namespace
 
 std::vector<std::string> calibration_data_candidates(
@@ -113,58 +95,13 @@ std::string resolve_calibration_data_file(const std::string& relative,
   return candidates.front();
 }
 
-std::string default_calibration_path() {
-  if (const char* override_path = env_or_null(kCalibEnvVar)) {
-    return override_path;
-  }
-  const char* home = env_or_null("HOME");
-  if (home == nullptr) {
-    return ".litegrip/litegrip_calibration.json";
-  }
-  return std::string(home) + "/.litegrip/litegrip_calibration.json";
-}
-
 std::string default_calibration_path(const std::string& channel) {
-  if (const char* override_path = env_or_null(kCalibEnvVar)) {
-    return override_path;
-  }
   const char* home = env_or_null("HOME");
+  const std::string name = channel + "_calibration.json";
   if (home == nullptr) {
-    return ".litegrip/" + channel + "_calibration.json";
+    return ".litegrip/" + name;
   }
-  return std::string(home) + "/.litegrip/" + channel + "_calibration.json";
-}
-
-std::vector<std::string> ignored_local_calibrations(
-    const std::string& channel) {
-  const char* home = env_or_null("HOME");
-  if (home == nullptr) {
-    return {};
-  }
-  const std::string directory = std::string(home) + "/.litegrip";
-  DIR* dir = ::opendir(directory.c_str());
-  if (dir == nullptr) {
-    return {};
-  }
-
-  std::vector<std::string> ignored;
-  while (const struct dirent* entry = ::readdir(dir)) {
-    const std::string name = entry->d_name;
-    if (name.size() <= 5 || name.compare(name.size() - 5, 5, ".json") != 0) {
-      continue;
-    }
-    // Only names that could belong to THIS channel: a second gripper's file
-    // must not show up in the first one's log.
-    const std::string prefix = channel + "_";
-    if (name.rfind(prefix, 0) == 0 ||
-        name == "litegrip_calibration.json") {
-      ignored.push_back(directory + "/" + name);
-    }
-  }
-  ::closedir(dir);
-
-  std::sort(ignored.begin(), ignored.end());
-  return ignored;
+  return std::string(home) + "/.litegrip/" + name;
 }
 
 std::string factory_calibration_path() {
@@ -177,37 +114,6 @@ std::string factory_calibration_path() {
   // no machine-dependent path is baked into the source.
   return resolve_calibration_data_file("factory_calibration.json",
                                        program_directory());
-}
-
-std::vector<std::string> list_calibration_templates() {
-  std::vector<std::string> names;
-  for (const CalibrationTemplate& entry : kCalibrationTemplates) {
-    names.emplace_back(entry.name);
-  }
-  return names;
-}
-
-std::string calibration_template_path(const std::string& name) {
-  for (const CalibrationTemplate& entry : kCalibrationTemplates) {
-    if (name == entry.name) {
-      return resolve_calibration_data_file(entry.file, program_directory());
-    }
-  }
-
-  std::string available;
-  for (const CalibrationTemplate& entry : kCalibrationTemplates) {
-    if (!available.empty()) {
-      available += ", ";
-    }
-    available += std::string("'") + entry.name + "'";
-  }
-  // Strict on purpose: answering an unknown (or mistyped) name with the
-  // factory file would turn a request for a reverse mount into a normal one
-  // without a sound. Mirrors the Python SDK's _resolve_template().
-  throw CommandError("unknown calibration template '" + name +
-                     "'; the available templates are " + available +
-                     " (an explicit calibration file path can still be passed "
-                     "to load_calibration)");
 }
 
 std::optional<CalibrationFile> read_calibration_file(const std::string& path) {
@@ -243,18 +149,11 @@ std::optional<CalibrationFile> read_calibration_file(const std::string& path) {
   if (document->contains("channel")) {
     out.channel = document->get_string("channel", "");
   }
-  if (document->contains("canfd_mode")) {
-    out.canfd_mode = document->get_bool("canfd_mode", false);
-  }
   if (document->contains("kp")) {
     out.kp = document->get_number("kp", 0.0);
   }
   if (document->contains("kd")) {
     out.kd = document->get_number("kd", 0.0);
-  }
-  if (document->contains("grasp_torque_threshold")) {
-    out.grasp_torque_threshold =
-        document->get_number("grasp_torque_threshold", 0.0);
   }
   if (document->contains("motor_type")) {
     out.motor_type = document->get_string("motor_type", "");
@@ -279,7 +178,6 @@ void write_calibration_file(const std::string& path, const GripperConfig& config
   json::Value document = json::Value::make_object();
   document.set("channel", config.can_channel);
   document.set("can_id", can_id);
-  document.set("canfd_mode", config.canfd_mode);
   // Anything written from a live config states a direction on purpose, so the
   // numbers are a claim even when they were never measured. Mirrors the
   // Python SDK stamping the flag unconditionally.
@@ -293,7 +191,6 @@ void write_calibration_file(const std::string& path, const GripperConfig& config
   document.set("motor_type", motor_type);
   document.set("kp", config.kp);
   document.set("kd", config.kd);
-  document.set("grasp_torque_threshold", config.grasp_torque_threshold);
   // Only stamp mst_id when it is actually known. Writing a falsy 0 would pin
   // auto-detection: load_calibration would install an RX filter of 0x000,
   // every reply from the motor would be dropped, and enable() would fail
