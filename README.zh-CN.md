@@ -195,7 +195,8 @@ while (running) {
 }
 ```
 
-若主手是另一只 LiteGrip，读之前先调 `leader.refresh_status()` —— 否则它空闲时不上报
+从手示例默认 `--channel can1`（双机同主机的约定）；单机只有 `can0` 时请显式传
+`--channel can0`。若主手是另一只 LiteGrip，读之前先调 `leader.refresh_status()` —— 否则它空闲时不上报
 状态。开始遥操前让主手处于跟随端当前位置附近：这个原语不做斜坡、不做对齐，第一帧就
 可能下发全部误差。
 

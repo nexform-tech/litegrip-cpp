@@ -305,12 +305,16 @@ CalibrationData Gripper::calibrate(bool save) {
       "[litegrip] calibrate: initial position %.4f rad (close_sign %+.0f)\n",
       initial, s);
 
-  const ProbeConfig probe{/*kp=*/60.0,
+  // Match the Python probe defaults: kp x step = 1.0 Nm, below the 2.0 Nm
+  // ceiling. The previous 60 x 0.1 = 6 Nm could hit the torque ceiling as an
+  // impact spike after the jaws were already past the stop, recording a travel
+  // 14-17% larger than the Python SDK on the same unit.
+  const ProbeConfig probe{/*kp=*/20.0,
                           /*kd=*/2.0,
-                          /*step_rad=*/0.1,
-                          /*stall_delta=*/0.0003,
-                          /*stall_cycles=*/8,
-                          /*max_iter=*/30,
+                          /*step_rad=*/0.05,
+                          /*stall_delta=*/0.0015,
+                          /*stall_cycles=*/5,
+                          /*max_iter=*/200,
                           /*tau_limit=*/2.0};
   const ProbeCalibration measured =
       probe_calibrate(io, probe, s, config_.max_stroke_mm);
