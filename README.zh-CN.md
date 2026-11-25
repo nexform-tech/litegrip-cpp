@@ -155,10 +155,14 @@ int main() {
 
 | 调用 | 含义 |
 | --- | --- |
-| `CalibrationData calibrate()` | 以低刚度探测两侧机械限位，更新配置，并自动保存到本通道文件。阻塞，会移动夹爪。 |
+| `CalibrationData calibrate(bool save = true)` | 以低刚度探测两侧机械限位并更新配置；`save=true` 还会写入本通道文件。阻塞，会移动夹爪。 |
 | `bool load_calibration(path = {})` | 给了 `path` 就只读它，不回退；不给时依次尝试 `$LITEGRIP_CALIB`、`~/.litegrip/<channel>_calibration.json`、随包工厂标定。全部不可读返回 false。 |
 | `std::string save_calibration(path = {})` | 写到给定路径，否则 `~/.litegrip/<channel>_calibration.json`；返回写入路径。 |
 | `std::string default_calibration_path(channel = "can0")` | 本通道用户标定路径（自由函数）。 |
+
+随包 `factory_calibration.json` 是**参考单元**，不是逐台/逐序列号标定。零点、行程和比例
+每台都有差异；在依赖绝对 mm 精度或 `open()`/`close()` 的限位判据之前，必须对每台执行
+`calibrate()`（或加载厂家提供的逐台标定文件）。
 
 ### 运动
 
@@ -169,7 +173,7 @@ int main() {
 | `bool set_gripper_distance(distance_mm, speed_mm_s = {})` | mm | 定位到绝对开口，夹取到已标定行程内，不压限位。 |
 | `bool set_motor_angle(angle_rad, speed_mm_s = {})` | rad, mm/s | 以电机弧度定位，夹取到行程内。 |
 | `bool follow_gripper_distance(distance_mm, kp = {}, kd = {}, dq = 0.0, tau = 0.0, force_feedback = {})` | mm、rad/s、Nm | 遥操用的单帧 MIT 跟随，不走斜坡。见[遥操](#遥操)。 |
-| `bool grasp(force_n = {}, hold_s = 0.0)` | N, s | 闭合直到堵转，再以纯力矩保持 `force_n × 0.1 Nm`；`hold_s = 0` 表示保持到 `release()` 或故障。 |
+| `bool grasp(force_n = {}, hold_s = 0.0)` | N, s | 闭合直到堵转，再以纯力矩保持 `force_n × 0.1 Nm`；靠近闭合限位时交接前会做一次短验证性再夹，仍能移动则判为空夹并返回 false。`hold_s = 0` 表示保持到 `release()` 或故障。 |
 | `bool release(clearance_mm = 10.0)` | mm | 结束进行中的夹持，并在声明的夹持位之外张开。线程安全。 |
 
 `open()` / `close()` 在夹爪压到并停在标定限位附近（或到达配置的工作行程）时
@@ -200,8 +204,8 @@ while (running) {
 文件的零点、方向或比例不同，主手也可以直接发自己的 `get_gripper_distance()`。跟随端
 行程更短时仍会被夹到自己的行程；行程不同时请由调用方先归一化。目标夹进标定行程。边界：kp 0–500、kd 0–5、`|dq| ≤ 10 rad/s`、`|tau| ≤ 3.5 Nm`；非法值在
 发帧前抛 `CommandError`，返回 `false` 只表示传输失败。主手读取、循环节拍和看门狗由
-调用方负责：循环停下时请调用 `disable()` 或继续发保持帧 —— 电机在静默约 900 ms 后会
-锁存通信丢失故障。
+调用方负责：循环停下时请调用 `disable()` 或继续发保持帧 —— 电机在静默约 400 ms 后会
+锁存通信丢失故障（`TIMEOUT=8000` × 50 µs）；SDK 的阻塞等待会发 0xCC keepalive。
 
 **力反馈（默认关闭）。** 先配置主手，再传回调：
 

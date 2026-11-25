@@ -131,6 +131,17 @@ struct MotionConfig {
   // actions.MotionConfig.stall_speed_mm_s.
   double stall_speed_mm_s = 2.0;
 
+  // ── contact verification before hand-over ─────────────────────────────
+  // A free-air stiction pocket can stop a budget-limited approach and look
+  // like a light grip. When the stop is close to the closed limit, one short
+  // squeeze above the setpoint tells them apart: a real object stays put, a
+  // pocket moves. Stops farther away are treated as objects without the push.
+  double verify_contact_mm = 0.5;   // closing distance of the check, mm
+  double verify_motion_mm = 0.25;   // movement above this = pocket, mm
+  double verify_time_s = 0.15;      // streamed duration of the check, s
+  double verify_force_factor = 1.5; // budget = setpoint x this
+  double verify_zone_mm = 5.0;      // only verify within this of the closed stop
+
   // ── torque / command caps ─────────────────────────────────────────────
   double max_lead_mm = 4.0;        // travel-phase lead cap, mm (~= kp x cap)
 
@@ -832,6 +843,10 @@ class MotionEngine {
   /// position guard judged before the first frame and again in every slice.
   HoldOutcome hold_force(double force_n, double hold_s,
                          const MoveProgressCallback& progress);
+
+  /// One short squeeze above the setpoint; true when the jaws stay put.
+  /// Only called when the approach stalled close to the closed limit.
+  bool verify_contact(double force_n);
 
   /// The handover gate: hand a finished closing leg to the force hold, or
   /// refuse. The hold's frames carry no position term and no velocity term, so

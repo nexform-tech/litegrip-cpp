@@ -33,12 +33,17 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "litegrip/constants.hpp"
 #include "litegrip/exceptions.hpp"
 
 namespace litegrip {
+
+namespace {
+constexpr double kVerifyTauMaxNm = 3.5;
+}
 
 const char* to_string(MovePhase phase) noexcept {
   return phase == MovePhase::kHold ? "hold" : "move";
@@ -274,6 +279,19 @@ MotionEngine::MotionEngine(MotionIo& io, SafetyGuard& safety,
         "(got " + std::to_string(config_.stall_speed_mm_s) +
         ") — the force-approach hand-over compares the window's average speed "
         "against it");
+  }
+  for (const auto& [name, value] :
+       {std::pair{"verify_contact_mm", config_.verify_contact_mm},
+        std::pair{"verify_motion_mm", config_.verify_motion_mm},
+        std::pair{"verify_time_s", config_.verify_time_s},
+        std::pair{"verify_force_factor", config_.verify_force_factor},
+        std::pair{"verify_zone_mm", config_.verify_zone_mm}}) {
+    if (!std::isfinite(value) || value <= 0.0) {
+      throw SafetyConfigError(
+          std::string("MotionConfig: ") + name +
+          " must be a positive finite number (got " +
+          std::to_string(value) + ")");
+    }
   }
 }
 
@@ -1096,6 +1114,29 @@ GraspResult MotionEngine::grasp(std::optional<double> force_n, double hold_s,
   return hand_over(move, force, hold_s, progress);
 }
 
+bool MotionEngine::verify_contact(double force_n) {
+  const GripperConfig& gcfg = io_.config();
+  const double start = io_.get_state(false).position_rad;
+  const double step_rad = config_.verify_contact_mm / gcfg.rad_to_mm;
+  const double budget = std::min(
+      kVerifyTauMaxNm,
+      force_n * UnitConversion::kNToNm * config_.verify_force_factor);
+  const double kp = std::min(500.0, budget / step_rad);
+  const double target = clamp_to_travel(
+      gcfg, start + gcfg.close_sign() * step_rad);
+  const int frames = std::max(
+      1, static_cast<int>(std::lround(
+             config_.verify_time_s / config_.frame_interval)));
+  for (int i = 0; i < frames; ++i) {
+    emit(target, 0.0, 0.0, kp, gcfg.kd, "grasp verify");
+    sleep_s(config_.frame_interval);
+  }
+  io_.get_state(false);  // drain the status frames the stream elicited
+  const double moved =
+      std::fabs(io_.get_state(false).position_rad - start);
+  return moved < config_.verify_motion_mm / gcfg.rad_to_mm;
+}
+
 GraspResult MotionEngine::hand_over(const MoveResult& move, double force,
                                     double hold_s,
                                     const MoveProgressCallback& progress) {
@@ -1153,6 +1194,17 @@ GraspResult MotionEngine::hand_over(const MoveResult& move, double force,
     drop_torque(move.state.position_rad, "grasp");
     return refused(/*no_bite=*/false);
   }
+  if (move.stalled && !move.reached &&
+      move.state.position_mm <= config_.verify_zone_mm) {
+    if (!verify_contact(force)) {
+      drop_torque(move.state.position_rad, "grasp");
+      std::fprintf(stderr,
+                   "[litegrip] grasp: handed back — the verification squeeze "
+                   "still moved the jaws (a free-air stiction pocket)\n");
+      return refused(/*no_bite=*/true);
+    }
+  }
+
   // The hand-over pose and the request are read in ONE critical section: a
   // request landing between the two would otherwise be missed, and the hold
   // below would start even though the caller asked to let go.

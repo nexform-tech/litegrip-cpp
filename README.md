@@ -159,10 +159,14 @@ destructor disconnects.
 
 | Call | Meaning |
 | --- | --- |
-| `CalibrationData calibrate()` | Probe both mechanical stops with low stiffness, update the config, then save to the per-channel path automatically. Blocking; moves the jaws. |
+| `CalibrationData calibrate(bool save = true)` | Probe both mechanical stops with low stiffness and update the config; `save=true` also writes the per-channel path. Blocking; moves the jaws. |
 | `bool load_calibration(path = {})` | With `path`, that file is the only source tried (no fallback). Without it: `$LITEGRIP_CALIB`, then `~/.litegrip/<channel>_calibration.json`, then the bundled factory file. False when nothing readable was found. |
 | `std::string save_calibration(path = {})` | Write to the given path or `~/.litegrip/<channel>_calibration.json`; returns the path. |
 | `std::string default_calibration_path(channel = "can0")` | The per-channel user path (free function). |
+
+The bundled `factory_calibration.json` is a **reference unit**, not a per-serial file. Zero,
+travel and scale vary unit to unit; calibrate each unit (or load the vendor's per-unit file)
+before relying on absolute mm accuracy or the `open()`/`close()` stop verdicts.
 
 ### Motion
 
@@ -173,7 +177,7 @@ destructor disconnects.
 | `bool set_gripper_distance(distance_mm, speed_mm_s = {})` | mm | Positioning move to an absolute opening, clamped into the calibrated travel; no limit press. |
 | `bool set_motor_angle(angle_rad, speed_mm_s = {})` | rad, mm/s | Positioning move in motor radians, clamped into the travel. |
 | `bool follow_gripper_distance(distance_mm, kp = {}, kd = {}, dq = 0.0, tau = 0.0, force_feedback = {})` | mm, rad/s, Nm | One MIT follow frame for teleoperation; no ramp. See [Teleoperation](#teleoperation). |
-| `bool grasp(force_n = {}, hold_s = 0.0)` | N, s | Close until stall, then pure-torque hold at `force_n × 0.1 Nm`. `hold_s = 0` holds until `release()` or a fault. |
+| `bool grasp(force_n = {}, hold_s = 0.0)` | N, s | Close until stall, then pure-torque hold at `force_n × 0.1 Nm`. Near the closed stop a short verification squeeze runs before hand-over; if it still moves, the stop is a free-air stiction pocket and the grasp returns false. `hold_s = 0` holds until `release()` or a fault. |
 | `bool release(clearance_mm = 10.0)` | mm | End an in-progress grasp and open past the declared grip pose. Thread-safe. |
 
 `open()` / `close()` return true when the jaws pressed and parked near the
@@ -213,7 +217,8 @@ target is clamped into the calibrated travel. Bounds: kp 0–500, kd 0–5, `|dq
 values throw `CommandError` before any bus write, and `false` means the
 transport failed. The caller owns the leader read, loop timing, and watchdog:
 if the loop stops, call `disable()` or keep sending hold frames — the motor
-latches a communication-loss fault after ~900 ms of silence.
+latches a communication-loss fault after ~400 ms of silence (`TIMEOUT=8000` ×
+50 µs); SDK waits send 0xCC keepalives to stay under it.
 
 **Force feedback (off by default).** Configure the leader, then pass a callback:
 

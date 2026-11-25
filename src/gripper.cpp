@@ -143,6 +143,12 @@ constexpr double kFollowKdMax = 5.0;         // MIT damping range
 constexpr double kFollowDqMaxRadS = 10.0;    // teleop velocity feed-forward
 constexpr double kFollowTauMaxNm = 3.5;      // safety torque ceiling
 
+// A cached status frame younger than this is treated as a measurement by
+// get_state(wait=true). refresh_status() consumes the reply it elicits, so the
+// following get_state() must accept that fresh cache instead of spending
+// another 0.5 s waiting for a frame that will not come.
+constexpr double kFreshWindowS = 0.05;
+
 }  // namespace
 
 // ── construction ──────────────────────────────────────────────────────────
@@ -281,7 +287,7 @@ bool Gripper::set_zero() {
 
 // ── calibration ───────────────────────────────────────────────────────────
 
-CalibrationData Gripper::calibrate() {
+CalibrationData Gripper::calibrate(bool save) {
   check_connected();
   check_enabled();
 
@@ -333,10 +339,12 @@ CalibrationData Gripper::calibrate() {
       result.zero_position, result.max_position, result.travel_range,
       result.travel_mm(), result.rad_to_mm);
 
-  // Persist automatically: the per-channel file is what the next constructor
+  // Persist by default: the per-channel file is what the next constructor
   // reads. A slow save failure still leaves the in-memory calibration valid.
-  const std::string path = save_calibration();
-  std::printf("[litegrip] calibrate: saved to %s\n", path.c_str());
+  if (save) {
+    const std::string path = save_calibration();
+    std::printf("[litegrip] calibrate: saved to %s\n", path.c_str());
+  }
   return result;
 }
 
@@ -614,11 +622,13 @@ GripperState Gripper::get_state(bool wait) {
   check_connected();
 
   if (wait) {
-    // Waits the staleness horizon, not something shorter: a miss then means the
-    // snapshot is past kStaleAfterS, so the reading is one is_stale() reports
-    // as stale rather than a cached value returned as fresh.
-    await_fresh_state(
-        [this](double budget) { return bus_->update_state(budget); });
+    // A recent frame (for example the one refresh_status() just consumed)
+    // counts as the answer. Otherwise send 0xCC refresh requests while waiting:
+    // a bare 0.5 s poll would leave the bus silent past the DM4310's ~400 ms
+    // communication-loss latch.
+    if (bus_->data_age_s() > kFreshWindowS) {
+      bus_->refresh_status(0.5);
+    }
   } else {
     bus_->poll(0.0);
   }

@@ -98,13 +98,14 @@ class Gripper : private MotionIo {
 
   // ── calibration ───────────────────────────────────────────────────────
 
-  /// Probe both mechanical limits with low stiffness, update the config, then
-  /// save to the default per-channel path automatically.
+  /// Probe both mechanical limits with low stiffness and update the config.
   ///
+  /// With `save = true` (default) the result is also written to the default
+  /// per-channel path. With `save = false` only the in-memory config changes.
   /// BLOCKING and it moves the jaws against both stops — make sure the travel
   /// is clear. The direction (which end is closed) comes from the loaded
   /// calibration and is preserved; load a calibration first on a fresh unit.
-  CalibrationData calibrate();
+  CalibrationData calibrate(bool save = true);
 
   /// Load a calibration. With `path`, that file is the only source tried (no
   /// fallback). Without it: `$LITEGRIP_CALIB`, then
